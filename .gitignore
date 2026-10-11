@@ -9,3 +9,6 @@ __pycache__/
 /bench/quality-data/
 # Benchmark outputs (the ones the documents quote are in docs/results/)
 /bench/results/
+# Local compose additions and settings (a private checkout may link its own here)
+compose.override.yaml
+.env
