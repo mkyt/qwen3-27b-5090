@@ -1,0 +1,112 @@
+{
+  "label": "pr6-sglang-parallel-concurrent",
+  "model": "qwen3.8-27b",
+  "started": "2026-10-11T16:35:22.423091",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "pr6-sglang-parallel-concurrent",
+    "prompts": "reason",
+    "concurrency": "8",
+    "max_tokens": 4096,
+    "reps": 2,
+    "extra_body": "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"presence_penalty\":0}"
+  },
+  "results": {
+    "reason": [
+      {
+        "concurrency": 8,
+        "tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "finish": [
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length"
+        ],
+        "ttft": [
+          0.813,
+          0.869,
+          0.869,
+          0.869,
+          0.87,
+          0.869,
+          0.869,
+          0.869
+        ],
+        "stream_tps": [
+          106.47,
+          100.83,
+          107.01,
+          104.26,
+          110.49,
+          110.16,
+          103.78,
+          108.21
+        ],
+        "sum_stream_tps": 851.19,
+        "window_s": 37.06,
+        "wall_s": 41.48,
+        "wall_tps": 789.93
+      },
+      {
+        "concurrency": 8,
+        "tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "finish": [
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length"
+        ],
+        "ttft": [
+          0.123,
+          0.134,
+          0.135,
+          0.134,
+          0.133,
+          0.134,
+          0.134,
+          0.133
+        ],
+        "stream_tps": [
+          103.94,
+          100.3,
+          103.01,
+          108.39,
+          107.46,
+          101.04,
+          110.94,
+          101.92
+        ],
+        "sum_stream_tps": 836.99,
+        "window_s": 36.91,
+        "wall_s": 40.96,
+        "wall_tps": 799.93
+      }
+    ]
+  }
+}

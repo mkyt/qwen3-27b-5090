@@ -1,0 +1,94 @@
+{
+  "label": "pr6-custom-prefill-s1",
+  "model": "qwen3.8-27b",
+  "started": "2026-10-11T16:51:38.417425",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "pr6-custom-prefill-s1",
+    "scenarios": "longctx",
+    "seed": 1,
+    "thinking": false,
+    "decode_reps": 2,
+    "decode_max_tokens": 1024,
+    "agent_sessions": "1,4",
+    "agent_turns": 8,
+    "agent_max_tokens": 512,
+    "system_tokens": 4000,
+    "tools": 20,
+    "tool_output_min": 800,
+    "tool_output_max": 3000,
+    "longctx_tokens": "32000,120000,250000",
+    "longctx_max_tokens": 64,
+    "extra_body": "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"presence_penalty\":0}"
+  },
+  "results": {
+    "longctx": [
+      {
+        "target_tokens": 32000,
+        "cold": {
+          "prompt_tokens": 19526,
+          "ttft": 1.824,
+          "prefill_tps": 10703.3,
+          "decode_tps": 211.79
+        },
+        "warm": {
+          "prompt_tokens": 19522,
+          "ttft": 0.056,
+          "prefill_tps": 347218.7,
+          "decode_tps": 355.37
+        },
+        "prefix_cache_hit_rate": 0.4983,
+        "prefix_cache_hits": 19456,
+        "prefix_cache_queries": 39048,
+        "prefix_cache_reusable": 19512,
+        "prefix_cache_hit_of_reusable": 0.9971,
+        "spec_mean_accept_len": 3.382,
+        "spec_draft_acceptance": null
+      },
+      {
+        "target_tokens": 120000,
+        "cold": {
+          "prompt_tokens": 72907,
+          "ttft": 8.558,
+          "prefill_tps": 8519.5,
+          "decode_tps": 170.21
+        },
+        "warm": {
+          "prompt_tokens": 72903,
+          "ttft": 1.191,
+          "prefill_tps": 61205.1,
+          "decode_tps": 355.73
+        },
+        "prefix_cache_hit_rate": 0.4495,
+        "prefix_cache_hits": 65536,
+        "prefix_cache_queries": 145810,
+        "prefix_cache_reusable": 72892,
+        "prefix_cache_hit_of_reusable": 0.8991,
+        "spec_mean_accept_len": 3.2,
+        "spec_draft_acceptance": null
+      },
+      {
+        "target_tokens": 250000,
+        "cold": {
+          "prompt_tokens": 151974,
+          "ttft": 23.353,
+          "prefill_tps": 6507.8,
+          "decode_tps": 166.0
+        },
+        "warm": {
+          "prompt_tokens": 151970,
+          "ttft": 0.255,
+          "prefill_tps": 596291.3,
+          "decode_tps": 390.66
+        },
+        "prefix_cache_hit_rate": 0.4999,
+        "prefix_cache_hits": 151936,
+        "prefix_cache_queries": 303944,
+        "prefix_cache_reusable": 151960,
+        "prefix_cache_hit_of_reusable": 0.9998,
+        "spec_mean_accept_len": 3.176,
+        "spec_draft_acceptance": null
+      }
+    ]
+  }
+}

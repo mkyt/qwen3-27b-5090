@@ -1,0 +1,101 @@
+{
+ "date": "2026-10-11",
+ "power_limit_w": 400,
+ "prompts": "bench/golden/prompts.jsonl (13 prompts, 35,328 positions; sources bench/golden/sources/)",
+ "metric": "golden compare, position-weighted over all prompts: top1 agreement, mean KL, share of positions with KL > 0.5",
+ "rows": [
+  {
+   "a": "ref-gpu-kvfp8",
+   "b": "ref-gpu",
+   "top1": 0.891,
+   "kl": 0.0359,
+   "kl_gt_0_5": 0.0015,
+   "note": "noise floor (reference, KV type only)"
+  },
+  {
+   "a": "engine (nvidia, KV bf16)",
+   "b": "ref-gpu",
+   "top1": 0.893,
+   "kl": 0.0363,
+   "kl_gt_0_5": 0.0015
+  },
+  {
+   "a": "engine-kvnvfp4 (nvidia)",
+   "b": "ref-gpu",
+   "top1": 0.8871,
+   "kl": 0.0392,
+   "kl_gt_0_5": 0.002
+  },
+  {
+   "a": "engine-decode (last 128 one by one)",
+   "b": "ref-gpu",
+   "positions": 1664,
+   "top1": 0.8936,
+   "kl": 0.0358,
+   "kl_gt_0_5": 0.0042
+  },
+  {
+   "a": "ref-gpu (nvidia checkpoint)",
+   "b": "ref-gpu-bf16model",
+   "top1": 0.8873,
+   "kl": 0.0361,
+   "kl_gt_0_5": 0.0023
+  },
+  {
+   "a": "engine-kvnvfp4 (nvidia)",
+   "b": "ref-gpu-bf16model",
+   "top1": 0.8827,
+   "kl": 0.038,
+   "kl_gt_0_5": 0.0023
+  },
+  {
+   "a": "engine-gdnfp4-kvnvfp4 (serve default)",
+   "b": "ref-gpu-bf16model",
+   "top1": 0.874,
+   "kl": 0.047,
+   "kl_gt_0_5": 0.0058
+  },
+  {
+   "a": "engine nvidia KV fp8",
+   "b": "ref-gpu-bf16model",
+   "top1": 0.8868,
+   "kl": 0.0362,
+   "kl_gt_0_5": 0.0023,
+   "model_card_old_prompts": 0.0369
+  },
+  {
+   "a": "engine gdnfp4 KV fp8",
+   "b": "ref-gpu-bf16model",
+   "top1": 0.876,
+   "kl": 0.0445,
+   "kl_gt_0_5": 0.0048,
+   "model_card_old_prompts": 0.0422
+  },
+  {
+   "a": "engine quasar KV fp8",
+   "b": "ref-gpu-bf16model",
+   "top1": 0.8715,
+   "kl": 0.0475,
+   "kl_gt_0_5": 0.0054,
+   "model_card_old_prompts": 0.0489
+  },
+  {
+   "a": "engine gdnfp4-perproj (predecessor) KV fp8",
+   "b": "ref-gpu-bf16model",
+   "top1": 0.873,
+   "kl": 0.0436,
+   "kl_gt_0_5": 0.0039,
+   "model_card_old_prompts": 0.0413
+  }
+ ],
+ "dropped_source": {
+  "en-prose": "Pride and Prejudice: memorized (BF16 NLL 0.2-0.4 nats/token); en-prose-4096 KL vs BF16 0.36 (nvidia engine) / 0.55 (gdnfp4)"
+ },
+ "memorization_check_nll_nvidia_engine_4096": {
+  "pride-and-prejudice": 0.624,
+  "pg24518": 2.16,
+  "pg41420": 2.478,
+  "pg52130": 1.983,
+  "pg58104 (chosen)": 2.293
+ }
+}

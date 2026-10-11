@@ -1,0 +1,209 @@
+#include "model.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdarg>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <tuple>
+#include <vector>
+
+#include "common.h"
+#include "json.h"
+
+namespace q38 {
+
+using namespace dims;
+using namespace std::string_literals;
+
+void fail(const std::string& msg) { throw std::runtime_error(msg); }
+
+void log(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  fprintf(stderr, "[q38] ");
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+}
+
+Model::Model(const Options& opt) : opt_(opt) {
+  Q38_CHECK(opt.prefill_chunk > 0 && opt.prefill_chunk % 128 == 0, "prefill_chunk must be a multiple of 128");
+  Q38_CHECK(opt.logits_rows > 0 && opt.logits_rows % 128 == 0 && opt.logits_rows <= opt.prefill_chunk,
+            "logits_rows must be a multiple of 128 and <= prefill_chunk");
+  Budget budget = make_budget();
+  Q38_CUDA(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking));
+  ckpt_ = std::make_unique<SafeTensors>(opt.model_dir);
+  // End-of-sequence ids (speculative steps end at an accepted one).
+  if (std::ifstream f(opt.model_dir + "/generation_config.json"); f) {
+    const Json gc = Json::parse(std::string(std::istreambuf_iterator<char>(f), {}));
+    if (gc.has("eos_token_id")) {
+      const Json& e = gc["eos_token_id"];
+      if (e.kind == Json::Array)
+        for (size_t i = 0; i < e.arr.size() && i < 2; i++) stop_[i] = int32_t(e[i].as_int());
+      else
+        stop_[0] = int32_t(e.as_int());
+    }
+  }
+  if (const char* lm = getenv("Q38_LM_HEAD_CKPT"); lm && *lm && ckpt_->info("lm_head.weight").dtype == "BF16")
+    lm_ckpt_ = std::make_unique<SafeTensors>(lm);
+  w_.plan(*ckpt_, lm_ckpt_.get(), dev_weights_, host_weights_);
+  if (w_.fp4_proj) log("GDN / attention projections: NVFP4");
+  if (opt.vision) {
+    Q38_CHECK(ckpt_->config()["image_token_id"].as_int() == kImagePad, "unexpected image_token_id");
+    Q38_CHECK(opt.image_tokens > 0 && opt.image_max_pixels >= 4 * 256, "image_tokens / image_max_pixels");
+    // (A checkpoint without the vision tower takes it from the lm_head one, the nvidia checkpoint.)
+    const bool own = ckpt_->has("model.visual.patch_embed.proj.weight");
+    Q38_CHECK(own || lm_ckpt_, "the checkpoint has no vision tower");
+    w_.plan_vision(own ? *ckpt_ : *lm_ckpt_, dev_weights_, host_weights_, vision_mode());
+    host_mm_.add("image embeddings", size_t(opt.image_tokens) * kHidden * sizeof(bf16));
+  }
+
+  // Sequence state (a verify block writes up to 8 positions past the committed length).
+  max_pages_ = int(ceil_div(opt.max_tokens + kSpecBlock, kPageTokens));
+  kv_page_bytes_ = size_t(kPageTokens) * kKvHeads * kv_row_bytes(opt.kv_type);
+  // Pages per KV block: a block's slice spans 2 MiB at least (Q38_KV_BLOCK: another size, for A/B).
+  kv_block_ = int(ceil_div(size_t(2) << 20, kv_page_bytes_));
+  if (const char* e = getenv("Q38_KV_BLOCK"); e && atoi(e) > 0) kv_block_ = atoi(e);
+  cache_on_ = opt.state_cache_gib > 0;
+  conv_bytes_ = size_t(kGdnLayers) * kConvDim * (kConvK - 1) * sizeof(float);
+  ssm_bytes_ = size_t(kGdnLayers) * kVHeads * kKDim * kVDim * sizeof(float);
+  const bool spec = !opt.draft_dir.empty();
+  size_t o_conv = state_.add("conv", conv_bytes_), o_ssm = state_.add("ssm", ssm_bytes_);
+  size_t o_ssm2 = spec ? state_.add("ssm (second buffer)", ssm_bytes_) : 0;
+  size_t o_pt = state_.add("page table", max_pages_ * sizeof(int32_t));
+  size_t o_pos = state_.add("position", sizeof(int32_t));
+  size_t o_delta = state_.add("rope delta", sizeof(int32_t));
+  size_t o_rep = 0, o_par = 0, o_nc = 0, o_rng = 0, o_idv = 0, o_blk = 0, o_tv = 0, o_ti = 0, o_cap = 0, o_hist = 0,
+         o_lk = 0, o_tree = 0, o_cpath = 0, o_sbuf = 0, o_kvl = 0, o_bud = 0;
+  // Lanes of a batched step (P6-10; MAX_SEQS with a draft model).
+  const int lanes = spec && opt.park_slots > 0 ? std::min(kMaxLanes, opt.park_slots + 1) : 1;
+  if (spec) {
+    rep_rows_ = std::max(kVerifyMaxT, kLaneRows * lanes);
+    o_rep = state_.add("gdn verify inputs", 2 * kGdnLayers * rep_rows_ * kRepTokenFloats * sizeof(float));
+    o_par = state_.add("spec parity", 4);
+    o_nc = state_.add("spec commit count", 4);
+    o_bud = state_.add("spec token budget", 4);
+    o_rng = state_.add("spec rng", 16);
+    o_idv = state_.add("spec verify ids", kTreeMax * 4);
+    o_tree = state_.add("spec tree", sizeof(SpecTree));
+    o_cpath = state_.add("spec commit path", kSpecBlock * 4);
+    o_sbuf = state_.add("gdn state buffer", 4);
+    o_kvl = state_.add("kv layer table", kAttnLayers * sizeof(KvLayer));
+    o_blk = state_.add("spec block ids", kSpecBlock * 4);
+    o_hist = state_.add("token history", size_t(max_pages_) * kPageTokens * 4);
+    o_lk = state_.add("lookup match", 4);
+  }
+  // Batched steps (P6-10): the step scalars and page tables of up to MAX_SEQS lanes.
+  size_t o_bsc = 0, o_bpt = 0, o_brng = 0, o_btree = 0;
+  constexpr int kLaneInts = 5 + 3 * kSpecBlock;  // pos, delta, par, ncommit, budget, ids, block ids, commit path
+  if (lanes > 1) {
+    o_bsc = state_.add("batch lane scalars", size_t(kMaxLanes) * kLaneInts * 4);
+    o_bpt = state_.add("batch lane page tables", size_t(kMaxLanes) * max_pages_ * 4);
+    o_brng = state_.add("batch lane rng", size_t(kMaxLanes) * 16);
+    o_btree = state_.add("batch lane trees", size_t(kMaxLanes) * sizeof(SpecTree));
+  }
+
+  // Activations.
+  const int64_t Tc = opt.prefill_chunk, Tp = round_up(Tc, 128), L = opt.logits_rows;
+  auto f32 = [&](const char* what, int64_t n) { return act_.add(what, size_t(n) * 4); };
+  size_t o_x = f32("x", Tc * kHidden), o_h = f32("h", Tc * kHidden);
+  size_t o_b1 = f32("big1", Tc * kInter), o_b2 = f32("big2", Tc * kInter);
+  size_t o_q = f32("q", Tc * kKHeads * kKDim), o_k = f32("k", Tc * kKHeads * kKDim);
+  size_t o_v = f32("v", Tc * kHeads * kHeadDim), o_o = f32("o", Tc * kHeads * kHeadDim);
+  size_t o_n = f32("n", Tc * kVHeads * kVDim);
+  size_t o_a = f32("a", Tc * kVHeads), o_bb = f32("b", Tc * kVHeads), o_g = f32("g", Tc * kVHeads),
+         o_beta = f32("beta", Tc * kVHeads);
+  size_t o_aq = act_.add("act quant", size_t(Tp) * std::max(kInter / 2, kHeads * kHeadDim));
+  size_t o_asf = act_.add("act sf", size_t(sf_bytes(Tp, kInter / 16)));
+  size_t o_ids = act_.add("ids", Tc * 4);
+  size_t o_mpos = act_.add("mrope positions", Tc * 3 * 4);
+  size_t o_logits = f32("logits", L * kVocab);
+  size_t o_tki = act_.add("topk ids", L * 64 * 4), o_tkl = f32("topk logp", L * 64);
+  size_t o_u = f32("uniform", 1), o_sm = act_.add("sampled", 4);
+  ws_bytes_ = gemm_workspace_bytes(int(Tc));
+  size_t o_ws = act_.add("gemm workspace", ws_bytes_);
+  size_t o_sws = act_.add("skinny workspace", kSkinnyWsBytes);
+  size_t o_aws = act_.add("attention workspace", kAttnDecodeWsBytes);
+  // NVFP4 KV (P7-8): the prefill attention reads the context rounded to E4M3 from here: V only (1 KiB / token)
+  // for mode 3 (the default), K and V for Q38_ATTN_FP8=2 at start.
+  size_t o_fst = 0;
+  if (opt.kv_type == KvType::NVFP4 && attention_prefill_stage_on()) {
+    const bool v_only = attention_prefill_mode(KvType::NVFP4, true) == 3;
+    fa_stage_bytes_ = attention_prefill_stage_bytes(max_pages_ * kPageTokens, v_only);
+    o_fst = act_.add("prefill attention E4M3 KV", fa_stage_bytes_);
+  }
+  // Vision workspace: x_ .. aq_ (adjacent, free between forward calls), or its own region when larger.
+  size_t o_vis = 0;
+  if (opt.vision) {
+    vis_ws_bytes_ = vision_ws_bytes(opt.image_max_pixels / (vdims::kPatchPixels * vdims::kPatchPixels), vision_mode());
+    if (vis_ws_bytes_ > o_asf - o_x) o_vis = act_.add("vision workspace", vis_ws_bytes_);
+  }
+  if (spec) {
+    const int vrows = std::max(kTreeMax, kLaneRows * lanes);  // verify rows (a tree, or a batched step)
+    o_tv = act_.add("spec top-k values", size_t(vrows) * 64 * 4);
+    o_ti = act_.add("spec top-k ids", size_t(vrows) * 64 * 4);
+    o_cap = act_.add("draft context features", size_t(Tc) * ddims::kCtxFeatures * kHidden * 2);
+    draft_ = std::make_unique<Draft>(opt.draft_dir, dev_weights_, act_, int(Tc), lanes);
+  }
+
+  // Prefix cache: a device staging copy of one checkpoint and the pinned host slots.
+  ckpt_bytes_ = ssm_bytes_ + conv_bytes_ + (draft_ ? 2 * draft_->ring_layers_bytes() : 0);
+  size_t o_stage = 0;
+  int slots = 0;
+  if (cache_on_) {
+    o_stage = state_.add("checkpoint staging", ckpt_bytes_);
+    slots = std::max(1, int(opt.state_cache_gib * double(1 << 30) / double(ckpt_bytes_)));
+    host_cache_.add("state checkpoints", size_t(slots) * ckpt_bytes_);
+  }
+
+  // Parking areas of other sequences (Phase 6; a sequence's state in the checkpoint layout). They are whole
+  // KV blocks at the top of the KV pool (P7-13): area k is the pages [kv_total - (k + 1) park_pages_,
+  // kv_total - k park_pages_), contiguous memory since the pool is block-major. An area's pages hold KV while
+  // no sequence is parked there; seq_park moves them out (reserve_area).
+  Q38_CHECK(opt.park_slots >= 0 && opt.park_slots <= 15, "park_slots: 0 .. 15");
+  const size_t per_page = 2 * kAttnLayers * kv_page_bytes_;
+  park_pages_ = int(round_up(ceil_div(ckpt_bytes_, per_page), kv_block_));
+  const int park_all = opt.park_slots * park_pages_;
+
+  // KV pool (planned last): max_tokens, or with the prefix cache what the budget leaves (pages of
+  // finished sequences stay cached while their checkpoints live). Page 0 is a scratch page.
+  const size_t used = dev_weights_.size() + state_.size() + act_.size() + (size_t(256) << 20);  // graphs, slack
+  // (the parking areas are pages of the pool: a sequence of max_tokens fits while none is parked)
+  const int left_pages = budget.budget > used ? int((budget.budget - used) / per_page) - 1 : 0;
+  // MAX_TOKENS_FIT: a context the budget does not fit (e.g. 262,144 with MAX_SEQS=8) is lowered. The state
+  // sized by max_pages_ above stays as planned (a few hundred KiB more than needed).
+  if (opt.fit_max_tokens && opt.kv_pool_tokens <= 0 && left_pages < max_pages_) {
+    const int fit = (left_pages * kPageTokens - kSpecBlock) / 1024 * 1024;
+    Q38_CHECK(fit >= opt.prefill_chunk, "MAX_TOKENS_FIT: the VRAM budget leaves no room for the KV pool");
+    log("max_tokens %d does not fit the VRAM budget: lowered to %d (MAX_TOKENS_FIT)", opt.max_tokens, fit);
+    opt_.max_tokens = fit;
+    max_pages_ = int(ceil_div(fit + kSpecBlock, kPageTokens));
+  }
+  int pool_pages = max_pages_;
+  if (opt.kv_pool_tokens > 0)
+    pool_pages = std::max(max_pages_, int(ceil_div(opt.kv_pool_tokens, kPageTokens)));
+  else if (cache_on_)
+    pool_pages = std::max(max_pages_, left_pages);
+  // Whole blocks: with the prefix cache the pool takes what the budget leaves rounded down to blocks.
+  int kv_pages = int(round_up(pool_pages + 1, kv_block_));
+  if (cache_on_ && opt.kv_pool_tokens <= 0 && kv_pages - 1 > left_pages && kv_pages - kv_block_ - 1 >= max_pages_)
+    kv_pages -= kv_block_;
+  // Without the prefix cache (tests) the pool holds max_tokens (or KV_POOL_TOKENS) with every area in use.
+  const int kv_total = cache_on_ && opt.kv_pool_tokens <= 0 ? kv_pages : kv_pages + park_all;
+  Q38_CHECK(kv_total - park_all >= kv_block_, "the KV pool does not hold the parking areas (MAX_SEQS)");
+  pool_pages = kv_total - 1;
+  const char* high = getenv("Q38_PAGES_HIGH");
+  pool_.init(kv_total, high && atoi(high) != 0);
+  const size_t o_kv = kv_.add("K | V pages (and parking areas)", size_t(kv_total) * per_page);
+
+  check_and_log(budget, {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_cache_, &host_mm_});
+  for (Pool* p : {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_cache_, &host_mm_})
+    p->commit();
+  log("kv pool: %d pages (%d tokens), max_tokens %d%s", pool_pages, pool_pages * kPageTokens, opt_.max_tokens,
+      cache_on_ ? "" : " (prefix cache off)");
+  if (cache_on_) {
+    stage_ = state_.at<char>(o_stage);
+    host_slots_ = host_cache_.at<char>(0);
+    slot_used_.assign(slots, false);

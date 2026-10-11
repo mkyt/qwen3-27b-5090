@@ -1,0 +1,118 @@
+{
+  "label": "pr6-sglang-agent-concurrent",
+  "model": "qwen3.8-27b",
+  "started": "2026-10-11T16:30:05.383182",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "pr6-sglang-agent-concurrent",
+    "prompts": "reason",
+    "concurrency": "1,4",
+    "max_tokens": 4096,
+    "reps": 2,
+    "extra_body": "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"presence_penalty\":0}"
+  },
+  "results": {
+    "reason": [
+      {
+        "concurrency": 1,
+        "tokens": [
+          4096
+        ],
+        "finish": [
+          "length"
+        ],
+        "ttft": [
+          0.199
+        ],
+        "stream_tps": [
+          121.55
+        ],
+        "sum_stream_tps": 121.55,
+        "window_s": 33.69,
+        "wall_s": 33.89,
+        "wall_tps": 120.86
+      },
+      {
+        "concurrency": 1,
+        "tokens": [
+          4096
+        ],
+        "finish": [
+          "length"
+        ],
+        "ttft": [
+          0.068
+        ],
+        "stream_tps": [
+          120.83
+        ],
+        "sum_stream_tps": 120.83,
+        "window_s": 33.89,
+        "wall_s": 33.96,
+        "wall_tps": 120.61
+      },
+      {
+        "concurrency": 4,
+        "tokens": [
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "finish": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ],
+        "ttft": [
+          0.092,
+          0.129,
+          0.129,
+          0.129
+        ],
+        "stream_tps": [
+          117.62,
+          123.57,
+          109.59,
+          106.35
+        ],
+        "sum_stream_tps": 457.13,
+        "window_s": 33.14,
+        "wall_s": 38.64,
+        "wall_tps": 424.07
+      },
+      {
+        "concurrency": 4,
+        "tokens": [
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "finish": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ],
+        "ttft": [
+          0.103,
+          0.112,
+          0.112,
+          0.112
+        ],
+        "stream_tps": [
+          110.5,
+          116.97,
+          122.89,
+          115.82
+        ],
+        "sum_stream_tps": 466.19,
+        "window_s": 33.32,
+        "wall_s": 37.16,
+        "wall_tps": 440.87
+      }
+    ]
+  }
+}

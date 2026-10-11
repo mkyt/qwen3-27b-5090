@@ -1,0 +1,83 @@
+name: qwen3-27b-5090
+
+# Development services, and the engine served on port 8000 from the same image.
+#   docker compose --profile dev run --rm dev-cpu <cmd>   # no GPU attached (safe while another env is serving)
+#   docker compose --profile dev run --rm dev <cmd>       # GPU attached (microbenchmarks, GPU reference, engine tests)
+#   docker compose up -d serve                            # build libq27.so and serve the OpenAI / Anthropic API on 127.0.0.1:8000
+x-dev: &dev
+  build: ./dev
+  image: local/qwen3-27b-5090-dev:cuda13.3-torch2.14.1
+  working_dir: /work
+  # Host user, so files written into the bind mounts stay editable outside the container.
+  user: "${UID:-1000}:${GID:-1000}"
+  ipc: host
+  ulimits:
+    memlock: -1
+    stack: 67108864
+  environment: &dev-env
+    # Weights are fetched ahead of time (scripts/download-weights.sh); never reach the Hub from the container.
+    HF_HUB_OFFLINE: "1"
+    HF_HOME: /hf
+    HOME: /tmp
+    PYTHONPATH: /work/reference
+  volumes:
+    - .:/work
+    # Hugging Face cache (scripts/download-weights.sh). Make ./hf a symlink to keep the weights elsewhere.
+    - ./hf:/hf
+    - ./cache/build:/build
+
+services:
+  dev:
+    <<: *dev
+    gpus: all
+    profiles: [dev]
+  dev-cpu:
+    <<: *dev
+    environment:
+      <<: *dev-env
+      CUDA_VISIBLE_DEVICES: ""
+    profiles: [dev]
+  serve:
+    <<: *dev
+    gpus: all
+    container_name: qwen3-27b-5090
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      <<: *dev-env
+      SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-qwen3.8-27b}  # same name as the vLLM / SGLang environments
+      MAX_TOKENS: ${MAX_TOKENS:-262144}
+      MAX_TOKENS_FIT: ${MAX_TOKENS_FIT:-1}         # 1: lower MAX_TOKENS to what the VRAM fits (since P7-13 MAX_SEQS=8 fits 262144)
+      MAX_SEQS: ${MAX_SEQS:-8}                     # requests the engine can run at once (fewer while the KV pool is short; more wait)
+      MIN_SEQ_TPS: ${MIN_SEQ_TPS:-0}               # start another request only if each keeps this many tok/s (0: off)
+      ADMIT_KV: ${ADMIT_KV:-1}                     # 1: a request waits for room in the KV pool (rather than suspend one later)
+      KV_RESERVE_TOKENS: ${KV_RESERVE_TOKENS:-4096} # output tokens per request the KV admission keeps room for
+      DECODE_SHARE: ${DECODE_SHARE:-0.5}           # decode time of running requests per second of prefill
+      SCHED_QUANTUM_MS: ${SCHED_QUANTUM_MS:-50}    # decode turn of a request while several decode
+      BATCH_DECODE: ${BATCH_DECODE:-1}             # 1: decoding requests step together (P6-10); 0: they take turns
+      PREFILL_CHUNK: ${PREFILL_CHUNK:-2048}
+      KV_DTYPE: ${KV_DTYPE:-nvfp4}                # nvfp4 (default since 2026-10-11, P7-9) | fp8 | bf16 (P4-11)
+      WEIGHTS: ${WEIGHTS:-gdnfp4}                  # gdnfp4 (GDN projections NVFP4, juzbox/Qwen3.8-27B-NVFP4-GDN) | nvidia (FP8 projections) | quasar | a model dir
+      SPEC: ${SPEC:-dflash2}                       # dflash2 | none
+      Q27_DRAFT_QUANT: ${Q27_DRAFT_QUANT:-fp4}     # draft linear layers: fp4 | fp8 | bf16
+      Q27_DRAFT_VOCAB: ${Q27_DRAFT_VOCAB:-/work/bench/draft-vocab/vocab-128k.txt}  # candidate vocabulary; none: full
+      STATE_HOST_CACHE: ${STATE_HOST_CACHE:-4}     # prefix cache: GiB of pinned state checkpoints (0: off)
+      KV_POOL_TOKENS: ${KV_POOL_TOKENS:-0}         # 0: what the VRAM budget leaves
+      CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-8192}
+      VISION: ${VISION:-host}                      # off | host | fp8 | bf16: image input (P4-12)
+      IMAGE_MAX_PIXELS: ${IMAGE_MAX_PIXELS:-4194304}  # images are resized to at most this many pixels
+      IMAGE_TOKENS: ${IMAGE_TOKENS:-16384}         # image tokens per request (pinned host embeddings, 10 KiB each)
+      Q27_ATTN_FP8: ${Q27_ATTN_FP8:-}              # prefill attention MMAs: empty = 2 (FP8 KV) / 3 (NVFP4 KV: Q·K on FP4 MMAs, P7-8); 2 Q·K and P·V in FP8, 1 P·V only, 0 BF16
+      Q27_ATTN_FP4_STAGE: ${Q27_ATTN_FP4_STAGE:-1} # NVFP4 KV prefill: V (mode 3) rounded to E4M3 once per call (P7-8; 1 KiB/token; 0 = per CTA, mode 2)
+      Q27_ATTN_TC_F8: ${Q27_ATTN_TC_F8:-}          # decode / verify attention MMAs: empty = FP8 with NVFP4 KV (P7-7), 1 = also with FP8 KV, 0 = BF16 / f16
+    command: >-
+      bash -c 'cmake -S engine -B /build/engine -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
+      && cmake --build /build/engine && exec python frontend/server.py'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 600s
+    # The server restarts a crashed engine itself; this covers the server. No start with the Docker daemon:
+    # only one environment in this repository fits on the GPU at a time.
+    restart: on-failure:3

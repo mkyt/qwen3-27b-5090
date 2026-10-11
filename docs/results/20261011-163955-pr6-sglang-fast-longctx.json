@@ -1,0 +1,48 @@
+{
+  "label": "pr6-sglang-fast-longctx",
+  "model": "qwen3.8-27b",
+  "started": "2026-10-11T16:39:51.379155",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "pr6-sglang-fast-longctx",
+    "scenarios": "longctx",
+    "seed": 0,
+    "thinking": false,
+    "decode_reps": 2,
+    "decode_max_tokens": 1024,
+    "agent_sessions": "1,4",
+    "agent_turns": 8,
+    "agent_max_tokens": 512,
+    "system_tokens": 4000,
+    "tools": 20,
+    "tool_output_min": 800,
+    "tool_output_max": 3000,
+    "longctx_tokens": "32000",
+    "longctx_max_tokens": 256,
+    "extra_body": "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"presence_penalty\":0}"
+  },
+  "results": {
+    "longctx": [
+      {
+        "target_tokens": 32000,
+        "cold": {
+          "prompt_tokens": 19465,
+          "ttft": 2.402,
+          "prefill_tps": 8104.2,
+          "decode_tps": 117.76
+        },
+        "warm": {
+          "prompt_tokens": 19461,
+          "ttft": 0.206,
+          "prefill_tps": 94524.6,
+          "decode_tps": 217.1
+        },
+        "prefix_cache_hit_rate": 0.4735,
+        "prefix_cache_hits": 18432,
+        "prefix_cache_queries": 38926,
+        "spec_mean_accept_len": 3.121,
+        "spec_draft_acceptance": null
+      }
+    ]
+  }
+}

@@ -1,0 +1,124 @@
+{
+  "label": "pr6-sglang-agent-decode",
+  "model": "qwen3.8-27b",
+  "started": "2026-10-11T16:29:06.723036",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "pr6-sglang-agent-decode",
+    "scenarios": "decode",
+    "seed": 0,
+    "thinking": false,
+    "decode_reps": 3,
+    "decode_max_tokens": 1024,
+    "agent_sessions": "1,4",
+    "agent_turns": 8,
+    "agent_max_tokens": 512,
+    "system_tokens": 4000,
+    "tools": 20,
+    "tool_output_min": 800,
+    "tool_output_max": 3000,
+    "longctx_tokens": "32000,120000",
+    "longctx_max_tokens": 256,
+    "extra_body": "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"presence_penalty\":0}"
+  },
+  "results": {
+    "decode": {
+      "rows": [
+        {
+          "prompt": "code",
+          "rep": 0,
+          "completion_tokens": 1024,
+          "ttft": 0.05,
+          "decode_tps": 186.63
+        },
+        {
+          "prompt": "code",
+          "rep": 1,
+          "completion_tokens": 1024,
+          "ttft": 0.047,
+          "decode_tps": 152.99
+        },
+        {
+          "prompt": "code",
+          "rep": 2,
+          "completion_tokens": 1024,
+          "ttft": 0.046,
+          "decode_tps": 153.52
+        },
+        {
+          "prompt": "json",
+          "rep": 0,
+          "completion_tokens": 1024,
+          "ttft": 0.052,
+          "decode_tps": 221.04
+        },
+        {
+          "prompt": "json",
+          "rep": 1,
+          "completion_tokens": 1024,
+          "ttft": 0.058,
+          "decode_tps": 216.54
+        },
+        {
+          "prompt": "json",
+          "rep": 2,
+          "completion_tokens": 1024,
+          "ttft": 0.047,
+          "decode_tps": 220.41
+        },
+        {
+          "prompt": "prose",
+          "rep": 0,
+          "completion_tokens": 1024,
+          "ttft": 0.064,
+          "decode_tps": 119.75
+        },
+        {
+          "prompt": "prose",
+          "rep": 1,
+          "completion_tokens": 1024,
+          "ttft": 0.055,
+          "decode_tps": 116.42
+        },
+        {
+          "prompt": "prose",
+          "rep": 2,
+          "completion_tokens": 1024,
+          "ttft": 0.054,
+          "decode_tps": 132.17
+        }
+      ],
+      "decode_tps": {
+        "mean": 168.83,
+        "p50": 153.52,
+        "min": 116.42,
+        "max": 221.04
+      },
+      "per_prompt_tps": {
+        "code": {
+          "mean": 164.38,
+          "p50": 153.52,
+          "min": 152.99,
+          "max": 186.63
+        },
+        "json": {
+          "mean": 219.33,
+          "p50": 220.41,
+          "min": 216.54,
+          "max": 221.04
+        },
+        "prose": {
+          "mean": 122.78,
+          "p50": 119.75,
+          "min": 116.42,
+          "max": 132.17
+        }
+      },
+      "prefix_cache_hit_rate": 0.0,
+      "prefix_cache_hits": 0,
+      "prefix_cache_queries": 357,
+      "spec_mean_accept_len": 3.672,
+      "spec_draft_acceptance": null
+    }
+  }
+}

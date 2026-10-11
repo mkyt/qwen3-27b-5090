@@ -1,0 +1,4 @@
+# Build context: only the files the Dockerfile copies.
+*
+!pyproject.toml
+!uv.lock

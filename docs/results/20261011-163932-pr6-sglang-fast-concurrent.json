@@ -1,0 +1,56 @@
+{
+  "label": "pr6-sglang-fast-concurrent",
+  "model": "qwen3.8-27b",
+  "started": "2026-10-11T16:38:48.308145",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "pr6-sglang-fast-concurrent",
+    "prompts": "reason",
+    "concurrency": "1",
+    "max_tokens": 4096,
+    "reps": 2,
+    "extra_body": "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"presence_penalty\":0}"
+  },
+  "results": {
+    "reason": [
+      {
+        "concurrency": 1,
+        "tokens": [
+          4096
+        ],
+        "finish": [
+          "length"
+        ],
+        "ttft": [
+          3.127
+        ],
+        "stream_tps": [
+          197.22
+        ],
+        "sum_stream_tps": 197.22,
+        "window_s": 20.76,
+        "wall_s": 23.89,
+        "wall_tps": 171.45
+      },
+      {
+        "concurrency": 1,
+        "tokens": [
+          4096
+        ],
+        "finish": [
+          "length"
+        ],
+        "ttft": [
+          0.05
+        ],
+        "stream_tps": [
+          205.33
+        ],
+        "sum_stream_tps": 205.33,
+        "window_s": 19.94,
+        "wall_s": 19.99,
+        "wall_tps": 204.86
+      }
+    ]
+  }
+}

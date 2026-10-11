@@ -1,0 +1,68 @@
+{
+  "label": "pr6-vllm-longctx",
+  "model": "qwen3.8-27b",
+  "started": "2026-10-11T16:26:47.224818",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "pr6-vllm-longctx",
+    "scenarios": "longctx",
+    "seed": 0,
+    "thinking": false,
+    "decode_reps": 2,
+    "decode_max_tokens": 1024,
+    "agent_sessions": "1,4",
+    "agent_turns": 8,
+    "agent_max_tokens": 512,
+    "system_tokens": 4000,
+    "tools": 20,
+    "tool_output_min": 800,
+    "tool_output_max": 3000,
+    "longctx_tokens": "32000,120000",
+    "longctx_max_tokens": 256,
+    "extra_body": "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"presence_penalty\":0}"
+  },
+  "results": {
+    "longctx": [
+      {
+        "target_tokens": 32000,
+        "cold": {
+          "prompt_tokens": 19465,
+          "ttft": 3.603,
+          "prefill_tps": 5402.0,
+          "decode_tps": 109.66
+        },
+        "warm": {
+          "prompt_tokens": 19461,
+          "ttft": 0.389,
+          "prefill_tps": 49978.6,
+          "decode_tps": 153.74
+        },
+        "prefix_cache_hit_rate": 0.4521,
+        "prefix_cache_hits": 17600,
+        "prefix_cache_queries": 38926,
+        "spec_mean_accept_len": 2.695,
+        "spec_draft_acceptance": 0.565
+      },
+      {
+        "target_tokens": 120000,
+        "cold": {
+          "prompt_tokens": 72965,
+          "ttft": 19.277,
+          "prefill_tps": 3785.0,
+          "decode_tps": 95.72
+        },
+        "warm": {
+          "prompt_tokens": 72961,
+          "ttft": 1.01,
+          "prefill_tps": 72272.1,
+          "decode_tps": 141.06
+        },
+        "prefix_cache_hit_rate": 0.4824,
+        "prefix_cache_hits": 70400,
+        "prefix_cache_queries": 145926,
+        "spec_mean_accept_len": 2.66,
+        "spec_draft_acceptance": 0.5533
+      }
+    ]
+  }
+}

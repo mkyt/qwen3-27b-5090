@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["httpx==0.28.1"]
+# ///
+"""Agentic-workload benchmark for an OpenAI-compatible vLLM or SGLang server.
+
+Scenarios
+  decode   single-stream generation at short context (decode speed, MTP acceptance)
+  agent    N concurrent coding-agent sessions sharing a large system prompt + tool
+           manifest, each growing a history of tool calls / tool results
+           (prefix-cache reuse, warm-turn TTFT, decode under concurrency)
+  longctx  cold prefill of a long unique prompt, then a follow-up question on the
+           same document (prefill throughput, long-context decode, warm reuse)
+
+    uv run scripts/bench_agentic.py --label mtp-k3
+"""
+
+import argparse
+import asyncio
+import json
+import random
+import re
+import statistics
+import sys
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+import httpx
+
+WORDS = (
+    "self value index result config request buffer token cache layer state return "
+    "import class async await yield tensor batch schedule prefix block kernel worker "
+    "engine server client stream parse render error retry path file module handler "
+    "session context manager queue event loop thread offset length window"
+).split()
+
+METRIC_RE = re.compile(r"^((?:vllm|sglang|q27):[a-zA-Z_:]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+)\s*$", re.M)
+COUNTERS = (
+    # vLLM
+    "vllm:prefix_cache_queries_total",
+    "vllm:prefix_cache_hits_total",
+    "vllm:spec_decode_num_drafts_total",
+    "vllm:spec_decode_num_draft_tokens_total",
+    "vllm:spec_decode_num_accepted_tokens_total",
+    # SGLang (--enable-metrics)
+    "sglang:prompt_tokens_total",
+    "sglang:cached_tokens_total",
+    "sglang:generation_tokens_total",
+    "sglang:spec_verify_calls_total",
+    # custom engine (frontend/server.py)
+    "q27:prompt_tokens_total",
+    "q27:cached_tokens_total",
+    "q27:reusable_tokens_total",
+    "q27:generation_tokens_total",
+    "q27:spec_verify_calls_total",
+)
+EXTRA_BODY: dict = {}  # --extra-body: request fields sent to every server alike (e.g. sampling)
+
+
+def filler(rng: random.Random, approx_tokens: int) -> str:
+    """Deterministic python-ish text of roughly `approx_tokens` tokens."""
+    lines, n = [], 0
+    while n < approx_tokens:
+        w = [rng.choice(WORDS) for _ in range(rng.randint(5, 9))]
+        indent = "    " * rng.randint(0, 2)
+        lines.append(f"{indent}{w[0]}_{w[1]} = {w[2]}.{w[3]}({', '.join(w[4:])})")
+        n += 3 * len(w)
+    return "\n".join(lines)
+
+
+def make_tools(rng: random.Random, count: int) -> list[dict]:
+    tools = []
+    for i in range(count):
+        props = {
+            f"{rng.choice(WORDS)}_{j}": {"type": "string", "description": filler(rng, 40)}
+            for j in range(rng.randint(2, 5))
+        }
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": f"{rng.choice(WORDS)}_{rng.choice(WORDS)}_{i}",
+                "description": filler(rng, 250),
+                "parameters": {"type": "object", "properties": props, "required": list(props)[:1]},
+            },
+        })
+    return tools
+
+
+@dataclass
+class Result:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    ttft: float = 0.0
+    e2e: float = 0.0
+    decode_tps: float | None = None
+    content: str = ""
+    reasoning: str = ""
+    tool_calls: list = field(default_factory=list)
+
+
+async def scrape(client: httpx.AsyncClient) -> dict[str, float]:
+    out = dict.fromkeys(COUNTERS, 0.0)
+    for name, val in METRIC_RE.findall((await client.get("/metrics")).text):
+        if name in out:
+            out[name] += float(val)
+    return out
+
+
+def delta_stats(before: dict, after: dict) -> dict:
+    d = {k: after[k] - before[k] for k in COUNTERS}
+    if d["q27:prompt_tokens_total"]:
+        # Same token counting as SGLang: hit rate = cached / prompt tokens.
+        q, h = d["q27:prompt_tokens_total"], d["q27:cached_tokens_total"]
+        steps, gen = d["q27:spec_verify_calls_total"], d["q27:generation_tokens_total"]
+        # reusable: tokens shared with an earlier prompt + output (the cap of any prefix cache on this load).
+        r = d["q27:reusable_tokens_total"]
+        return {"prefix_cache_hit_rate": round(h / q, 4), "prefix_cache_hits": int(h), "prefix_cache_queries": int(q),
+                "prefix_cache_reusable": int(r), "prefix_cache_hit_of_reusable": round(h / r, 4) if r else None,
+                "spec_mean_accept_len": round(gen / steps, 3) if steps else None, "spec_draft_acceptance": None}
+    if d["sglang:prompt_tokens_total"]:
+        # SGLang counts tokens: hit rate = cached / prompt tokens; accept length = tokens per verify step.
+        q, h = d["sglang:prompt_tokens_total"], d["sglang:cached_tokens_total"]
+        steps, gen = d["sglang:spec_verify_calls_total"], d["sglang:generation_tokens_total"]
+        return {
+            "prefix_cache_hit_rate": round(h / q, 4) if q else None,
+            "prefix_cache_hits": int(h),
+            "prefix_cache_queries": int(q),
+            "spec_mean_accept_len": round(gen / steps, 3) if steps else None,
+            "spec_draft_acceptance": None,
+        }
+    q, h = d["vllm:prefix_cache_queries_total"], d["vllm:prefix_cache_hits_total"]
+    drafts = d["vllm:spec_decode_num_drafts_total"]
+    acc = d["vllm:spec_decode_num_accepted_tokens_total"]
+    dtok = d["vllm:spec_decode_num_draft_tokens_total"]
+    return {
+        "prefix_cache_hit_rate": round(h / q, 4) if q else None,
+        "prefix_cache_hits": int(h),
+        "prefix_cache_queries": int(q),
+        "spec_mean_accept_len": round(1 + acc / drafts, 3) if drafts else None,
+        "spec_draft_acceptance": round(acc / dtok, 4) if dtok else None,
+    }
+
+
+async def chat(client, model, messages, *, max_tokens, tools=None, thinking=False, seed=0) -> Result:
+    body = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "seed": seed,
+        "chat_template_kwargs": {"enable_thinking": thinking},
+    }
+    body.update(EXTRA_BODY)
+    if tools:
+        body["tools"] = tools
+    res, content, reasoning, calls = Result(), [], [], {}
+    t0 = time.perf_counter()
+    first = last = None
+    async with client.stream("POST", "/v1/chat/completions", json=body) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}: {(await r.aread())[:500]!r}")
+        async for line in r.aiter_lines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            chunk = json.loads(line[6:])
+            if chunk.get("usage"):
+                res.prompt_tokens = chunk["usage"]["prompt_tokens"]
+                res.completion_tokens = chunk["usage"]["completion_tokens"]
+            for choice in chunk.get("choices") or []:
+                delta, got = choice.get("delta") or {}, False
+                if delta.get("content"):
+                    content.append(delta["content"])
+                    got = True
+                if delta.get("reasoning") or delta.get("reasoning_content"):
+                    reasoning.append(delta.get("reasoning") or delta.get("reasoning_content"))
+                    got = True
+                for tc in delta.get("tool_calls") or []:
+                    got = True
+                    slot = calls.setdefault(tc.get("index", 0), {
+                        "id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+                    slot["id"] = tc.get("id") or slot["id"]
+                    fn = tc.get("function") or {}
+                    slot["function"]["name"] += fn.get("name") or ""
+                    slot["function"]["arguments"] += fn.get("arguments") or ""
+                if got:
+                    last = time.perf_counter()
+                    first = first or last
+    end = time.perf_counter()
+    res.ttft = (first or end) - t0
+    res.e2e = end - t0
+    if res.completion_tokens > 1 and first and last and last > first:
+        res.decode_tps = (res.completion_tokens - 1) / (last - first)
+    res.content, res.reasoning = "".join(content), "".join(reasoning)
+    for i, c in sorted(calls.items()):
+        c["id"] = c["id"] or f"call_{i}_{uuid.uuid4().hex[:8]}"
+        try:
+            ok = isinstance(json.loads(c["function"]["arguments"] or "{}"), dict)
+        except json.JSONDecodeError:
+            ok = False
+        if not ok:
+            # e.g. cut off by max_tokens; SGLang rejects non-object arguments when they are sent back
+            c["function"]["arguments"] = "{}"
+        res.tool_calls.append(c)
+    return res
+
+
+def summarize(values):
+    values = [v for v in values if v is not None]
+    if not values:
+        return None
+    return {"mean": round(statistics.fmean(values), 3), "p50": round(statistics.median(values), 3),
+            "min": round(min(values), 3), "max": round(max(values), 3)}
+
+
+async def scenario_decode(client, model, args):
+    prompts = {
+        "code": "Write a complete, well-documented Python module implementing a thread-safe LRU cache "
+                "with TTL expiry, plus pytest unit tests. Output only code.",
+        "json": "Generate a JSON array of 25 fictional employee records with fields id, name, email, "
+                "department, salary, start_date, skills (array). Output only JSON.",
+        "prose": "Explain in detail how a CPU executes a program, from fetching instructions to "
+                 "branch prediction and caches.",
+    }
+    before, rows = await scrape(client), []
+    for name, text in prompts.items():
+        for rep in range(args.decode_reps):
+            r = await chat(client, model, [{"role": "user", "content": text}],
+                           max_tokens=args.decode_max_tokens, seed=rep)
+            rows.append({"prompt": name, "rep": rep, "completion_tokens": r.completion_tokens,
+                         "ttft": round(r.ttft, 3), "decode_tps": round(r.decode_tps or 0, 2)})
+            print(f"  decode/{name}#{rep}: {r.completion_tokens} tok, {r.decode_tps or 0:.1f} tok/s")
+    return {"rows": rows, "decode_tps": summarize([x["decode_tps"] for x in rows]),
+            "per_prompt_tps": {p: summarize([x["decode_tps"] for x in rows if x["prompt"] == p])
+                               for p in prompts},
+            **delta_stats(before, await scrape(client))}
+
+
+async def agent_session(client, model, args, sid, system, tools, rows):
+    rng = random.Random(f"{args.seed}-{sid}")
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"[session {sid}] Refactor the scheduler module so that block "
+                                    f"allocation is O(1). Inspect the relevant files with the tools, "
+                                    f"then propose the change.\n\n{filler(rng, 300)}"},
+    ]
+    for turn in range(args.agent_turns):
+        r = await chat(client, model, messages, max_tokens=args.agent_max_tokens, tools=tools,
+                       thinking=args.thinking, seed=turn)
+        rows.append({"session": sid, "turn": turn, "prompt_tokens": r.prompt_tokens,
+                     "completion_tokens": r.completion_tokens, "tool_calls": len(r.tool_calls),
+                     "ttft": round(r.ttft, 3), "e2e": round(r.e2e, 3),
+                     "decode_tps": round(r.decode_tps, 2) if r.decode_tps else None})
+        assistant = {"role": "assistant", "content": r.content}
+        if r.reasoning:
+            assistant["reasoning_content"] = r.reasoning
+        if r.tool_calls:
+            assistant["tool_calls"] = r.tool_calls
+        messages.append(assistant)
+        output = filler(rng, rng.randint(args.tool_output_min, args.tool_output_max))
+        if r.tool_calls:
+            for tc in r.tool_calls:
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": output})
+        else:
+            messages.append({"role": "user", "content": f"Tool output:\n{output}\n\nContinue."})
+
+
+async def scenario_agent(client, model, args, sessions):
+    rng = random.Random(f"{args.seed}-shared")
+    nonce = uuid.uuid4().hex  # unique per run so previous runs cannot warm the cache
+    system = (f"# run {nonce}\nYou are an autonomous coding agent working in a large repository. "
+              f"Always call tools to gather information before answering.\n\n"
+              f"{filler(rng, args.system_tokens)}")
+    tools = make_tools(rng, args.tools)
+    before, rows = await scrape(client), []
+    t0 = time.perf_counter()
+    await asyncio.gather(*(agent_session(client, model, args, s, system, tools, rows)
+                           for s in range(sessions)))
+    wall = time.perf_counter() - t0
+    warm = [x for x in rows if x["turn"] > 0]
+    out = {
+        "sessions": sessions, "turns": args.agent_turns, "wall_s": round(wall, 2),
+        "output_tok_per_s": round(sum(x["completion_tokens"] for x in rows) / wall, 2),
+        "first_turn_ttft": summarize([x["ttft"] for x in rows if x["turn"] == 0]),
+        "warm_turn_ttft": summarize([x["ttft"] for x in warm]),
+        "decode_tps": summarize([x["decode_tps"] for x in rows]),
+        "final_prompt_tokens": max(x["prompt_tokens"] for x in rows),
+        "tool_call_turns": sum(1 for x in rows if x["tool_calls"]),
+        **delta_stats(before, await scrape(client)),
+        "rows": rows,
+    }
+    print(f"  agent x{sessions}: warm TTFT p50 {out['warm_turn_ttft']['p50']}s, "
+          f"decode p50 {out['decode_tps']['p50']} tok/s, hit rate {out['prefix_cache_hit_rate']} "
+          f"({out.get('prefix_cache_hit_of_reusable')} of reusable), "
+          f"final ctx {out['final_prompt_tokens']}")
+    return out
+
+
+async def scenario_longctx(client, model, args, tokens):
+    rng = random.Random(f"{args.seed}-long-{tokens}")
+    doc = f"# document {uuid.uuid4().hex}\n{filler(rng, tokens)}"
+    out, before = {"target_tokens": tokens}, await scrape(client)
+    for label, question in (("cold", "Summarize what this code does in 3 sentences."),
+                            ("warm", "List five identifiers that appear most often.")):
+        r = await chat(client, model, [{"role": "user", "content": f"{doc}\n\n{question}"}],
+                       max_tokens=args.longctx_max_tokens)
+        out[label] = {"prompt_tokens": r.prompt_tokens, "ttft": round(r.ttft, 3),
+                      "prefill_tps": round(r.prompt_tokens / r.ttft, 1),
+                      "decode_tps": round(r.decode_tps or 0, 2)}
+        print(f"  longctx {tokens}/{label}: {r.prompt_tokens} tok, TTFT {r.ttft:.2f}s, "
+              f"decode {r.decode_tps or 0:.1f} tok/s")
+    out.update(delta_stats(before, await scrape(client)))
+    return out
+
+
+async def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--base-url", default="http://127.0.0.1:8000")
+    ap.add_argument("--label", default="run")
+    ap.add_argument("--scenarios", default="decode,agent,longctx")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--thinking", action="store_true", help="enable thinking in agent turns")
+    ap.add_argument("--decode-reps", type=int, default=2)
+    ap.add_argument("--decode-max-tokens", type=int, default=1024)
+    ap.add_argument("--agent-sessions", default="1,4")
+    ap.add_argument("--agent-turns", type=int, default=8)
+    ap.add_argument("--agent-max-tokens", type=int, default=512)
+    ap.add_argument("--system-tokens", type=int, default=4000)
+    ap.add_argument("--tools", type=int, default=20)
+    ap.add_argument("--tool-output-min", type=int, default=800)
+    ap.add_argument("--tool-output-max", type=int, default=3000)
+    ap.add_argument("--longctx-tokens", default="32000,120000")
+    ap.add_argument("--longctx-max-tokens", type=int, default=256)
+    ap.add_argument("--extra-body", default="{}",
+                    help='JSON merged into every request, e.g. \'{"temperature": 0}\' to pin sampling across servers')
+    ap.add_argument("--out-dir", default=str(Path(__file__).resolve().parent.parent / "bench" / "results"))
+    args = ap.parse_args()
+    EXTRA_BODY.update(json.loads(args.extra_body))
+    sys.stdout.reconfigure(line_buffering=True)  # show progress when piped / backgrounded
+
+    async with httpx.AsyncClient(base_url=args.base_url.rstrip("/"), timeout=None) as client:
+        model = (await client.get("/v1/models")).json()["data"][0]["id"]
+        await chat(client, model, [{"role": "user", "content": "hi"}], max_tokens=8)  # warmup
+        report = {"label": args.label, "model": model, "started": datetime.now().isoformat(),
+                  "args": {k: v for k, v in vars(args).items() if k != "out_dir"}, "results": {}}
+        scenarios = args.scenarios.split(",")
+        if "decode" in scenarios:
+            report["results"]["decode"] = await scenario_decode(client, model, args)
+        if "agent" in scenarios:
+            report["results"]["agent"] = [await scenario_agent(client, model, args, int(n))
+                                          for n in args.agent_sessions.split(",")]
+        if "longctx" in scenarios:
+            report["results"]["longctx"] = [await scenario_longctx(client, model, args, int(n))
+                                            for n in args.longctx_tokens.split(",")]
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{args.label}.json"
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    print(f"saved {path}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

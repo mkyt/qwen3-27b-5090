@@ -1,0 +1,28 @@
+# Python environment of the dev image (reference model, tests, quantization, bench clients).
+# The serving engine itself does not use Python or PyTorch.
+[project]
+name = "qwen3-27b-5090-dev"
+version = "0.0.0"
+requires-python = "==3.12.*"
+dependencies = [
+  "torch==2.14.1",
+  "torchvision",  # image processor of the vision tower (Qwen2VLImageProcessorFast), P4-12
+  "pillow",
+  "transformers==5.18.0",
+  "safetensors==0.8.0",
+  "numpy==2.5.3",
+  "pytest",
+  "httpx",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+torchvision = { index = "pytorch-cu132" }
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
