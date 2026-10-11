@@ -1,44 +1,82 @@
 # Qwen3.8-27B on one RTX 5090
 
 A single-purpose inference engine for [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) on one NVIDIA RTX 5090
-(32 GB, SM120), written from scratch in C++ / CUDA with a small Python server in front. It serves the full 262K-token
-context, up to eight requests at once, images, and OpenAI- and Anthropic-compatible APIs, so coding agents such as
-Claude Code and Codex can use it as their backend.
+(32 GB, SM120), written from scratch in C++ / CUDA with a small Python server in front. It serves OpenAI- and
+Anthropic-compatible APIs with images, so coding agents such as Claude Code and Codex can use it as their backend.
 
 It is not a general engine: the kernels, the memory plan and the scheduler are written for this one model on this one
-GPU, which is where its speed comes from.
+GPU. That buys two things:
 
-| What | This engine | Notes |
-| --- | ---: | --- |
-| Decode, one request (code / JSON / prose) | 328–395 / 497–505 / 258–267 tok/s | DFlash2 speculative decoding, the model's default sampling |
-| Aggregate decode, 4 / 8 concurrent requests | 935 / 1,395 tok/s | 4,096 output tokens each, about 172 tok/s per request at 8 |
-| Prefill at 19K / 73K / 194K tokens | 11,295 / 8,773 / 5,875 tok/s | one request, cold |
-| Agent turn after a 20K-token conversation | 0.19 s to the first token | prefix cache hit on everything reusable |
-| KV cache capacity | 605,504 tokens | 262K context for one request, with `MAX_SEQS=8` |
+- **Speed.** Faster than vLLM, SGLang and NInfer on the same card in every scenario measured: 1.3–2.8x the
+  single-request decode, 1.1–1.7x the throughput of eight concurrent requests, and a 152K-token prompt answered in
+  23 s instead of 31–56 s.
+- **The full 262K context with room to spare.** A 605K-token KV cache on a 32 GB card, 2.8–6.3x what the other
+  engines fit, with up to eight requests, images and speculative decoding all enabled at once. Of the others, only
+  NInfer reached the model's whole 262,144-token context here, serving one request without speculative decoding.
 
-On the same GPU with the same scripts, the fastest settings of other engines decode code at 285 tok/s (NInfer),
-246 (SGLang with DFlash2) and 154 (vLLM) for one request, and reach 1,260–1,277 / 837–851 / 912–930 tok/s with eight
-concurrent requests. A 152K-token prompt reaches its first token after 23 s here, 31 s on NInfer, 50 s on SGLang and
-56 s on vLLM ([comparison](docs/benchmarks.md#other-engines)).
+All numbers are measured at a **400 W power limit** (the card's default is 575 W), on the same day, driver and scripts
+for every engine. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, each engine's settings and the
+commands that reproduce them.
 
-All numbers are at a 400 W power limit. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, the commands that
-produce them and the comparison with other engines.
+## Fast
 
-## How
+| On one RTX 5090 at 400 W | This engine | NInfer | SGLang | vLLM |
+| --- | ---: | ---: | ---: | ---: |
+| Decode, one request: code / JSON / prose (tok/s) | **386 / 500 / 258** | 285 / 362 / 197 | 246 / 320 / 167 | 154 / 180 / 128 |
+| Eight concurrent requests, total (tok/s) | **1,395** | 1,260–1,277 | 837–851 | 912–930 |
+| Time to first token, 152K-token document | **23 s** | 31 s | 50 s | 56 s |
+| Time to first token, agent turn after a 20K-token history | **0.19 s** | 0.39 s | 0.31 s | 0.57 s |
+| Follow-up question on a 73K-token document | **0.14 s** | 10.9 s | 0.49 s | 1.01 s |
 
-- **Weights**: [juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), NVIDIA's NVFP4
-  checkpoint with the Gated DeltaNet projections also quantized to NVFP4 (GPTQ from the BF16 original). The attention
-  projections stay FP8: quantizing them too cost parallel tool calls.
-- **KV cache in NVFP4**, 1.7x the tokens of FP8, with the prefill attention's QK^T on native FP4 MMAs.
-- **Speculative decoding** with the [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) block drafter, batched
-  across concurrent requests; each request's tokens are bit-identical to running it alone.
-- **Prefix cache** of GDN state checkpoints in pinned host memory, so an agent's growing conversation is prefilled once.
-- **One memory plan at startup**: no allocation while serving; idle per-request areas are lent to the KV pool.
-- **Vision tower** streamed from host memory layer by layer (no VRAM cost, 47 ms for a 1024x1024 image).
+- **Speculative decoding** with the [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) block drafter,
+  batched across concurrent requests; each request's tokens are bit-identical to running it alone.
+- **NVFP4 weights including the Gated DeltaNet projections**
+  ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), GPTQ from the BF16 original;
+  the attention projections stay FP8 because quantizing them cost parallel tool calls): decode reads 14 GiB of
+  weights per step, and the GEMMs and attention run on FP4 / FP8 tensor-core MMAs.
+- **Prefix cache** of the recurrent (GDN) state in host memory, so an agent's growing conversation and repeated
+  questions on a long document are prefilled once.
 
-[docs/architecture.md](docs/architecture.md) explains the design; [docs/decisions.md](docs/decisions.md) lists the
-measured reasons behind each choice, including the options that were tried and dropped. Task IDs in code comments
-(such as `P7-8`) refer to entries there.
+## Long context on a 32 GB card
+
+| | This engine | NInfer | SGLang | vLLM |
+| --- | ---: | ---: | ---: | ---: |
+| KV cache (tokens) | **605,504** | 96,128 | 214,219 | 173,913 |
+| Longest context of one request | **262,144** (the model's limit) | 94,208 | 196,608 | 160,000 |
+| ... at the same time as | 8 concurrent requests, images, DFlash2 | 4 requests | 4 requests, MTP | 8 requests, MTP |
+
+The other engines' columns are the largest settings with concurrency and speculative decoding that ran on this
+machine; NInfer and SGLang need other configurations for other scenarios (NInfer: 262K for one request without
+speculative decoding; SGLang: one request at 90K for its DFlash2 mode). Here one configuration serves everything:
+the defaults.
+
+Where the memory comes from: the weights and the draft take about 15 GiB, and the engine plans the rest once at
+startup against an explicit budget (no allocator slack, no profiling run). One GiB holds about 58K tokens of NVFP4
+KV cache, so every GiB not spent elsewhere becomes context:
+
+| Choice | VRAM it saves | About this many tokens of KV cache |
+| --- | ---: | ---: |
+| **KV cache in NVFP4** (4-bit values, an FP8 scale per 16), with prefill attention's QK^T on native FP4 MMAs: prefill is as fast as with FP8 KV or faster | 42% of the KV cache | 1.7x the tokens of FP8 (590K against 340K) |
+| **Vision tower streamed from pinned host memory**, one layer ahead of the computation (47 ms for a 1024x1024 image, output identical to keeping it in VRAM) | 0.86 GiB of weights | 40K (measured against keeping it in VRAM) |
+| **Embedding table in pinned host memory**, read over PCIe one row per token | 2.37 GiB | 138K |
+| **Draft model quantized to NVFP4** at load time (same acceptance as BF16) | 2.4 GiB | 140K |
+| **No per-row GDN state copies** for speculative verification (the next step replays the accepted tokens instead) | 0.9 GiB per request | 52K per request |
+| **Idle requests' state lent to the KV cache**: the 189.6 MiB parking area of each waiting request holds KV pages until it is needed | 1.3 GiB with `MAX_SEQS=8` | 72K (measured) |
+
+Long prompts stay fast and accurate:
+
+| Context | Prefill | Decode, no speculation |
+| ---: | ---: | ---: |
+| 73K tokens | 8,773 tok/s (8.3 s) | 87 tok/s |
+| 194K tokens | 5,875 tok/s (33 s) | 77 tok/s |
+
+Between 73K and 152K tokens of a prompt this engine prefills 5,359 tok/s, against 3,868 (NInfer), 2,234 (SGLang)
+and 1,953 (vLLM). Needle retrieval finds 16 of 16 facts at 190K tokens and 56 of 64 at 256K.
+
+The full measurements, each engine's settings and the caveats (NInfer's memory sizing under WSL2, for one) are in
+[docs/benchmarks.md](docs/benchmarks.md#other-engines); [docs/architecture.md](docs/architecture.md) explains the
+design and [docs/decisions.md](docs/decisions.md) lists the measured reasons behind each choice, including the
+options that were tried and dropped. Task IDs in code comments (such as `P7-8`) refer to entries there.
 
 ## Requirements
 
