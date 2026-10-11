@@ -225,8 +225,9 @@ gate without an explicit decision, recorded below with its numbers.
   saved no energy.
 - **P5-11: block-scaled FP8 MMAs with unit scales.** On the RTX 5090 the plain FP8 MMA with FP32 accumulation runs
   at half rate (507 against 1,007 TFLOPS); the block-scaled `mxf8f6f4` with scales of 1.0 gives bit-identical
-  results at full rate (a technique from NInfer). Prefill FP8 GEMMs use CUTLASS's MXFP8 kernel, and the FP8
-  attention the same instruction: 19K / 73K / 194K 9,319 -> 9,726, 7,080 -> 7,600, 4,584 -> 5,113 tok/s.
+  results at full rate (a technique from [NInfer](https://github.com/Neroued/ninfer)). Prefill FP8 GEMMs use
+  CUTLASS's MXFP8 kernel, and the FP8 attention the same instruction: 19K / 73K / 194K 9,319 -> 9,726,
+  7,080 -> 7,600, 4,584 -> 5,113 tok/s.
 - **Attention tiles on absolute positions.** A 2,048-token chunk made 2.26 waves; blocks that end past 1,024 split
   their keys in two, which depends only on the block, so a row's result is the same wherever a chunk starts.
 - **P7-8: prefill attention with the NVFP4 KV cache.**

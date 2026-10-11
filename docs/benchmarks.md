@@ -102,7 +102,7 @@ the sampling pinned for all of them (`--extra-body '{"temperature":1.0,"top_p":0
 Each engine runs its own weights and KV cache type, and some need different settings for different scenarios
 because one configuration cannot do everything; the settings are listed below the table.
 
-| | This engine | [NInfer](https://github.com/Neroued/ninfer) | SGLang | vLLM |
+| | This engine | [NInfer](https://github.com/Neroued/ninfer) | [SGLang](https://github.com/sgl-project/sglang) | [vLLM](https://github.com/vllm-project/vllm) |
 | --- | ---: | ---: | ---: | ---: |
 | Context limit / KV cache, tokens | 262,144 / 605,504 | 16,384 / 43,904 (x8), 94,208 / 96,128 (x4) | 90,000 / 98,134 (fast), 196,608 / 214,219 (agent) | 160,000 / 173,913 |
 | Decode, one request, code / JSON / prose (tok/s) | **386 / 500 / 258** | 285 / 362 / 197 | 246 / 320 / 167 (fast) | 154 / 180 / 128 |
@@ -142,9 +142,9 @@ tokenization and the first decode step, so these are slightly below the in-proce
 | Engine | Version | Weights | KV cache | Speculative decoding | Settings |
 | --- | --- | --- | --- | --- | --- |
 | This engine | this repository | `gdnfp4` | NVFP4 | DFlash2, 8-token blocks | defaults (`MAX_SEQS=8`) |
-| NInfer | `81c8ce0`, built on this repository's `dev` image | `neroued/Qwen3.8-27B-nvfp4-NInfer` | FP8 | DFlash2, 7 draft tokens, `--lm-head-draft` | x8: `--max-context 16384 --max-concurrency 8 --device-state-slots 0` (decode, concurrency); x4: `--max-context 94208 --max-concurrency 4` (agent, documents); larger settings do not fit under WSL2 |
-| SGLang | v0.5.21 with two unmerged patches (embedding in host memory, MTP weight sharing) | `nvidia/Qwen3.8-27B-NVFP4` | FP8 | fast: DFlash2 (one request at a time); agent / parallel: the checkpoint's MTP head, 5 steps | fast: 90K, 1 request; agent: 196K, 4 requests; parallel: 160K, 8 requests |
-| vLLM | v0.29.0 | `nvidia/Qwen3.8-27B-NVFP4` | FP8 | MTP, 3 tokens | 160K, 8 requests, a fixed 6.5 GiB KV cache |
+| [NInfer](https://github.com/Neroued/ninfer) | [`81c8ce0`](https://github.com/Neroued/ninfer/commit/81c8ce093b2c1646a87566a8e59d807fcf0ec95c), built on this repository's `dev` image | `neroued/Qwen3.8-27B-nvfp4-NInfer` | FP8 | DFlash2, 7 draft tokens, `--lm-head-draft` | x8: `--max-context 16384 --max-concurrency 8 --device-state-slots 0` (decode, concurrency); x4: `--max-context 94208 --max-concurrency 4` (agent, documents); larger settings do not fit under WSL2 |
+| [SGLang](https://github.com/sgl-project/sglang) | [v0.5.21](https://github.com/sgl-project/sglang/releases/tag/v0.5.21) with two unmerged patches: embedding in host memory ([#37826](https://github.com/sgl-project/sglang/pull/37826), backported) and MTP weight sharing ([#37155](https://github.com/sgl-project/sglang/pull/37155)) | `nvidia/Qwen3.8-27B-NVFP4` | FP8 | fast: DFlash2 (one request at a time); agent / parallel: the checkpoint's MTP head, 5 steps | fast: 90K, 1 request; agent: 196K, 4 requests; parallel: 160K, 8 requests |
+| [vLLM](https://github.com/vllm-project/vllm) | [v0.29.0](https://github.com/vllm-project/vllm/releases/tag/v0.29.0) | `nvidia/Qwen3.8-27B-NVFP4` | FP8 | MTP, 3 tokens | 160K, 8 requests, a fixed 6.5 GiB KV cache |
 
 The JSON files are in [results/](results/) (`20261011-1*-pr6-*.json`). Notes:
 

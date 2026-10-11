@@ -7,7 +7,7 @@ Anthropic-compatible APIs with images, so coding agents such as Claude Code and 
 It is not a general engine: the kernels, the memory plan and the scheduler are written for this one model on this one
 GPU. That buys two things:
 
-- **Speed.** Faster than vLLM, SGLang and NInfer on the same card in every scenario measured: 1.3–2.8x the
+- **Speed.** Faster than [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [NInfer](https://github.com/Neroued/ninfer) on the same card in every scenario measured: 1.3–2.8x the
   single-request decode, 1.1–1.7x the throughput of eight concurrent requests, and a 152K-token prompt answered in
   23 s instead of 31–56 s.
 - **The full 262K context with room to spare.** A 605K-token KV cache on a 32 GB card, 2.8–6.3x what the other
