@@ -29,6 +29,9 @@ SIGNATURES = {
     "q27_prefix_begin": ([P, P, I, P, I, I, P], I),
     "q27_checkpoint": ([P], I),
     "q27_cache_stats": ([P, P], I),
+    "q27_cache_grow": ([P, I, P], I),
+    "q27_memory_report": ([P, ctypes.c_char_p, I], I),
+    "q27_device_memory": ([P, P], I),
     "q27_has_vision": ([P], I),
     "q27_mm_set": ([P, P, I], I),
     "q27_mm_encode": ([P, I, P], I),
@@ -271,12 +274,49 @@ class Engine:
         """Saves a checkpoint of the sequence so far (e.g. after a generation)."""
         self._check(lib().q27_checkpoint(self.h), "q27_checkpoint")
 
+    def cache_grow(self, n=1):
+        """Allocates up to n more pinned state slots of the prefix cache (not allocated at startup; about 80 ms each
+        on WSL2); returns how many (0: all are)."""
+        out = ctypes.c_int()
+        self._check(lib().q27_cache_grow(self.h, n, ctypes.byref(out)), "q27_cache_grow")
+        return out.value
+
     def cache_stats(self):
-        out = (ctypes.c_int64 * 11)()
+        out = (ctypes.c_int64 * 12)()
         self._check(lib().q27_cache_stats(self.h, out), "q27_cache_stats")
         keys = ("lookups", "hits", "prompt_tokens", "cached_tokens", "saved", "evicted", "checkpoints", "free_pages",
-                "checkpoint_only_pages", "pool_pages", "park_pages")
+                "checkpoint_only_pages", "pool_pages", "park_pages", "slots_allocated")
         return dict(zip(keys, out))
+
+    def memory_report(self):
+        """The memory pools: {"pools": [{"name", "host", "bytes", "items": [(what, bytes)]}], "slots": state cache
+        slots, "checkpoint_bytes": bytes of one}. Fixed once the engine is created."""
+        cap = 1 << 20
+        while True:
+            buf = ctypes.create_string_buffer(cap)
+            n = lib().q27_memory_report(self.h, buf, cap)
+            if n < 0:
+                raise RuntimeError(f"q27_memory_report: {lib().q27_last_error().decode()}")
+            if n < cap:
+                break
+            cap = n + 1
+        pools, out = {}, {"pools": [], "slots": 0, "checkpoint_bytes": 0}
+        for line in buf.value.decode().splitlines():
+            f = line.split("\t")
+            if f[0] == "pool":
+                pools[f[1]] = {"name": f[1], "host": f[2] == "1", "bytes": int(f[3]), "items": []}
+                out["pools"].append(pools[f[1]])
+            elif f[0] == "item":
+                pools[f[1]]["items"].append((f[2], int(f[3])))
+            elif f[0] == "slots":
+                out["slots"], out["checkpoint_bytes"] = int(f[1]), int(f[2])
+        return out
+
+    def device_memory(self):
+        """{"free", "total"} device bytes now (cudaMemGetInfo), "free_at_start" (before the pools), "budget"."""
+        out = (ctypes.c_int64 * 4)()
+        self._check(lib().q27_device_memory(self.h, out), "q27_device_memory")
+        return dict(zip(("free", "total", "free_at_start", "budget"), out))
 
     @property
     def has_vision(self):

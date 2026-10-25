@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "common.h"
+#include "prefetch.h"
 
 namespace q27 {
 namespace {
@@ -246,22 +247,47 @@ void Weights::plan_vision(const SafeTensors& ckpt, Pool& dev, Pool& host, Vision
 void Weights::load(cudaStream_t s) {
   auto t0 = std::chrono::steady_clock::now();
   for (auto& [dst, loc] : ptrs_) *dst = loc.first->at<void>(loc.second);
+  // The reads in the order the loop below takes them, read ahead by several threads (prefetch.h): the f32
+  // scalars, then per job the embedding (straight into its pinned table), the scale factors and the plain
+  // tensors in slot-sized chunks. Small NVFP4 layers, VISION=fp8 matrices and scale factors larger than a slot
+  // are read here directly.
+  constexpr int64_t kChunk = Prefetcher::kSlotBytes;
+  std::vector<Prefetcher::Read> plan;
   for (auto& sj : scalars_) {
     const auto& info = sj.src->info(sj.name);
     Q27_CHECK(info.dtype == "F32" && info.nbytes == 4, sj.name + ": expected an f32 scalar");
-    sj.src->read(sj.name, sj.dst);
+    plan.push_back({sj.src, sj.name, 0, 4, sj.dst});
+  }
+  for (auto& j : jobs_) {
+    const auto& info = j.src->info(j.name);
+    if (!j.dq.empty() || j.q8_rows || (j.sf_rows && !Prefetcher::fits(info.nbytes))) continue;
+    if (j.sf_rows) {
+      plan.push_back({j.src, j.name, 0, info.nbytes, nullptr});
+      continue;
+    }
+    char* host = j.pool->host() ? j.pool->at<char>(j.offset) : nullptr;
+    for (int64_t off = 0; off < info.nbytes; off += kChunk)
+      plan.push_back({j.src, j.name, off, std::min<int64_t>(kChunk, info.nbytes - off), host ? host + off : nullptr});
+  }
+  Prefetcher pf(std::move(plan));
+  size_t ri = 0;
+  for (auto& sj : scalars_) {
+    pf.get(ri++, sj.name, 0);
     if (sj.inv) *sj.dst = 1.f / *sj.dst;
   }
   fuse();
-  // Two pinned staging buffers: the next chunk is read from disk while the previous one is copied.
+  // Two pinned staging buffers for the direct reads: the next chunk is read while the previous one is copied.
   constexpr size_t kStage = 128 << 20;
-  void* stage[2];
+  void* stage[2] = {nullptr, nullptr};
   cudaEvent_t done[2];
   for (int i = 0; i < 2; i++) {
-    Q27_CUDA(cudaHostAlloc(&stage[i], kStage, cudaHostAllocMapped));
     Q27_CUDA(cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming));
     Q27_CUDA(cudaEventRecord(done[i], s));
   }
+  auto staging = [&] {
+    for (int i = 0; i < 2; i++)
+      if (!stage[i]) Q27_CUDA(cudaHostAlloc(&stage[i], kStage, cudaHostAllocMapped));
+  };
   int cur = 0;
   size_t total = 0;
   void* q8_tmp = nullptr;  // (VISION=fp8: one BF16 matrix at a time)
@@ -271,10 +297,6 @@ void Weights::load(cudaStream_t s) {
     const auto& info = ckpt.info(j.name);
     total += size_t(info.nbytes);
     char* dst = j.pool->at<char>(j.offset);
-    if (j.pool->host()) {  // embedding: straight into the pinned table
-      ckpt.read(j.name, dst);
-      continue;
-    }
     if (!j.dq.empty()) {  // small NVFP4 layer -> BF16 (e2m1 * scale / global, compressed-tensors)
       const int rows = int(info.shape[0]), cols = int(info.shape[1]) * 2;
       std::vector<uint8_t> packed(size_t(info.nbytes)), sf(size_t(rows) * cols / 16);
@@ -285,6 +307,7 @@ void Weights::load(cudaStream_t s) {
       ckpt.read(j.dq + ".weight_global_scale", &global);
       static const float kE2m1[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
       Q27_CHECK(size_t(rows) * cols * sizeof(bf16) <= kStage, j.dq + ": larger than the staging buffer");
+      staging();
       Q27_CUDA(cudaEventSynchronize(done[cur]));
       bf16* out = static_cast<bf16*>(stage[cur]);
       for (int r = 0; r < rows; r++)
@@ -305,6 +328,7 @@ void Weights::load(cudaStream_t s) {
         q8_tmp_bytes = size_t(info.nbytes);
         Q27_CUDA(cudaMalloc(&q8_tmp, q8_tmp_bytes));
       }
+      staging();
       for (int64_t off = 0; off < info.nbytes; off += kStage) {
         int64_t len = std::min<int64_t>(kStage, info.nbytes - off);
         Q27_CUDA(cudaEventSynchronize(done[cur]));
@@ -318,7 +342,13 @@ void Weights::load(cudaStream_t s) {
       continue;
     }
     if (j.sf_rows) {  // whole scale-factor tensor in one staging buffer, swizzled from host memory
+      if (Prefetcher::fits(info.nbytes)) {
+        swizzle_sf(static_cast<uint8_t*>(pf.get(ri, j.name, 0)), j.sf_rows, j.sf_kblocks, reinterpret_cast<uint8_t*>(dst), s);
+        pf.release(ri++, s);
+        continue;
+      }
       Q27_CHECK(size_t(info.nbytes) <= kStage, j.name + ": scale factors larger than the staging buffer");
+      staging();
       Q27_CUDA(cudaEventSynchronize(done[cur]));
       ckpt.read(j.name, stage[cur]);
       swizzle_sf(static_cast<uint8_t*>(stage[cur]), j.sf_rows, j.sf_kblocks, reinterpret_cast<uint8_t*>(dst), s);
@@ -326,20 +356,21 @@ void Weights::load(cudaStream_t s) {
       cur ^= 1;
       continue;
     }
-    for (int64_t off = 0; off < info.nbytes; off += kStage) {
-      int64_t len = std::min<int64_t>(kStage, info.nbytes - off);
-      Q27_CUDA(cudaEventSynchronize(done[cur]));
-      ckpt.read_range(j.name, off, len, stage[cur]);
-      Q27_CUDA(cudaMemcpyAsync(dst + off, stage[cur], size_t(len), cudaMemcpyHostToDevice, s));
-      Q27_CUDA(cudaEventRecord(done[cur], s));
-      cur ^= 1;
+    for (int64_t off = 0; off < info.nbytes; off += kChunk) {
+      void* buf = pf.get(ri, j.name, off);
+      if (!buf) {  // embedding: read straight into the pinned table
+        ri++;
+        continue;
+      }
+      Q27_CUDA(cudaMemcpyAsync(dst + off, buf, size_t(std::min<int64_t>(kChunk, info.nbytes - off)), cudaMemcpyHostToDevice, s));
+      pf.release(ri++, s);
     }
   }
   Q27_CUDA(cudaStreamSynchronize(s));
   if (q8_tmp) Q27_CUDA(cudaFree(q8_tmp));
   for (int i = 0; i < 2; i++) {
     cudaEventDestroy(done[i]);
-    cudaFreeHost(stage[i]);
+    if (stage[i]) cudaFreeHost(stage[i]);
   }
   double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   log("loaded %.2f GB of weights in %.1f s (%.2f GB/s)", total / 1e9, sec, total / 1e9 / sec);

@@ -24,7 +24,9 @@ starts. A request waiting for room rather than one suspended later keeps its tur
 
 Messages (pickled tuples). In: ("submit", rid, request), ("cancel", rid), ("config", changes, n), ("stop",).
 Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids]), ("done", rid, finish, info),
-("error", rid, message), ("metrics", dict), ("config", settings, n: the change answered, or None).
+("error", rid, message), ("metrics", dict), ("config", settings, n: the change answered, or None),
+("memory", the pools: once after "ready"), ("stats", snapshot: the requests, KV pool and device memory, every STATS_INTERVAL s while busy),
+("event", rid, kind, text: an admission wait, a preemption, an engine error).
 """
 
 import array
@@ -39,6 +41,8 @@ PREFILL, DECODE = "prefill", "decode"
 PAGE = 64  # tokens of a KV page (kernels.h kPageTokens)
 ADMIT_RECHECK = 0.05  # s between checks of a request kept waiting by the admission
 RATE_WINDOW = 10.0    # s of decoding the measured tok/s per request averages over
+STATS_INTERVAL = 0.5  # s between stats snapshots (the stats UI) while requests run
+STATS_IDLE = 5.0      # s between them while idle
 
 
 def step_ms(n):
@@ -79,6 +83,11 @@ class Seq:
         self.share_with, self.share_len = None, 0  # an earlier request still computing a prefix this one shares
         self.held = False        # kept waiting by the admission (counted once)
         self._bytes = None
+        self.begun = None        # time of the first prefix_begin
+        self.computed = 0        # prompt tokens prefilled (not restored from the cache)
+        self.prefill_s = self.decode_s = 0.0  # time in its prefill turns / decode turns (a batched turn counts for each)
+        self.steps = 0           # decode steps (speculative: verify steps)
+        self.marks = [0, 0, 0]   # end of the first message, starts of the last message and the generation prompt
 
     def rest(self):
         return len(self.eng_ids) - (self.fed if self.started else self.est_cached)
@@ -118,7 +127,8 @@ class Scheduler:
         self.credit = 0.0        # decode time owed to decoding requests by the prefills (DECODE_SHARE)
         self.history = collections.deque(maxlen=64)  # recent sequences (prompt + output) as int32 bytes
         self.m = collections.Counter()
-        self.last_metrics = 0.0
+        self.last_metrics = self.last_stats = 0.0
+        self.cache_full = False  # every state slot of the prefix cache allocated (poll)
 
     # ------------------------------------------------------------ messages
 
@@ -126,8 +136,13 @@ class Scheduler:
         self.conn.send(msg)
 
     def poll(self, block):
+        # Idle: allocate the prefix cache's state slots one by one (not at startup, so the engine is ready sooner),
+        # then wake up now and then for a stats snapshot.
+        if block and not self.cache_full:
+            self.cache_full = self.engine.cache_grow(1) == 0
+            block = self.cache_full
         if block:
-            self.conn.poll(None)
+            self.conn.poll(STATS_IDLE)
         while self.conn.poll(0):
             msg = self.conn.recv()
             if msg[0] == "submit":
@@ -158,6 +173,9 @@ class Scheduler:
                 o.at = sorted(set(o.at) | {s.share_len})
             s.reusable = s.share_len
         s.at = self.checkpoints(s.prompt, s.reusable)
+        # (stats: where the first message ends, the last message and the generation prompt start)
+        starts = [i for i, t in enumerate(s.prompt) if t == self.im_start]
+        s.marks = (starts[1:2] or [0]) + (starts[-2:-1] or [0]) + (starts[-1:] or [0])
         s.est_cached = s.reusable
         self.by_id[rid] = s
         self.waiting.append(s)
@@ -206,6 +224,7 @@ class Scheduler:
             s.held = True
             self.m[f'q27:admission_waits_total{{reason="{reason}"}}'] += 1
             log(f"{s.rid}: waits for room ({reason}), {len(self.alive)} running")
+            self.send("event", s.rid, "wait", f"waits for room ({reason}), {len(self.alive)} running")
         self.blocked = reason
         self.held_until = (s, time.time() + ADMIT_RECHECK) if reason else (None, 0.0)
         return reason is None
@@ -288,6 +307,7 @@ class Scheduler:
     def run(self):
         self.send("ready", {"max_tokens": self.engine.max_tokens, "max_seqs": self.engine_seqs, "spec": self.spec,
                             "vision": self.engine.has_vision})
+        self.send("memory", self.engine.memory_report())
         self.send("config", self.settings(), None)
         log(f"{self.engine_seqs} sequences at once (target {self.max_seqs}, KV admission {'on' if self.admit_kv else 'off'}, "
             f"min {self.min_tps:g} tok/s per request), decode share {self.share}, quantum {self.quantum * 1000:.0f} ms, "
@@ -302,9 +322,18 @@ class Scheduler:
             job = self.pick()
             if job:
                 self.guarded(*job)
-            if time.time() - self.last_metrics > 2.0:
-                self.send("metrics", self.metrics())
-                self.send("config", self.settings(), None)
+            # (stats also once more when the work is done, and after each idle wait)
+            self.report(force=not (self.alive or self.waiting))
+
+    def report(self, force=False):
+        """Metrics and admission settings every 2 s, stats snapshots every STATS_INTERVAL (also from inside a
+        long decode turn: one request alone decodes until it ends or a message arrives)."""
+        now = time.time()
+        if now - self.last_metrics > 2.0:
+            self.send("metrics", self.metrics())
+            self.send("config", self.settings(), None)
+        if force or now - self.last_stats > STATS_INTERVAL:
+            self.send("stats", self.stats())
 
     def can_prefill(self, s):
         o = s.share_with
@@ -369,6 +398,7 @@ class Scheduler:
                     raise
                 for o in s if kind == "batch" else [s]:
                     log(f"{o.rid}: {msg}")
+                    self.send("event", o.rid, "error", msg)
                     self.send("error", o.rid, msg)
                     self.finish(o, "error", save=False, notify=False)
                 self.engine.reset()
@@ -404,7 +434,7 @@ class Scheduler:
         self.cur = s
         s.started, s.fed = True, cached
         if s.cached is None:
-            s.cached = cached
+            s.cached, s.begun = cached, time.time()
             self.m["q27:prompt_tokens_total"] += len(s.prompt)
             self.m["q27:cached_tokens_total"] += cached
             self.m["q27:reusable_tokens_total"] += s.reusable
@@ -424,7 +454,7 @@ class Scheduler:
 
     def prefill_turn(self, s):
         self.load(s)
-        t0 = time.time()
+        t0, fed0 = time.time(), s.fed
         rest = s.eng_ids[s.fed:]
         if len(rest) > self.chunk:
             s.fed += self.engine.prefill(rest, self.chunk, spec=self.spec)
@@ -443,6 +473,9 @@ class Scheduler:
             self.emit(s, [tok])
         dt = time.time() - t0
         s.last_run = time.time()
+        s.prefill_s += dt
+        s.computed += s.fed - fed0
+        self.m["q27:prefill_tokens_total"] += s.fed - fed0
         if any(o.phase == DECODE for o in self.alive if o is not s):
             self.credit += self.share * dt
 
@@ -463,11 +496,14 @@ class Scheduler:
             else:
                 toks = [self.engine.forward_sample([s.out[-1]], s.temperature, s.top_k, s.top_p, s.rng.random())]
             step = max(step * 0.8, time.time() - ts)
+            s.steps += 1
             self.emit(s, toks)
             if last:
                 break
+            self.report()
         dt = time.time() - t0
         s.last_run = time.time()
+        s.decode_s += dt
         if not others and self.spec:
             self.measure(1, len(s.out) - n0, dt)
         if has_prefill:
@@ -486,6 +522,7 @@ class Scheduler:
             self.m["q27:spec_verify_calls_total"] += len(seqs)
             self.m["q27:batched_steps_total"] += 1
             for s, toks in zip(seqs, new):
+                s.steps += 1
                 self.emit(s, toks)
             if any(s.dead for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0):
                 break
@@ -493,6 +530,7 @@ class Scheduler:
         self.measure(len(seqs), sum(len(s.out) for s in seqs) - n0, dt)
         for s in seqs:
             s.last_run = time.time()
+            s.decode_s += dt
         if has_prefill:
             self.credit -= dt
 
@@ -519,6 +557,7 @@ class Scheduler:
         waits at the head of the queue (the admission lets it in again) as a prompt of its prompt + output."""
         saved = len(v.eng_ids) if v.phase == DECODE else v.fed
         log(f"{v.rid}: preempted at {saved} tokens (KV pool full)")
+        self.send("event", v.rid, "preempt", f"preempted at {saved} tokens (KV pool full)")
         if v is self.cur:
             self.engine.checkpoint()
             self.engine.reset()
@@ -555,7 +594,9 @@ class Scheduler:
         now = time.time()
         info = {"prompt_tokens": len(s.prompt), "completion_tokens": len(s.out), "cached_tokens": s.cached or 0,
                 "ttft": (s.first_token - s.arrival) if s.first_token else None, "total": now - s.arrival,
-                "preempted": s.preempted}
+                "preempted": s.preempted, "reusable_tokens": s.reusable, "computed_tokens": s.computed,
+                "queued": (s.begun - s.arrival) if s.begun else None, "prefill_s": s.prefill_s,
+                "decode_s": s.decode_s, "steps": s.steps}
         self.m[f'q27:requests_finished_total{{reason="{reason}"}}'] += 1
         if notify:
             self.send("done", s.rid, reason, dict(info, metrics=self.metrics()))
@@ -575,6 +616,33 @@ class Scheduler:
                     "q27:kv_free_pages": st["free_pages"], "q27:kv_checkpoint_only_pages": st["checkpoint_only_pages"],
                     "q27:prefix_cache_checkpoints": st["checkpoints"], "q27:prefix_cache_evictions_total": st["evicted"]})
         return out
+
+
+    def stats(self):
+        """Snapshot for the stats UI: each request (where its context stands), the KV pool, device memory."""
+        self.last_stats = now = time.time()
+        st = self.engine.cache_stats()
+        seqs = []
+        for s in self.alive + list(self.waiting):
+            if s.dead:
+                continue
+            state = "waiting" if s not in self.alive else ("running" if s is self.cur else
+                                                          "parked" if s.area is not None else "admitted")
+            seqs.append({"rid": s.rid, "state": state, "phase": s.phase, "prompt": len(s.prompt),
+                         "cached": s.cached if s.cached is not None else s.est_cached,
+                         "fed": min(s.fed, len(s.prompt)) if s.started else 0, "out": len(s.out),
+                         "max_new": s.max_new, "computed": s.computed, "reusable": s.reusable,
+                         "age": now - s.arrival, "queued": (s.begun or now) - s.arrival,
+                         "ttft": (s.first_token - s.arrival) if s.first_token else None,
+                         "decode_wall": (now - s.first_token) if s.first_token else 0.0,
+                         "prefill_s": s.prefill_s, "decode_s": s.decode_s, "steps": s.steps,
+                         "preempted": s.preempted, "held": s.held and s in self.waiting,
+                         "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
+                         "marks": s.marks})
+        return {"t": now, "seqs": seqs, "cache": st, "device": self.engine.device_memory(),
+                "running": len(self.alive), "waiting": len(self.waiting), "blocked": self.blocked,
+                "target_seqs": self.max_seqs, "busy_s": self.m["q27:engine_busy_seconds_total"],
+                "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"]}
 
 
 def lcp_bytes(a, b):

@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qwen3-27b-5090 live</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10); --wash: rgba(11,11,11,0.04);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #6250d6;
+  --track: #e8e7e1; --pending: #d6d5ce;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b; --good-text: #006300;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #9085e9;
+    --track: #2a2a28; --pending: #3c3c39; --good-text: #0ca30c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #9085e9;
+  --track: #2a2a28; --pending: #3c3c39; --good-text: #0ca30c;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--page); color: var(--ink);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1440px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; }
+h1 { font-size: 18px; font-weight: 600; margin: 0; }
+h2 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
+.sub { color: var(--ink2); }
+.muted { color: var(--muted); }
+.num { font-variant-numeric: tabular-nums; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; min-width: 0; }
+.badge { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--border); font-size: 12px; color: var(--ink2); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.tile .label { color: var(--ink2); font-size: 12px; }
+.tile .value { font-size: 22px; font-weight: 600; margin-top: 2px; white-space: nowrap; }
+.tile .note { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meter { height: 6px; border-radius: 3px; background: var(--track); margin-top: 6px; overflow: hidden; }
+.meter > div { height: 100%; border-radius: 3px; background: var(--s1); }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.seg button { font: inherit; color: var(--ink2); background: transparent; border: 1px solid var(--border);
+  padding: 2px 10px; cursor: pointer; }
+.seg button:first-child { border-radius: 6px 0 0 6px; }
+.seg button:last-child { border-radius: 0 6px 6px 0; }
+.seg button + button { border-left: none; }
+.seg button[aria-pressed="true"] { color: var(--ink); background: var(--wash); font-weight: 600; }
+.ctl { display: inline-flex; gap: 6px; }
+.ctl button { font: inherit; font-size: 12px; color: var(--ink); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; padding: 1px 10px; cursor: pointer; }
+.ctl button:hover:not(:disabled) { background: var(--wash); }
+.ctl button:disabled { color: var(--muted); cursor: default; opacity: 0.6; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+.chart svg { display: block; width: 100%; height: 150px; overflow: visible; }
+.chart .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.chart .cur { font-weight: 600; font-variant-numeric: tabular-nums; }
+.tip { position: fixed; pointer-events: none; z-index: 10; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.18); display: none; max-width: 320px; }
+.tip .k { display: flex; align-items: center; gap: 6px; }
+.tip .k i { width: 10px; height: 2px; border-radius: 1px; flex: none; }
+.tip b { font-variant-numeric: tabular-nums; }
+.stack { display: flex; height: 22px; gap: 2px; border-radius: 4px; overflow: hidden; position: relative; }
+.stack > div { min-width: 0; height: 100%; cursor: default; }
+.stack > div:hover { filter: brightness(1.12); }
+.stack.thin { height: 12px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; color: var(--ink2); font-size: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
+.mem-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+@media (max-width: 900px) { .mem-grid { grid-template-columns: 1fr; } }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; font-weight: 600; color: var(--ink2); padding: 4px 8px; border-bottom: 1px solid var(--grid);
+  white-space: nowrap; position: sticky; top: 0; background: var(--surface); }
+td { padding: 4px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.scroll { overflow: auto; }
+.sess { display: grid; gap: 10px; }
+.seq { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; display: grid; gap: 6px; }
+.seq .top { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; }
+.seq .rid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.seq .preview { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 2px 12px; font-size: 12px; }
+.kv div span { color: var(--muted); }
+.kv div b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.ctx { position: relative; }
+.ctx .tick { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink); opacity: 0.55; border-radius: 1px; }
+.empty { color: var(--muted); padding: 12px 0; }
+.log-wrap { max-height: 520px; }
+.log tr.ev td { color: var(--ink2); }
+.log tr.sel td { background: var(--wash); }
+.log tr:hover td { background: var(--wash); cursor: pointer; }
+.log pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 11px; color: var(--ink2); }
+.lvl { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.prev { max-width: 380px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--ink2); }
+@media (max-width: 600px) { main { padding: 16px; } .tile .value { font-size: 18px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>qwen3-27b-5090</h1>
+    <span class="badge" id="engine"><span class="dot" style="background:var(--muted)"></span><span>connecting</span></span>
+    <span class="ctl" id="ctl" role="group" aria-label="Engine">
+      <button data-a="start">Start</button><button data-a="stop">Stop</button><button data-a="restart">Restart</button>
+    </span>
+    <span class="sub" id="cfg"></span>
+    <span class="muted" id="conn" style="margin-left:auto"></span>
+  </header>
+
+  <section class="tiles" id="tiles"></section>
+
+  <section class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">GPU and throughput</h2>
+      <div class="seg" id="range" role="group" aria-label="Time range">
+        <button data-s="60">1 min</button><button data-s="300" aria-pressed="true">5 min</button><button data-s="600">10 min</button>
+      </div>
+    </div>
+    <div class="charts" id="charts"></div>
+  </section>
+
+  <section class="card">
+    <h2>VRAM</h2>
+    <div class="sub" id="vram-sum" style="margin-bottom:8px"></div>
+    <div class="stack" id="vram-bar"></div>
+    <div class="legend" id="vram-legend"></div>
+    <div class="mem-grid" id="mem-grid" style="margin-top:16px">
+      <div style="display:grid;gap:18px;align-content:start">
+        <div><div class="row" style="justify-content:space-between"><h2 style="margin:0 0 6px">KV cache pool</h2><span class="muted" id="kv-sum"></span></div>
+          <div class="stack thin" id="kv-bar"></div><div class="legend" id="kv-legend"></div></div>
+        <div><div class="row" style="justify-content:space-between"><h2 style="margin:0 0 6px">Weights</h2><span class="muted" id="w-sum"></span></div>
+          <div class="stack thin" id="w-bar"></div><div class="legend" id="w-legend"></div></div>
+      </div>
+      <div class="scroll"><table id="vram-table"></table></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">Active requests</h2>
+      <span class="legend" style="margin:0">
+        <span><i style="background:var(--s1)"></i>cached (prefix cache)</span>
+        <span><i style="background:var(--s3)"></i>prefilled</span>
+        <span><i style="background:var(--pending)"></i>prompt to run</span>
+        <span><i style="background:var(--s2)"></i>generated</span>
+        <span><i style="background:var(--ink);opacity:.55;width:2px"></i>message boundaries</span>
+      </span>
+    </div>
+    <div class="sess" id="sess"></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">Log</h2>
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="f-req" checked>requests</label>
+        <label class="chk"><input type="checkbox" id="f-sub">submitted</label>
+        <label class="chk"><input type="checkbox" id="f-ev" checked>events</label>
+        <span class="muted" id="log-sum"></span>
+      </div>
+    </div>
+    <div class="scroll log-wrap"><table class="log" id="log"></table></div>
+  </section>
+</main>
+<div class="tip" id="tip"></div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const GiB = 1024 ** 3, MiB = 1024 ** 2;
+const state = { info: {}, history: [], log: [], tick: null, range: 300, sampleS: 1, hover: null, open: new Set() };
+
+// ---------------------------------------------------------------- formatting
+const fmtGiB = (b) => b == null ? "–" : (b / GiB).toFixed(b >= 10 * GiB ? 1 : 2) + " GiB";
+const fmtMem = (b) => b == null ? "–" : b >= GiB ? fmtGiB(b) : (b / MiB).toFixed(b >= 100 * MiB ? 0 : 1) + " MiB";
+function fmtTok(n) {
+  if (n == null) return "–";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e4) return (n / 1e3).toFixed(1) + "K";
+  if (n >= 1e3) return (n / 1e3).toFixed(2) + "K";
+  return String(Math.round(n));
+}
+const fmtRate = (v) => v == null ? "–" : v >= 1000 ? (v / 1000).toFixed(2) + "K" : v.toFixed(v >= 100 ? 0 : 1);
+const fmtS = (s) => s == null ? "–" : s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : s >= 10 ? s.toFixed(1) + " s" : s.toFixed(2) + " s";
+const fmtPct = (v) => v == null ? "–" : (v * 100).toFixed(v >= 0.995 || v < 0.1 ? 0 : 1) + "%";
+const clock = (t) => new Date(t * 1000).toLocaleTimeString([], { hour12: false });
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "style") e.style.cssText = v; else if (k === "class") e.className = v; else e.setAttribute(k, v);
+  }
+  for (const k of kids) if (k != null) e.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return e;
+}
+
+// ---------------------------------------------------------------- tooltip
+const tip = $("tip");
+function showTip(x, y, rows, title) {
+  tip.replaceChildren();
+  if (title) tip.append(el("div", { class: "muted", style: "margin-bottom:3px" }, title));
+  for (const [color, value, label] of rows) {
+    const k = el("div", { class: "k" });
+    if (color) k.append(el("i", { style: `background:${color}` }));
+    k.append(el("b", {}, value), el("span", { class: "muted" }, label));
+    tip.append(k);
+  }
+  tip.style.display = "block";
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.min(window.innerWidth - w - 8, x + 14) + "px";
+  tip.style.top = Math.max(8, y - h - 10) + "px";
+}
+const hideTip = () => { tip.style.display = "none"; };
+function hoverable(node, fn) {
+  node.addEventListener("pointermove", (e) => { const r = fn(); showTip(e.clientX, e.clientY, r.rows, r.title); });
+  node.addEventListener("pointerleave", hideTip);
+}
+
+// ---------------------------------------------------------------- time-series charts
+const CHARTS = [
+  { key: "util", title: "GPU utilization", unit: "%", color: "--s1", max: () => 100, fmt: (v) => v.toFixed(0) + "%" },
+  { key: "power", title: "Power", unit: "W", color: "--s2", max: (s) => s?.power_limit || 400, fmt: (v) => v.toFixed(0) + " W",
+    note: (s) => s?.power_limit ? `limit ${s.power_limit.toFixed(0)} W` : "" },
+  { key: "decode_tps", title: "Decode (all requests)", unit: "tok/s", color: "--s3", fmt: (v) => fmtRate(v) + " tok/s" },
+  { key: "prefill_tps", title: "Prefill (all requests)", unit: "tok/s", color: "--s6", fmt: (v) => fmtRate(v) + " tok/s" },
+];
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const SVGNS = "http://www.w3.org/2000/svg";
+const sv = (tag, a) => { const e = document.createElementNS(SVGNS, tag); for (const k in a) e.setAttribute(k, a[k]); return e; };
+
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const p = 10 ** Math.floor(Math.log10(v)), m = v / p;
+  return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p;
+}
+
+function buildCharts() {
+  const box = $("charts");
+  for (const c of CHARTS) {
+    const svg = sv("svg", {});
+    const card = el("div", { class: "chart" },
+      el("div", { class: "head" }, el("span", { class: "sub" }, c.title), el("span", {}, el("span", { class: "muted", "data-note": "" }), " ", el("span", { class: "cur" }))),
+      svg);
+    c.node = card; c.svg = svg;
+    svg.addEventListener("pointermove", (e) => {
+      const r = svg.getBoundingClientRect();
+      state.hover = { x: (e.clientX - r.left) / r.width, cx: e.clientX, cy: e.clientY, chart: c };
+      drawCharts();
+    });
+    svg.addEventListener("pointerleave", () => { state.hover = null; hideTip(); drawCharts(); });
+    box.append(card);
+  }
+}
+
+function drawCharts() {
+  const now = Date.now() / 1000, t0 = now - state.range;
+  const data = state.history.filter((s) => s.t >= t0 - 2);
+  const last = state.history[state.history.length - 1];
+  let hoverSample = null;
+  for (const c of CHARTS) {
+    const svg = c.svg, W = svg.clientWidth || 400, H = 150, L = 44, R = 8, T = 8, B = 20;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.replaceChildren();
+    const vals = data.map((s) => s[c.key]).filter((v) => v != null);
+    const ymax = c.max ? c.max(last) : niceMax(Math.max(10, ...vals) * 1.1);
+    const x = (t) => L + (t - t0) / state.range * (W - L - R);
+    const y = (v) => T + (1 - Math.min(v, ymax) / ymax) * (H - T - B);
+    for (let i = 0; i <= 4; i++) {
+      const v = ymax * i / 4, yy = y(v);
+      svg.append(sv("line", { x1: L, x2: W - R, y1: yy, y2: yy, stroke: i === 0 ? css("--axis") : css("--grid"), "stroke-width": 1 }));
+      const lab = sv("text", { x: L - 6, y: yy + 4, "text-anchor": "end", "font-size": 11, fill: css("--muted"), class: "num" });
+      lab.textContent = c.key === "util" ? v.toFixed(0) : fmtRate(v); svg.append(lab);
+    }
+    const ticks = state.range <= 60 ? [60, 45, 30, 15, 0] : state.range <= 300 ? [300, 240, 180, 120, 60, 0] : [600, 480, 360, 240, 120, 0];
+    for (const s of ticks) {
+      const lab = sv("text", { x: x(now - s), y: H - 4, "text-anchor": s === 0 ? "end" : "middle", "font-size": 11, fill: css("--muted") });
+      lab.textContent = s === 0 ? "now" : `-${s >= 60 ? s / 60 + "m" : s + "s"}`; svg.append(lab);
+    }
+    const pts = data.filter((s) => s[c.key] != null);
+    const color = css(c.color);
+    if (pts.length > 1) {
+      // Gaps (no samples for > 3 sampling periods) break the line.
+      let d = "", area = "", seg = [];
+      const flush = () => {
+        if (seg.length > 1) {
+          const p = seg.map((s, i) => `${i ? "L" : "M"}${x(s.t).toFixed(1)},${y(s[c.key]).toFixed(1)}`).join("");
+          d += p;
+          area += p + `L${x(seg[seg.length - 1].t).toFixed(1)},${y(0)}L${x(seg[0].t).toFixed(1)},${y(0)}Z`;
+        }
+        seg = [];
+      };
+      for (let i = 0; i < pts.length; i++) {
+        if (i && pts[i].t - pts[i - 1].t > 3 * state.sampleS + 0.5) flush();
+        seg.push(pts[i]);
+      }
+      flush();
+      svg.append(sv("path", { d: area, fill: color, "fill-opacity": 0.1, stroke: "none" }));
+      svg.append(sv("path", { d, fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      const e = pts[pts.length - 1];
+      svg.append(sv("circle", { cx: x(e.t), cy: y(e[c.key]), r: 4, fill: color, stroke: css("--surface"), "stroke-width": 2 }));
+    }
+    if (state.hover && pts.length) {
+      const th = t0 + (state.hover.x * W - L) / (W - L - R) * state.range;
+      let best = pts[0];
+      for (const s of pts) if (Math.abs(s.t - th) < Math.abs(best.t - th)) best = s;
+      if (Math.abs(best.t - th) < 5 * state.sampleS) {
+        const xx = x(best.t);
+        svg.append(sv("line", { x1: xx, x2: xx, y1: T, y2: H - B, stroke: css("--muted"), "stroke-width": 1 }));
+        svg.append(sv("circle", { cx: xx, cy: y(best[c.key]), r: 4, fill: color, stroke: css("--surface"), "stroke-width": 2 }));
+        if (state.hover.chart === c) hoverSample = best;
+      }
+    }
+    const cur = last && last[c.key] != null && now - last.t < 5 ? c.fmt(last[c.key]) : "–";
+    c.node.querySelector(".cur").textContent = cur;
+    c.node.querySelector("[data-note]").textContent = c.note ? c.note(last) : "";
+  }
+  if (hoverSample && state.hover) {
+    const s = hoverSample;
+    showTip(state.hover.cx, state.hover.cy, [
+      [css("--s1"), s.util != null ? s.util + "%" : "–", "GPU utilization"],
+      [css("--s2"), s.power != null ? s.power.toFixed(0) + " W" : "–", "power"],
+      [css("--s3"), fmtRate(s.decode_tps) + " tok/s", "decode"],
+      [css("--s6"), fmtRate(s.prefill_tps) + " tok/s", "prefill"],
+      [null, `${s.sm_clock ?? "–"} MHz`, "SM clock"],
+      [null, `${s.running} running, ${s.waiting} waiting`, ""],
+    ], clock(s.t));
+  }
+}
+
+// ---------------------------------------------------------------- tiles
+function tile(label, value, note, meter, meterColor) {
+  const t = el("div", { class: "card tile" }, el("div", { class: "label" }, label), el("div", { class: "value" }, value));
+  if (meter != null) t.append(el("div", { class: "meter" }, el("div", { style: `width:${Math.max(0, Math.min(100, meter * 100)).toFixed(1)}%;background:${meterColor || "var(--s1)"}` })));
+  t.append(el("div", { class: "note" }, note || " "));
+  return t;
+}
+function drawTiles() {
+  const s = state.history[state.history.length - 1] || {}, tk = state.tick, v = tk?.vram, c = tk?.cache, sch = tk?.sched;
+  const fresh = s.t && Date.now() / 1000 - s.t < 5;
+  const used = s.used, total = s.total || v?.total;
+  const app = v ? v.parts.filter((p) => !["free", "other processes"].includes(p.name)).reduce((a, p) => a + p.bytes, 0) : null;
+  const hit = c && c.prompt_tokens ? c.cached_tokens / c.prompt_tokens : null;
+  const powerFrac = s.power != null && s.power_limit ? s.power / s.power_limit : null;
+  const tiles = [
+    tile("GPU utilization", fresh && s.util != null ? s.util + "%" : "–", fresh ? `memory busy ${s.mem_util ?? "–"}%` : "no GPU samples", fresh ? (s.util || 0) / 100 : null),
+    tile("Power", fresh && s.power != null ? s.power.toFixed(0) + " W" : "–", fresh ? `limit ${s.power_limit?.toFixed(0) ?? "–"} W · ${s.temp ?? "–"} °C` : "", fresh ? powerFrac : null,
+      powerFrac != null && powerFrac > 0.97 ? "var(--serious)" : "var(--s2)"),
+    tile("Clocks", fresh && s.sm_clock != null ? s.sm_clock + " MHz" : "–", fresh ? `memory ${s.mem_clock ?? "–"} MHz` : ""),
+    tile("VRAM in use", used != null ? fmtGiB(used) : v ? fmtGiB(v.total - v.parts.find((p) => p.name === "free").bytes) : "–",
+      app != null ? `server ${fmtGiB(app)}` : "", used != null && total ? used / total : null),
+    tile("Decode", fresh ? fmtRate(s.decode_tps) + " tok/s" : "–", "all requests"),
+    tile("Prefill", fresh ? fmtRate(s.prefill_tps) + " tok/s" : "–", "prompt tokens run"),
+    tile("Requests", sch ? `${sch.running} running` : "–", sch ? `${sch.waiting} waiting · target ${sch.target_seqs}${sch.blocked ? " · blocked: " + sch.blocked : ""}` : ""),
+    tile("Prefix cache hit", fmtPct(hit), c ? `${fmtTok(c.cached_tokens)} of ${fmtTok(c.prompt_tokens)} tokens` : "", hit),
+  ];
+  $("tiles").replaceChildren(...tiles);
+}
+
+// ---------------------------------------------------------------- VRAM
+const VRAM_COLORS = { "weights": "--s1", "KV cache": "--s2", "sequence state": "--s3", "activations": "--s4",
+  "CUDA context & runtime": "--s5", "other processes": "--s6", "free": "--track" };
+const KV_COLORS = { "active sequences": "--s2", "prefix cache only": "--s1", "parked state": "--s3", "free": "--track" };
+const SEQ6 = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--track"];
+function stackBar(node, legend, parts, total, colorOf, label) {
+  node.replaceChildren(); legend.replaceChildren();
+  parts.forEach((p, i) => {
+    if (p.bytes <= 0) return;
+    const color = `var(${colorOf(p, i)})`;
+    const d = el("div", { style: `flex:${p.bytes} 1 0;background:${color}` });
+    hoverable(d, () => ({ title: label ? `${label}: ${p.name}` : p.name, rows: [[css(colorOf(p, i)), fmtMem(p.bytes), `${(p.bytes / total * 100).toFixed(1)}%`],
+      ...(p.extra || []).map((e) => [null, e, ""])] }));
+    node.append(d);
+    legend.append(el("span", {}, el("i", { style: `background:${color}` }), `${p.name} `, el("span", { class: "num", style: "color:var(--ink)" }, fmtMem(p.bytes))));
+  });
+}
+function drawVram() {
+  const v = state.tick?.vram;
+  if (!v) {
+    const s = state.history[state.history.length - 1], eng = state.tick?.engine;
+    $("vram-sum").textContent = (eng === "stopped" ? "The engine is stopped; its VRAM is free." : "Waiting for the engine.") +
+      (s?.used != null ? ` ${fmtGiB(s.used)} of ${fmtGiB(s.total)} in use on the device (NVML).` : "");
+    for (const id of ["vram-bar", "vram-legend", "kv-bar", "kv-legend", "w-bar", "w-legend", "vram-table"]) $(id).replaceChildren();
+    $("mem-grid").style.display = "none";
+    return;
+  }
+  $("mem-grid").style.display = "";
+  const free = v.parts.find((p) => p.name === "free").bytes;
+  const app = v.parts.filter((p) => !["free", "other processes"].includes(p.name)).reduce((a, p) => a + p.bytes, 0);
+  $("vram-sum").textContent = `${fmtGiB(v.total)} on the device · this server ${fmtGiB(app)} · free ${fmtGiB(free)} · pool budget ${fmtGiB(v.budget)}`;
+  stackBar($("vram-bar"), $("vram-legend"), v.parts, v.total, (p) => VRAM_COLORS[p.name] || "--track");
+  const kv = v.parts.find((p) => p.name === "KV cache");
+  const tokPerByte = v.kv_page_bytes ? v.kv_page_tokens / v.kv_page_bytes : 0;
+  const kvParts = kv.parts.map((p) => ({ ...p, extra: [`${fmtTok(p.bytes * tokPerByte)} tokens`] }));
+  stackBar($("kv-bar"), $("kv-legend"), kvParts, kv.bytes, (p) => KV_COLORS[p.name] || "--track", "KV");
+  $("kv-sum").textContent = `${fmtGiB(kv.bytes)} · ${fmtTok(kv.bytes * tokPerByte)} tokens · ${v.checkpoints} of ${v.slots} state checkpoints`;
+  const w = v.parts.find((p) => p.name === "weights");
+  stackBar($("w-bar"), $("w-legend"), w.parts, w.bytes, (p, i) => SEQ6[Math.min(i, 6)], "weights");
+  $("w-sum").textContent = fmtGiB(w.bytes);
+  const tb = $("vram-table"); tb.replaceChildren();
+  tb.append(el("tr", {}, el("th", {}, "Region"), el("th", { class: "r" }, "Size"), el("th", { class: "r" }, "Share")));
+  for (const p of v.parts) {
+    tb.append(el("tr", {}, el("td", {}, el("span", { class: "lvl" }, el("i", { class: "dot", style: `background:var(${VRAM_COLORS[p.name]});border-radius:2px` }), p.name)),
+      el("td", { class: "r" }, fmtMem(p.bytes)), el("td", { class: "r" }, (p.bytes / v.total * 100).toFixed(1) + "%")));
+    if (["sequence state", "activations", "CUDA context & runtime"].includes(p.name))
+      for (const q of p.parts.slice(0, 4)) if (q.bytes >= 16 * MiB)
+        tb.append(el("tr", {}, el("td", { class: "muted", style: "padding-left:26px" }, q.name), el("td", { class: "r muted" }, fmtMem(q.bytes)), el("td", {})));
+  }
+  for (const h of v.host) if (h.bytes > 0 || h.planned)
+    tb.append(el("tr", {}, el("td", { class: "muted" }, `pinned host: ${h.name}` + (h.planned ? ` (${fmtMem(h.planned)} as needed)` : "")),
+      el("td", { class: "r muted" }, fmtMem(h.bytes)), el("td", { class: "r muted" }, "RAM")));
+}
+
+// ---------------------------------------------------------------- sessions
+const STATE_COLOR = { running: "--good", parked: "--s1", admitted: "--muted", waiting: "--warning" };
+function ctxBar(s) {
+  const prompt = s.prompt, cached = Math.min(s.cached, prompt), fed = Math.max(s.fed, s.state === "waiting" ? 0 : cached);
+  const parts = [
+    ["cached" + (s.state === "waiting" ? " (expected)" : ""), cached, "--s1"],
+    ["prefilled", Math.max(0, fed - cached), "--s3"],
+    ["prompt to run", Math.max(0, prompt - Math.max(fed, cached)), "--pending"],
+    ["generated", s.out, "--s2"],
+  ];
+  const total = prompt + s.out || 1;
+  const wrap = el("div", { class: "ctx" }), bar = el("div", { class: "stack thin" });
+  for (const [name, n, color] of parts) {
+    if (n <= 0) continue;
+    const d = el("div", { style: `flex:${n} 1 0;background:var(${color})` });
+    hoverable(d, () => ({ title: name, rows: [[css(color), fmtTok(n) + " tokens", (n / total * 100).toFixed(1) + "%"]] }));
+    bar.append(d);
+  }
+  wrap.append(bar);
+  const [sysEnd, lastMsg, genStart] = s.marks;
+  const names = ["end of the first message (system, tools)", "start of the last message", "start of the generation prompt"];
+  [sysEnd, lastMsg, genStart].forEach((m, i) => {
+    if (m <= 0 || (i === 2 && genStart - lastMsg < total * 0.004)) return;
+    const t = el("div", { class: "tick", style: `left:calc(${(m / total * 100).toFixed(3)}% - 1px)` });
+    wrap.append(t);
+  });
+  const comp = [`system + tools ${fmtTok(sysEnd)}`, `history ${fmtTok(Math.max(0, lastMsg - sysEnd))}`,
+    `last message ${fmtTok(Math.max(0, prompt - lastMsg))}`, `output ${fmtTok(s.out)}`];
+  hoverable(wrap, () => ({ title: `context ${fmtTok(total)} tokens`, rows: [
+    [css("--s1"), fmtTok(cached), s.state === "waiting" ? "cached (expected)" : "cached"],
+    [css("--s3"), fmtTok(Math.max(0, fed - cached)), "prefilled"],
+    [css("--pending"), fmtTok(Math.max(0, prompt - Math.max(fed, cached))), "prompt to run"],
+    [css("--s2"), fmtTok(s.out), "generated"],
+    ...comp.map((c) => [null, c, ""]),
+    ...names.map((n, i) => [null, fmtTok([sysEnd, lastMsg, genStart][i]), n]),
+  ] }));
+  return [wrap, comp.join(" · ")];
+}
+function drawSessions() {
+  const box = $("sess"), seqs = state.tick?.seqs || [];
+  if (!seqs.length) { box.replaceChildren(el("div", { class: "empty" }, state.tick ? "No requests running." : "Waiting for the engine.")); return; }
+  const kids = seqs.map((s) => {
+    const phase = s.state === "waiting" ? (s.held ? "waiting for room" : "queued") : s.phase;
+    const [bar, comp] = ctxBar(s);
+    const decAvg = s.out > 1 && s.decode_wall > 0 ? (s.out - 1) / s.decode_wall : null;
+    const preAvg = s.prefill_s > 0 ? s.computed / s.prefill_s : null;
+    const kv = [
+      ["context", `${fmtTok(s.prompt + s.out)} tok`],
+      ["prefill now", s.phase === "prefill" && s.state !== "waiting" ? fmtRate(s.prefill_now) + " tok/s" : "–"],
+      ["prefill avg", preAvg ? fmtRate(preAvg) + " tok/s" : "–"],
+      ["decode now", s.phase === "decode" ? fmtRate(s.decode_now) + " tok/s" : "–"],
+      ["decode avg", decAvg ? fmtRate(decAvg) + " tok/s" : "–"],
+      ["tokens / step", s.steps ? (s.out / s.steps).toFixed(2) : "–"],
+      ["TTFT", fmtS(s.ttft)],
+      ["queued", fmtS(s.queued)],
+      ["age", fmtS(s.age)],
+      ["cache hit", s.prompt ? fmtPct(Math.min(s.cached, s.prompt) / s.prompt) : "–"],
+      ["max new", fmtTok(s.max_new)],
+      ...(s.images ? [["image tokens", fmtTok(s.images)]] : []),
+      ...(s.preempted ? [["preempted", s.preempted + "×"]] : []),
+    ];
+    return el("div", { class: "seq" },
+      el("div", { class: "top" },
+        el("span", { class: "badge" }, el("span", { class: "dot", style: `background:var(${STATE_COLOR[s.state] || "--muted"})` }), `${s.state} · ${phase}`),
+        el("span", { class: "rid" }, s.rid),
+        el("span", { class: "sub" }, s.endpoint || ""),
+        el("span", { class: "muted" }, s.client || ""),
+        el("span", { class: "muted num", style: "margin-left:auto" }, comp)),
+      bar,
+      el("div", { class: "kv" }, ...kv.map(([k, v]) => el("div", {}, el("span", {}, k + " "), el("b", {}, v)))),
+      s.preview ? el("div", { class: "preview" }, s.preview) : null);
+  });
+  box.replaceChildren(...kids);
+}
+
+// ---------------------------------------------------------------- log
+const LEVEL = { info: "--good", warn: "--warning", error: "--critical" };
+function logRow(e) {
+  const r = e.rec, m = e.meta || r?.meta || {};
+  const lvl = el("span", { class: "lvl" }, el("span", { class: "dot", style: `background:var(${LEVEL[e.level] || "--muted"})` }), e.kind === "done" ? e.text : e.kind);
+  const cells = r ? [
+    el("td", { class: "r" }, fmtTok(r.prompt_tokens)),
+    el("td", { class: "r" }, `${fmtTok(r.cached_tokens)} (${fmtPct(r.hit)})`),
+    el("td", { class: "r" }, fmtTok(r.completion_tokens)),
+    el("td", { class: "r" }, fmtS(r.ttft)),
+    el("td", { class: "r" }, r.prefill_tps ? fmtRate(r.prefill_tps) : "–"),
+    el("td", { class: "r" }, r.decode_tps ? fmtRate(r.decode_tps) : "–"),
+    el("td", { class: "r" }, r.accept ? r.accept.toFixed(2) : "–"),
+    el("td", { class: "r" }, fmtS(r.total)),
+    el("td", { class: "prev" }, m.preview || ""),
+  ] : [el("td", { colspan: 9, class: "prev", style: "max-width:none" }, e.text)];
+  const tr = el("tr", { class: r ? "" : "ev" }, el("td", { class: "num muted" }, clock(e.t)), el("td", {}, lvl),
+    el("td", { class: "muted", style: "font-family:ui-monospace,monospace" }, e.rid ? e.rid.slice(4, 12) : ""), el("td", { class: "muted" }, m.endpoint || ""), ...cells);
+  tr.title = "click for details";
+  tr.addEventListener("click", () => { state.open.has(e.n) ? state.open.delete(e.n) : state.open.add(e.n); drawLog(); });
+  const out = [tr];
+  if (state.open.has(e.n)) {
+    tr.className += " sel";
+    const detail = { ...e }; delete detail.n;
+    out.push(el("tr", { class: "sel" }, el("td", { colspan: 13 }, el("pre", {}, JSON.stringify(detail, null, 1)))));
+  }
+  return out;
+}
+function drawLog() {
+  const req = $("f-req").checked, sub = $("f-sub").checked, ev = $("f-ev").checked;
+  const rows = state.log.filter((e) => e.kind === "done" ? req : e.kind === "submit" ? sub : ev).slice(-300).reverse();
+  const tb = $("log"); tb.replaceChildren();
+  tb.append(el("tr", {}, el("th", {}, "Time"), el("th", {}, "Result"), el("th", {}, "Request"), el("th", {}, "Endpoint"),
+    el("th", { class: "r" }, "Prompt"), el("th", { class: "r" }, "Cached (hit)"), el("th", { class: "r" }, "Output"), el("th", { class: "r" }, "TTFT"),
+    el("th", { class: "r" }, "Prefill tok/s"), el("th", { class: "r" }, "Decode tok/s"), el("th", { class: "r" }, "Tok/step"), el("th", { class: "r" }, "Total"), el("th", {}, "Last user message")));
+  if (!rows.length) tb.append(el("tr", {}, el("td", { colspan: 13, class: "empty" }, "Nothing yet.")));
+  for (const e of rows) tb.append(...logRow(e));
+  const done = state.log.filter((e) => e.kind === "done");
+  const p = done.reduce((a, e) => a + e.rec.prompt_tokens, 0), c = done.reduce((a, e) => a + e.rec.cached_tokens, 0);
+  $("log-sum").textContent = done.length ? `${done.length} requests · cache hit ${fmtPct(p ? c / p : null)} of prompt tokens` : "";
+}
+for (const id of ["f-req", "f-sub", "f-ev"]) $(id).addEventListener("change", drawLog);
+
+// ---------------------------------------------------------------- header, stream
+function drawHeader() {
+  const i = state.info, eng = state.tick?.engine || "connecting";
+  const color = { ready: "--good", loading: "--warning", stopping: "--warning", stopped: "--muted" }[eng] || "--critical";
+  $("engine").replaceChildren(el("span", { class: "dot", style: `background:var(${color})` }), el("span", {}, `engine ${eng}`));
+  const can = { start: eng === "stopped", stop: ["ready", "loading", "restarting"].includes(eng), restart: ["ready", "loading", "restarting"].includes(eng) };
+  document.querySelectorAll("#ctl button").forEach((b) => { b.disabled = state.busy || !can[b.dataset.a]; });
+  $("cfg").textContent = i.max_tokens ? [i.gpu, i.model, `KV ${i.kv_dtype}`, `context ${fmtTok(i.max_tokens)}`, `${i.max_seqs} sequences`,
+    i.spec ? "DFlash2" : "no speculative decoding", i.vision ? "vision" : null].filter(Boolean).join(" · ") : "";
+}
+function drawAll() { drawHeader(); drawTiles(); drawCharts(); drawVram(); drawSessions(); }
+
+document.querySelectorAll("#ctl button").forEach((b) => b.addEventListener("click", async () => {
+  const a = b.dataset.a, n = state.tick?.seqs?.length || 0;
+  if (a !== "start" && !confirm(`${a === "stop" ? "Stop" : "Restart"} the engine?` +
+      (n ? ` ${n} request${n > 1 ? "s" : ""} in flight will fail.` : "") + " The prefix cache is dropped.")) return;
+  state.busy = true; drawHeader();
+  try {
+    const r = await fetch("/admin/engine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: a }) });
+    if (!r.ok) alert(`engine ${a}: ${(await r.json()).error?.message || r.status}`);
+  } catch (e) { alert(`engine ${a}: ${e}`); }
+  state.busy = false; drawHeader();
+}));
+document.querySelectorAll("#range button").forEach((b) => b.addEventListener("click", () => {
+  document.querySelectorAll("#range button").forEach((o) => o.setAttribute("aria-pressed", String(o === b)));
+  state.range = +b.dataset.s; drawCharts();
+}));
+window.addEventListener("resize", drawCharts);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
+
+function addSample(s) {
+  if (!s) return;
+  const h = state.history;
+  if (!h.length || s.t > h[h.length - 1].t) h.push(s);
+  while (h.length && h[0].t < Date.now() / 1000 - 660) h.shift();
+}
+function connect() {
+  const es = new EventSource("/ui/stream");
+  es.addEventListener("init", (ev) => {
+    const d = JSON.parse(ev.data);
+    state.info = d.info; state.sampleS = d.sample_s || 1; state.history = d.history; state.log = d.log; state.tick = d.tick;
+    $("conn").textContent = "live";
+    drawAll(); drawLog();
+  });
+  es.addEventListener("tick", (ev) => {
+    const d = JSON.parse(ev.data);
+    state.tick = d; addSample(d.sample);
+    if (d.engine === "ready" && !state.info.max_tokens) { es.close(); connect(); return; }
+    drawAll();
+  });
+  es.addEventListener("log", (ev) => {
+    state.log.push(...JSON.parse(ev.data));
+    if (state.log.length > 500) state.log.splice(0, state.log.length - 500);
+    drawLog();
+  });
+  es.onerror = () => { $("conn").textContent = "disconnected, retrying"; };
+}
+buildCharts();
+connect();
+</script>
+</body>
+</html>

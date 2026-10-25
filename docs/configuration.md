@@ -24,13 +24,16 @@ directly uses the same defaults. The startup log prints the memory plan. Task ID
 | `SPEC` | `dflash2` | `dflash2` (speculative decoding with the DFlash2 draft) or `none` |
 | `Q27_DRAFT_QUANT` | `fp4` | Draft linear layers: `fp4`, `fp8` or `bf16` (same acceptance, FP4 is fastest) |
 | `Q27_DRAFT_VOCAB` | `bench/draft-vocab/vocab-128k.txt` | Candidate vocabulary of the draft (`tools/draft_vocab.py`); `none` for the full vocabulary |
-| `STATE_HOST_CACHE` | 4 | GiB of pinned host memory for prefix-cache checkpoints (4 = 21 checkpoints; 0 disables the cache; the engine library defaults to 0) |
+| `STATE_HOST_CACHE` | 4 | GiB of pinned host memory for prefix-cache checkpoints (4 = 21 checkpoints; 0 disables the cache; the engine library defaults to 0). The slots are not allocated at startup (pinning 4 GiB takes about 1.8 s on WSL2): one by one while the server is idle, or when a checkpoint needs one |
 | `KV_POOL_TOKENS` | 0 | KV pool size in tokens (0 = all the VRAM budget leaves). When set, it is the KV cache with every parking area in use; the pool is that plus the parking areas (P7-13) |
 | `CHECKPOINT_INTERVAL` | 8192 | Distance between checkpoints inside a long prompt (a multiple of 64) |
 | `VISION` | `host` | Image input. `host`: the vision tower's BF16 weights (0.86 GiB) stay in pinned host memory and are streamed to the GPU one layer ahead of the computation; the KV pool loses 192 tokens, small images take +13 ms (the copy is about 20 ms), 1024x1024 and larger +1–4 ms; output identical to `bf16`. `fp8`: E4M3 weights with per-row scales on the GPU, widened per layer (0.43 GiB; embedding error about 3x that of `bf16`, answers can change). `bf16`: BF16 weights on the GPU (fastest, 0.86 GiB). `off`: requests with images get HTTP 400 (the engine library's default). Activations and the weight staging (90 MiB) share the prefill's buffers |
 | `IMAGE_MAX_PIXELS` | 4194304 | Images are resized to at most this many pixels (2048x2048 = 4,096 tokens, 370 ms in the vision tower) |
 | `IMAGE_TOKENS` | 16384 | Image tokens per request (embeddings in pinned host memory, 10 KiB per token: 160 MiB) |
 | `VRAM_BUDGET_GIB` / `WDDM_MARGIN_GIB` | free − 0.6 / 0.6 | VRAM budget (at most 30.3 GiB) and the margin kept free for the display driver |
+| `Q27_LOAD_THREADS` | 8 | Threads that read the weight files ahead of the uploads (the bytes loaded are the same with any number). On WSL2 one read stream from a Windows drive (`/mnt/d`, virtiofs) gets 1.2–1.5 GB/s; 4 to 16 threads reach the filesystem's 2.6–2.8 GB/s, and the engine starts in about 10 s instead of 18–21 s. A copy of the weights on the Linux file system, `cache/weights/<org>--<name>/<revision>/` (`cp -L` of the HF snapshot; used before the HF cache when present), starts in about 3.3 s while it is in the page cache |
+| `ENGINE_AUTOSTART` | 1 | 0: the server starts with the engine stopped (no VRAM in use; requests get 503) until it is started at `/ui` or with `POST /admin/engine` |
+| `STATS_SAMPLE_S` | 1 | Seconds between the GPU samples (NVML: utilization, power, clocks, temperature, memory) of the stats page `/ui`; the last 10 minutes are kept. 0: no sampling (the page still shows requests, VRAM and the log) |
 | `API_DUMP_DIR` | unset | Debugging: write the body of every POST to this directory (to see what a client sends; may contain personal data) |
 
 ### Attention numerics
@@ -55,6 +58,34 @@ directly uses the same defaults. The startup log prints the memory plan. Task ID
   Example: `curl -s -X POST localhost:8000/admin/concurrency -d '{"target_seqs": 4}'`.
 - `/metrics` (Prometheus): among others `q27:target_seqs`, `q27:admission_blocked{reason=...}`,
   `q27:admission_waits_total{reason=...}`, `q27:cached_tokens_total`, `q27:reusable_tokens_total`.
+
+## Stats page
+
+`http://localhost:8000/ui` shows the server live in the browser (no authentication, like the admin API):
+
+- GPU utilization, power against the limit, clocks and temperature (NVML), and the aggregate decode and prefill
+  tokens per second, over the last 1 to 10 minutes.
+- Device memory by owner: weights (by part of the model), the KV pool (pages of running requests, pages only
+  prefix-cache checkpoints hold, parked sequence state, free), sequence state, activations, the CUDA context and
+  runtime (CUDA graphs, libraries), other processes and free memory, plus the pinned host pools. The pool sizes come
+  from the engine's memory plan; the context and runtime are what `cudaMemGetInfo` shows beyond the pools.
+- Each running or waiting request: its context (tokens restored from the prefix cache, prefilled, still to run,
+  generated, with the message boundaries), current and average prefill and decode tokens per second, tokens per
+  speculative step, TTFT, time queued.
+- A log of the finished requests (prompt, cached tokens and hit rate, output, TTFT, prefill / decode tok/s, finish
+  reason, the start of the last user message) and of engine events (admission waits, preemptions, errors,
+  restarts), the last 500 entries.
+
+The page also starts, stops and restarts the engine (a start takes about 3.3 s with the weights in the page cache, about 10 s
+reading them from a Windows drive under WSL2: see `Q27_LOAD_THREADS`). The engine process holds all the VRAM; the HTTP server
+holds none, so stopping the engine frees the GPU for other work while the service and the page stay up. Requests in
+flight fail with 503, and so do new ones until the engine is started again. The prefix cache is lost. The same from
+a script: `curl -s -X POST localhost:8000/admin/engine -H 'Content-Type: application/json' -d '{"action": "stop"}'`
+(`start`, `stop` or `restart`; `GET /admin/engine` returns the state: `stopped`, `loading`, `ready`, `restarting`
+after a crash, `stopping`). The JSON content type is required, so that another web page cannot send the action as a
+form.
+
+`GET /ui/stream` is the page's event stream (server-sent events) and `GET /ui/state` returns one snapshot as JSON.
 
 ## Prefix cache
 

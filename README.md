@@ -101,6 +101,11 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 
 `./hf` can be a symlink if the weights should live on another disk.
 
+http://127.0.0.1:8000/ui shows the server live: GPU utilization and power, VRAM by owner (weights, KV cache, state,
+activations, CUDA runtime), each running request's context and prefill / decode speed, and a log of the requests
+with their prefix-cache hits. The page also stops the engine to free the VRAM (the server stays up) and starts or
+restarts it ([docs/configuration.md](docs/configuration.md#stats-page)).
+
 ## Clients
 
 - **OpenAI-compatible** (chat completions, completions, Responses): base URL `http://127.0.0.1:8000/v1`, any API key,

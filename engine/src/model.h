@@ -93,9 +93,18 @@ class Model {
   int prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, bool spec);
   // Saves a checkpoint of the sequence so far (e.g. at the end of a generation).
   void checkpoint();
-  // out[11]: lookups, hits, prompt tokens, cached tokens, checkpoints saved, evicted, live checkpoints, free
-  // pages, pages only checkpoints hold (free after evicting them), pool pages, KV pages of a parking area.
+  // out[12]: lookups, hits, prompt tokens, cached tokens, checkpoints saved, evicted, live checkpoints, free
+  // pages, pages only checkpoints hold (free after evicting them), pool pages, KV pages of a parking area, state
+  // slots allocated.
   void cache_stats(int64_t* out) const;
+  // Allocates up to n more pinned state slots of the prefix cache (they are not allocated at startup); returns how
+  // many it allocated (0: all are). A checkpoint that finds no free slot allocates one itself.
+  int grow_state_cache(int n);
+  // Memory (stats UI): one line per pool ("pool\t<name>\t<host 0|1>\t<bytes>") followed by its reservations
+  // ("item\t<name>\t<what>\t<bytes>"), and "slots\t<state cache slots>\t<bytes of a checkpoint>". Fixed after
+  // the constructor. device_memory: out[4] = free now, total (cudaMemGetInfo), free at the start, budget.
+  std::string memory_report() const;
+  void device_memory(int64_t* out) const;
 
   // Prompt chunks before forward_sample / spec_begin (Phase 6: other sequences can run between them).
   // ids[0..n) is the rest of the prompt after the sequence's position; runs chunks while more than one
@@ -203,6 +212,7 @@ class Model {
   Options opt_;
   std::unique_ptr<SafeTensors> ckpt_;
   std::unique_ptr<SafeTensors> lm_ckpt_;  // Q27_LM_HEAD_CKPT: the NVFP4 lm_head of a BF16-lm_head model
+  Budget vram_;                      // the VRAM budget (make_budget), for device_memory
   Pool dev_weights_{"weights"}, host_weights_{"embedding", true}, kv_{"kv"}, state_{"state"}, act_{"activations"},
       host_cache_{"state cache", true}, host_mm_{"image embeddings", true};
   Weights w_;
@@ -239,7 +249,7 @@ class Model {
   bool cache_on_ = false;
   std::vector<Checkpoint> ckpts_;
   size_t ckpt_bytes_ = 0;            // ssm + conv + draft ring
-  char* host_slots_ = nullptr;       // pinned [slots][ckpt_bytes_] (host_cache_)
+  std::vector<char*> slot_mem_;      // pinned [ckpt_bytes_] per slot, allocated as needed (grow_state_cache)
   std::vector<bool> slot_used_;
   char* stage_ = nullptr;            // device copy of one checkpoint on its way to the host
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled

@@ -6,6 +6,7 @@
 #include <fstream>
 
 #include "common.h"
+#include "prefetch.h"
 
 namespace q27 {
 
@@ -194,27 +195,25 @@ void Draft::bind() {
 
 void Draft::load(cudaStream_t s) {
   auto t0 = std::chrono::steady_clock::now();
-  constexpr size_t kStage = 128 << 20;
-  void* stage[2];
-  cudaEvent_t done[2];
-  for (int i = 0; i < 2; i++) {
-    Q27_CUDA(cudaHostAlloc(&stage[i], kStage, cudaHostAllocDefault));
-    Q27_CUDA(cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming));
-    Q27_CUDA(cudaEventRecord(done[i], s));
-  }
-  int cur = 0;
-  size_t total = 0;
-  // Streams one tensor into device memory at dst through the pinned staging buffers.
+  constexpr int64_t kChunk = Prefetcher::kSlotBytes;
+  // Every tensor in slot-sized chunks, read ahead by several threads (prefetch.h), in the order uploaded below.
+  std::vector<Prefetcher::Read> plan;
+  auto plan_tensor = [&](const std::string& name) {
+    const int64_t n = ckpt_->info(name).nbytes;
+    for (int64_t off = 0; off < n; off += kChunk) plan.push_back({ckpt_.get(), name, off, std::min(kChunk, n - off), nullptr});
+  };
+  for (auto& j : plain_) plan_tensor(j.name);
+  for (auto& j : lin_) plan_tensor(j.name);
+  Prefetcher pf(std::move(plan));
+  size_t ri = 0, total = 0;
+  // Streams one tensor into device memory at dst through the prefetcher's pinned slots.
   auto upload = [&](const std::string& name, char* dst) {
     const auto& info = ckpt_->info(name);
     total += size_t(info.nbytes);
-    for (int64_t off = 0; off < info.nbytes; off += kStage) {
-      const int64_t len = std::min<int64_t>(kStage, info.nbytes - off);
-      Q27_CUDA(cudaEventSynchronize(done[cur]));
-      ckpt_->read_range(name, off, len, stage[cur]);
-      Q27_CUDA(cudaMemcpyAsync(dst + off, stage[cur], size_t(len), cudaMemcpyHostToDevice, s));
-      Q27_CUDA(cudaEventRecord(done[cur], s));
-      cur ^= 1;
+    for (int64_t off = 0; off < info.nbytes; off += kChunk) {
+      void* buf = pf.get(ri, name, off);
+      Q27_CUDA(cudaMemcpyAsync(dst + off, buf, size_t(std::min(kChunk, info.nbytes - off)), cudaMemcpyHostToDevice, s));
+      pf.release(ri++, s);
     }
   };
   for (auto& j : plain_) upload(j.name, wpool_.at<char>(j.offset));
@@ -236,10 +235,6 @@ void Draft::load(cudaStream_t s) {
   }
   Q27_CUDA(cudaStreamSynchronize(s));
   if (tmp) Q27_CUDA(cudaFree(tmp));
-  for (int i = 0; i < 2; i++) {
-    cudaEventDestroy(done[i]);
-    cudaFreeHost(stage[i]);
-  }
   double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   log("loaded the draft (%.2f GB) in %.1f s", total / 1e9, sec);
 }

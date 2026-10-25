@@ -3,7 +3,8 @@ SGLang environments (same port, model name, parsers and request options).
 
 Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses (Codex), /v1/messages,
 /v1/messages/count_tokens, /tokenize, /detokenize; GET /v1/models, /health, /metrics; GET / POST
-/admin/concurrency (the admission settings, P7-14). Streaming everywhere (SSE), reasoning (`<think>`, returned as
+/admin/concurrency (the admission settings, P7-14); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
+/ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py). Streaming everywhere (SSE), reasoning (`<think>`, returned as
 `reasoning_content` / `reasoning`, or Anthropic thinking blocks), tool calls (qwen3_coder XML, streamed call by
 call), images (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
 
@@ -38,6 +39,7 @@ sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 
 import worker  # noqa: E402
+from stats import HUB, request_meta  # noqa: E402
 from chat import (STOP_REASON, AnthropicError, OutputParser, _partial_suffix, anthropic_messages,  # noqa: E402,F401
                   anthropic_template_kwargs, new_id, normalize_messages, openai_call, parse_output,
                   parse_tool_calls, responses_messages, responses_template_kwargs, split_reasoning,
@@ -48,6 +50,8 @@ DEFAULTS = {"temperature": 1.0, "top_k": 20, "top_p": 0.95}  # generation_config
 SPEC_MARGIN = 8  # a verify block writes up to 8 positions past the committed length
 KEEPALIVE_S = 10.0
 DUMP_DIR = os.environ.get("API_DUMP_DIR")  # debug: write every POST body there
+UI_PAGE = ROOT / "frontend/ui/index.html"
+GENERATE = ("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages")
 
 
 def log(msg):
@@ -137,9 +141,10 @@ class Images:
 
 class EngineClient:
     """Starts the engine process (worker.py) and routes its messages to the requests' queues; starts a new
-    one when it dies."""
+    one when it dies. The engine holds all the VRAM: control() stops it (the server stays up and answers 503),
+    starts it again or restarts it (POST /admin/engine, the stats page)."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, autostart=True):
         self.cfg = cfg
         self.lock = threading.Lock()       # handles
         self.send_lock = threading.Lock()  # (a Connection is not thread-safe)
@@ -152,19 +157,65 @@ class EngineClient:
         self.config_answers = {}           # change number -> the worker's settings after it
         self.config_n = 0
         self.restarts = 0
-        self.stopping = False
-        self.start()
+        self.stopping = False              # the server is shutting down
+        self.wanted = autostart            # the engine should run (stopped from the admin API: False)
+        self.life = threading.Lock()       # start / stop / restart, one at a time
+        self.gen = 0                       # engine generation (a stop or start makes a pending auto-restart stale)
+        self.proc = None
+        if autostart:
+            self.start()
+        else:
+            HUB.engine_state_set("stopped", "engine not started (ENGINE_AUTOSTART=0)")
 
     def start(self):
+        HUB.engine_starting()
         ctx = mp.get_context("spawn")
         parent, child = ctx.Pipe()
         self.proc = ctx.Process(target=worker.run, args=(child, self.cfg), daemon=True, name="q27-engine")
         self.proc.start()
         child.close()
         self.conn = parent
-        threading.Thread(target=self.reader, daemon=True, name="engine-reader").start()
+        threading.Thread(target=self.reader, args=(self.gen,), daemon=True, name="engine-reader").start()
 
-    def reader(self):
+    def state(self):
+        """stopped | loading | ready | restarting (after a crash) | stopping."""
+        return HUB.engine_state
+
+    def control(self, action):
+        """start | stop | restart the engine process; returns the state afterwards (start: "loading")."""
+        with self.life:
+            if action in ("stop", "restart"):
+                self._stop()
+            if action in ("start", "restart") and not (self.proc is not None and self.proc.is_alive()):
+                self.wanted, self.restarts = True, 0
+                self.gen += 1
+                self.start()
+        return self.state()
+
+    def _stop(self):
+        self.wanted = False
+        self.gen += 1
+        proc = self.proc
+        if proc is None or not proc.is_alive():
+            HUB.engine_state_set("stopped", "engine stopped")
+            return
+        HUB.engine_state_set("stopping", "stopping the engine")
+        if self.ready.is_set():  # (while loading it reads no messages)
+            try:
+                with self.send_lock:
+                    self.conn.send(("stop",))
+            except OSError:
+                pass
+            proc.join(timeout=15)
+        for kill in (proc.terminate, proc.kill):
+            if proc.is_alive():
+                kill()
+                proc.join(timeout=10)
+        self.ready.clear()
+        log(f"engine stopped (exit code {proc.exitcode})")
+        HUB.engine_state_set("stopped", "engine stopped: its VRAM is free")
+
+    def reader(self, gen):
         conn = self.conn
         try:
             while True:
@@ -174,6 +225,13 @@ class EngineClient:
                     self.info = msg[1]
                     self.ready.set()
                     log(f"engine ready: {self.info}")
+                    HUB.engine_ready(self.info, self.cfg)
+                elif kind == "memory":
+                    HUB.set_memory(msg[1])
+                elif kind == "stats":
+                    HUB.set_snapshot(msg[1])
+                elif kind == "event":
+                    HUB.event(msg[1], msg[2], msg[3])
                 elif kind == "metrics":
                     self.metrics.update(msg[1])
                 elif kind == "config":
@@ -188,6 +246,9 @@ class EngineClient:
                     rid = msg[1]
                     if kind == "done":
                         self.metrics.update(msg[3].pop("metrics", {}))
+                        HUB.finished(rid, msg[2], msg[3])
+                    elif kind == "error":
+                        HUB.failed(rid, msg[2])
                     with self.lock:
                         q = self.handles.get(rid)
                         if kind in ("done", "error"):
@@ -197,23 +258,32 @@ class EngineClient:
         except (EOFError, OSError):
             pass
         self.ready.clear()
+        planned = self.stopping or not self.wanted or gen != self.gen
         with self.lock:
             handles, self.handles = self.handles, {}
         for q in handles.values():
-            q.put(("error", None, "the engine stopped; it is restarting", 503))
-        if self.stopping:
+            q.put(("error", None, "the engine was stopped" if planned else "the engine stopped; it is restarting", 503))
+        if planned:
             return
         self.proc.join(timeout=10)
         code = self.proc.exitcode
         self.restarts += 1
         delay = min(60, 2 ** min(self.restarts, 6))
         log(f"engine exited with code {code}; starting a new one in {delay} s")
+        HUB.engine_stopped(f"engine exited with code {code}; starting a new one in {delay} s")
         time.sleep(delay)
-        self.start()
+        with self.life:
+            if self.wanted and gen == self.gen and not self.stopping:
+                self.start()
+
+    def not_ready(self):
+        if not self.wanted:
+            return ApiError(503, "the engine is stopped (start it at /ui or with POST /admin/engine)", "overloaded_error")
+        return ApiError(503, "the engine is loading", "overloaded_error")
 
     def submit(self, req):
         if not self.ready.is_set():
-            raise ApiError(503, "the engine is loading", "overloaded_error")
+            raise self.not_ready()
         rid = new_id("req-", 16)
         q = queue.Queue()
         with self.lock:
@@ -225,12 +295,13 @@ class EngineClient:
             with self.lock:
                 self.handles.pop(rid, None)
             raise ApiError(503, "the engine is restarting", "overloaded_error") from e
+        HUB.submitted(rid)
         return rid, q
 
     def configure(self, changes):
         """Changes the admission settings (kept for a restarted engine); returns the worker's settings."""
         if not self.ready.is_set():
-            raise ApiError(503, "the engine is loading", "overloaded_error")
+            raise self.not_ready()
         self.cfg.update(changes)
         with self.config_seen:
             self.config_n += 1
@@ -256,6 +327,8 @@ class EngineClient:
 
     def stop(self):
         self.stopping = True
+        if self.proc is None:
+            return
         try:
             with self.send_lock:
                 self.conn.send(("stop",))
@@ -461,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        if self.command == "GET" and self.path.split("?")[0] in ("/health", "/metrics"):
+        if self.command == "GET" and self.path.split("?")[0] in ("/health", "/metrics", "/ui/state"):
             return  # (polled by the healthcheck and the benchmarks)
         sys.stderr.write("[api] " + fmt % args + "\n")
 
@@ -508,7 +581,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.srv.engine.ready.is_set():
                 self._json(200, {"status": "ok"})
             else:
-                self._json(503, {"status": "loading"})
+                self._json(503, {"status": self.srv.engine.state()})
         elif path == "/metrics":
             body = "".join(f"{k} {v}\n" for k, v in sorted(self.srv.engine.metrics.items())).encode()
             self.send_response(200)
@@ -527,12 +600,48 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, card)
         elif path == "/admin/concurrency":
             if not self.srv.engine.ready.is_set():
-                return self._error(503, "the engine is loading", "overloaded_error")
+                e = self.srv.engine.not_ready()
+                return self._error(e.code, str(e), e.kind)
             self._json(200, self.srv.engine.config)
+        elif path == "/admin/engine":
+            self._json(200, {"state": self.srv.engine.state()})
         elif path == "/version":
             self._json(200, {"version": "q27-phase6"})
+        elif path == "/ui":
+            body = UI_PAGE.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/ui/state":
+            self._json(200, dict(HUB.init(), tick=HUB.tick()))
+        elif path == "/ui/stream":
+            self.ui_stream()
         else:
             self._error(404, "not found", "not_found")
+
+    def ui_stream(self):
+        """Server-sent events of the stats UI: "init" (configuration, sample history, log), then "tick" (the
+        requests, VRAM, last GPU sample) every second and "log" (new entries) as they come."""
+        self._sse_start()
+        try:
+            init = dict(HUB.init(), tick=HUB.tick())
+            self._sse(init, "init")
+            seen = init["log"][-1]["n"] if init["log"] else 0
+            last = time.time()
+            while True:
+                HUB.wait(1.0)
+                new = HUB.log_since(seen)
+                if new:
+                    seen = new[-1]["n"]
+                    self._sse(new, "log")
+                if time.time() - last >= 1.0:
+                    last = time.time()
+                    self._sse(HUB.tick(), "tick")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def do_HEAD(self):
         self.send_response(200 if self.srv.engine.ready.is_set() else 503)
@@ -553,13 +662,16 @@ class Handler(BaseHTTPRequestHandler):
             (pathlib.Path(DUMP_DIR) / name).write_text(json.dumps(body, ensure_ascii=False, indent=1))
         routes = {"/v1/chat/completions": self.chat, "/v1/completions": self.completions, "/v1/responses": self.responses_api,
                   "/v1/messages": self.messages, "/v1/messages/count_tokens": self.count_tokens,
-                  "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency}
+                  "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency,
+                  "/admin/engine": self.engine_control}
         fn = routes.get(path)
         if fn is None:
             return self._error(404, "not found", "not_found")
+        HUB.local.meta = request_meta(path, self.headers, body) if path in GENERATE else None
         try:
             fn(body)
         except ApiError as e:
+            HUB.http_error(path, e.code, str(e))
             self._error(e.code, str(e), e.kind)
         except (AnthropicError, ValueError, KeyError, TypeError) as e:
             self._error(400, f"{type(e).__name__}: {e}" if not isinstance(e, (AnthropicError, ValueError)) else str(e))
@@ -889,6 +1001,17 @@ class Handler(BaseHTTPRequestHandler):
         changes = {k: int(v) if k in ("target_seqs", "kv_reserve") else v for k, v in body.items()}
         self._json(200, self.srv.engine.configure(changes))
 
+    def engine_control(self, body):
+        """{"action": "start" | "stop" | "restart"}: the engine process (stop frees its VRAM; requests in flight fail
+        with 503). Needs Content-Type: application/json, so that a web page cannot send it with a plain form."""
+        if self.headers.get_content_type() != "application/json":
+            raise ApiError(415, "send the action as JSON (Content-Type: application/json)")
+        action = body.get("action")
+        if action not in ("start", "stop", "restart"):
+            raise ApiError(400, "action: start, stop or restart")
+        HUB.add_log("admin", None, f"engine {action} requested", level="warn" if action != "start" else "info")
+        self._json(200, {"state": self.srv.engine.control(action)})
+
     def tokenize(self, body):
         if "messages" in body:
             kwargs = template_kwargs(body, self.srv.thinking_default)
@@ -1039,13 +1162,14 @@ def main():
         vocab = ROOT / "bench/draft-vocab/vocab-128k.txt"
         if vocab.exists():
             os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
-    cfg = {"model": str(path), "draft": str(draft) if draft else None, "max_tokens": args.max_tokens,
+    cfg = {"model": str(path), "weights": args.weights, "draft": str(draft) if draft else None, "max_tokens": args.max_tokens,
            "prefill_chunk": args.prefill_chunk, "kv_dtype": args.kv_dtype, "max_seqs": max(1, args.max_seqs),
            "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv), "kv_reserve": args.kv_reserve,
            "decode_share": args.decode_share, "quantum_ms": args.quantum_ms, "batch_decode": bool(args.batch_decode),
            "eos": eos if isinstance(eos, list) else [eos], "im_start": tok.convert_tokens_to_ids("<|im_start|>"),
            "engine_python": str(ROOT / "engine/python")}
-    engine = EngineClient(cfg)
+    HUB.start()
+    engine = EngineClient(cfg, autostart=env("ENGINE_AUTOSTART", "1") != "0")
     images = None
     if os.environ.get("VISION", "off") != "off":  # (the image processor also needs IMAGE_MAX_PIXELS)
         images = Images(path, int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)))

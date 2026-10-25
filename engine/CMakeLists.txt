@@ -18,6 +18,7 @@ find_package(CUDAToolkit REQUIRED)
 add_library(q27 SHARED
   src/json.cc
   src/safetensors.cc
+  src/prefetch.cc
   src/memory.cc
   src/weights.cc
   src/kernels.cu

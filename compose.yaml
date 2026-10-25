@@ -46,6 +46,7 @@ services:
     environment:
       <<: *dev-env
       SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-qwen3.8-27b}  # same name as the vLLM / SGLang environments
+      ENGINE_AUTOSTART: ${ENGINE_AUTOSTART:-1}     # 0: the server starts with the engine stopped (no VRAM; start it at /ui)
       MAX_TOKENS: ${MAX_TOKENS:-262144}
       MAX_TOKENS_FIT: ${MAX_TOKENS_FIT:-1}         # 1: lower MAX_TOKENS to what the VRAM fits (since P7-13 MAX_SEQS=8 fits 262144)
       MAX_SEQS: ${MAX_SEQS:-8}                     # requests the engine can run at once (fewer while the KV pool is short; more wait)

@@ -249,10 +249,33 @@ int q27_checkpoint(void* m) {
   return guard([&] { static_cast<Model*>(m)->checkpoint(); });
 }
 
-// out[11]: lookups, hits, prompt tokens, cached tokens, saved, evicted, live checkpoints, free KV pages, pages
-// only checkpoints hold, pool pages, KV pages of a parking area.
+// out[12]: lookups, hits, prompt tokens, cached tokens, saved, evicted, live checkpoints, free KV pages, pages
+// only checkpoints hold, pool pages, KV pages of a parking area, state slots allocated.
 int q27_cache_stats(void* m, int64_t* out) {
   return guard([&] { static_cast<Model*>(m)->cache_stats(out); });
+}
+
+// Allocates up to n more pinned state slots of the prefix cache (*added: how many; 0 once all are).
+int q27_cache_grow(void* m, int n, int* added) {
+  return guard([&] { *added = static_cast<Model*>(m)->grow_state_cache(n); });
+}
+
+// Memory (stats UI): the pool report (Model::memory_report) copied into buf[0..cap) with a terminating 0;
+// returns its length (call again with a larger buffer when it is >= cap), or -1 on an error.
+int q27_memory_report(void* m, char* buf, int cap) {
+  std::string r;
+  if (guard([&] { r = static_cast<Model*>(m)->memory_report(); }) != 0) return -1;
+  if (cap > 0) {
+    const size_t n = std::min(r.size(), size_t(cap - 1));
+    memcpy(buf, r.data(), n);
+    buf[n] = 0;
+  }
+  return int(r.size());
+}
+
+// out[4]: device bytes free now, total, free when the engine started, VRAM budget of the pools.
+int q27_device_memory(void* m, int64_t* out) {
+  return guard([&] { static_cast<Model*>(m)->device_memory(out); });
 }
 
 // Images (P4-12): spans [n][3] = (start, gh, gw) of the request (after q27_reset / q27_prefix_begin), the

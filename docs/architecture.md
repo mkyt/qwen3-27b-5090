@@ -314,6 +314,15 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
 - The server marks message boundaries for the prefix cache and reports, per request, how many tokens came from it.
 - `/metrics` exposes Prometheus metrics; `/admin/concurrency` reads and sets the admission settings. There is no
   authentication: the server is meant to listen on 127.0.0.1 for one user.
+- `/ui` is a stats page (`frontend/stats.py`, `frontend/ui/index.html`): the engine process sends a snapshot of its
+  requests, KV pool and device memory every 0.5 s while it works and its memory plan once at startup
+  (`q27_memory_report`); the server adds NVML samples and a log of requests and engine events, and streams them to
+  the page as server-sent events. The page (and `POST /admin/engine`) also stops, starts and restarts the engine
+  process: it holds all the VRAM, the server none.
+- Loading (`engine/src/prefetch.cc`): the loaders plan the byte ranges they read, `Q27_LOAD_THREADS` threads read
+  them ahead into pinned slots (the embedding straight into its pinned table), and the loaders upload them in plan
+  order as before. The prefix cache's pinned state slots (4 GiB) are allocated after startup, one by one while the
+  engine is idle (`q27_cache_grow`) or when a checkpoint needs one.
 
 ## 13. Correctness
 

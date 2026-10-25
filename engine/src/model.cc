@@ -1,6 +1,7 @@
 #include "model.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstring>
@@ -32,7 +33,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   Q27_CHECK(opt.prefill_chunk > 0 && opt.prefill_chunk % 128 == 0, "prefill_chunk must be a multiple of 128");
   Q27_CHECK(opt.logits_rows > 0 && opt.logits_rows % 128 == 0 && opt.logits_rows <= opt.prefill_chunk,
             "logits_rows must be a multiple of 128 and <= prefill_chunk");
-  Budget budget = make_budget();
+  Budget budget = vram_ = make_budget();
   Q27_CUDA(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking));
   ckpt_ = std::make_unique<SafeTensors>(opt.model_dir);
   // End-of-sequence ids (speculative steps end at an accepted one).
@@ -199,19 +200,24 @@ Model::Model(const Options& opt) : opt_(opt) {
   const size_t o_kv = kv_.add("K | V pages (and parking areas)", size_t(kv_total) * per_page);
 
   check_and_log(budget, {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_cache_, &host_mm_});
-  for (Pool* p : {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_cache_, &host_mm_})
-    p->commit();
+  // The pinned state cache (host_cache_, 4 GiB: about 1.8 s to pin on WSL2, and other CUDA calls wait meanwhile) is
+  // not committed: its slots are allocated one by one when a checkpoint needs one or while the server is idle
+  // (grow_state_cache), so the engine is ready that much sooner.
+  auto since = [](auto t) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); };
+  auto t_commit = std::chrono::steady_clock::now();
+  for (Pool* p : {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_mm_}) p->commit();
+  log("pools allocated in %.2f s", since(t_commit));
   log("kv pool: %d pages (%d tokens), max_tokens %d%s", pool_pages, pool_pages * kPageTokens, opt_.max_tokens,
       cache_on_ ? "" : " (prefix cache off)");
   if (cache_on_) {
     stage_ = state_.at<char>(o_stage);
-    host_slots_ = host_cache_.at<char>(0);
     slot_used_.assign(slots, false);
+    slot_mem_.assign(slots, nullptr);
     Q27_CUDA(cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking));
     Q27_CUDA(cudaEventCreateWithFlags(&stage_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventCreateWithFlags(&stage_in_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
-    log("prefix cache: %d state slots of %.1f MiB (%.2f GiB pinned), checkpoint interval %d", slots,
+    log("prefix cache: %d state slots of %.1f MiB (%.2f GiB pinned, allocated as needed), checkpoint interval %d", slots,
         ckpt_bytes_ / 1048576.0, slots * double(ckpt_bytes_) / (1 << 30), opt.checkpoint_interval);
   }
 
@@ -358,6 +364,8 @@ Model::~Model() {
   if (b_out_) cudaFreeHost(b_out_);
   if (host_io_) cudaFreeHost(host_io_);
   if (cs_) cudaStreamSynchronize(cs_), cudaStreamDestroy(cs_);
+  for (char* m : slot_mem_)
+    if (m) cudaFreeHost(m);
   for (auto e : {stage_ev_, stage_in_ev_})
     if (e) cudaEventDestroy(e);
   for (auto* m : {&prof_.eager, &prof_.graph})
@@ -507,6 +515,17 @@ bool Model::evict_checkpoint() {
   return true;
 }
 
+int Model::grow_state_cache(int n) {
+  int added = 0;
+  for (size_t i = 0; i < slot_mem_.size() && added < n; i++)
+    if (!slot_mem_[i]) {
+      Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&slot_mem_[i]), ckpt_bytes_,
+                             cudaHostAllocMapped | cudaHostAllocPortable));
+      added++;
+    }
+  return added;
+}
+
 void Model::save_checkpoint(bool ring) {
   if (!cache_on_ || pos_ == 0) return;
   Q27_CHECK(int(seq_ids_.size()) == pos_, "checkpoint: token history does not match the position");
@@ -522,10 +541,14 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
       c.last_use = ++use_clock_;
       return;
     }
+  // A free allocated slot; else allocate another one; else evict the least recently used checkpoint.
   int slot = -1;
-  while ((slot = int(std::find(slot_used_.begin(), slot_used_.end(), false) - slot_used_.begin())) ==
-         int(slot_used_.size()))
-    evict_checkpoint();
+  for (;;) {
+    for (size_t i = 0; i < slot_used_.size() && slot < 0; i++)
+      if (slot_mem_[i] && !slot_used_[i]) slot = int(i);
+    if (slot >= 0) break;
+    if (!grow_state_cache(1) && !evict_checkpoint()) fail("checkpoint: no state slot");
+  }
   Checkpoint ck;
   ck.ids = ids;
   ck.pages.assign(pages.begin(), pages.begin() + ceil_div(pos, kPageTokens));
@@ -542,7 +565,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
     for (const Region& r : seq_regions(stage_)) Q27_CUDA(cudaMemcpyAsync(r.area, r.dev, r.bytes, cudaMemcpyDeviceToDevice, s_));
   Q27_CUDA(cudaEventRecord(stage_in_ev_, s_));
   Q27_CUDA(cudaStreamWaitEvent(cs_, stage_in_ev_));
-  Q27_CUDA(cudaMemcpyAsync(host_slots_ + size_t(slot) * ckpt_bytes_, stage_, ckpt_bytes_, cudaMemcpyDeviceToHost, cs_));
+  Q27_CUDA(cudaMemcpyAsync(slot_mem_[slot], stage_, ckpt_bytes_, cudaMemcpyDeviceToHost, cs_));
   Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
   ckpts_.push_back(std::move(ck));
   cstats_.saved++;
@@ -564,7 +587,7 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     const_cast<Checkpoint*>(best)->last_use = ++use_clock_;
     // The state from its host slot (after its device -> host copy), before anything can evict it.
     Q27_CUDA(cudaStreamSynchronize(cs_));
-    const char* src = host_slots_ + size_t(best->slot) * ckpt_bytes_;
+    const char* src = slot_mem_[best->slot];
     Q27_CUDA(cudaMemcpyAsync(ssm_, src, ssm_bytes_, cudaMemcpyHostToDevice, s_));
     Q27_CUDA(cudaMemcpyAsync(conv_, src + ssm_bytes_, conv_bytes_, cudaMemcpyHostToDevice, s_));
     if (draft_) {
@@ -638,6 +661,25 @@ void Model::cache_stats(int64_t* out) const {
   for (const auto& c : ckpts_)
     for (int32_t p : c.pages) ckpt_only += ++n[p] == pool_.refs(p);
   out[8] = ckpt_only, out[9] = pool_.pages() - 1, out[10] = park_pages_;
+  out[11] = int64_t(std::count_if(slot_mem_.begin(), slot_mem_.end(), [](char* m) { return m != nullptr; }));
+}
+
+std::string Model::memory_report() const {
+  std::string out;
+  for (const Pool* p : {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_cache_, &host_mm_}) {
+    out += "pool\t" + p->name() + "\t" + (p->host() ? "1" : "0") + "\t" + std::to_string(p->size()) + "\n";
+    for (const auto& [what, bytes] : p->items())
+      out += "item\t" + p->name() + "\t" + what + "\t" + std::to_string(bytes) + "\n";
+  }
+  out += "slots\t" + std::to_string(slot_used_.size()) + "\t" + std::to_string(ckpt_bytes_) + "\n";
+  return out;
+}
+
+void Model::device_memory(int64_t* out) const {
+  size_t free = 0, total = 0;
+  Q27_CUDA(cudaMemGetInfo(&free, &total));
+  out[0] = int64_t(free), out[1] = int64_t(total), out[2] = int64_t(vram_.free_at_start);
+  out[3] = int64_t(vram_.budget);
 }
 
 int Model::prefill_cut(int T, bool last) const {
