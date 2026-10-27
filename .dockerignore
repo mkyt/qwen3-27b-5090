@@ -1,0 +1,12 @@
+# The serving image (Dockerfile) takes only these; everything else (weights in hf/ and cache/, results) stays out
+# of the build context.
+*
+!LICENSE
+!bench/draft-vocab/
+!engine/
+!frontend/
+!reference/qwen27b/__init__.py
+!reference/qwen27b/paths.py
+!reference/qwen27b/image_tokens.py
+**/__pycache__
+**/.pytest_cache

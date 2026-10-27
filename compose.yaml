@@ -1,9 +1,9 @@
 name: qwen3-27b-5090
 
-# Development services, and the engine served on port 8000 from the same image.
+# The engine served on port 8000 (its own small image, Dockerfile), and the development services (dev/Dockerfile).
+#   docker compose up -d --build serve                    # build the serving image and serve the OpenAI / Anthropic API on 127.0.0.1:8000
 #   docker compose --profile dev run --rm dev-cpu <cmd>   # no GPU attached (safe while another env is serving)
 #   docker compose --profile dev run --rm dev <cmd>       # GPU attached (microbenchmarks, GPU reference, engine tests)
-#   docker compose up -d serve                            # build libq27.so and serve the OpenAI / Anthropic API on 127.0.0.1:8000
 x-dev: &dev
   build: ./dev
   image: local/qwen3-27b-5090-dev:cuda13.3-torch2.14.1
@@ -38,13 +38,20 @@ services:
       CUDA_VISIBLE_DEVICES: ""
     profiles: [dev]
   serve:
-    <<: *dev
+    # libq27.so, the server and its four Python packages; the code is in the image (`--build` after a change).
+    build: .
+    image: local/qwen3-27b-5090-serve:cuda13.3
+    user: "${UID:-1000}:${GID:-1000}"
+    ipc: host
+    ulimits:
+      memlock: -1
+    volumes:
+      - ./hf:/hf
     gpus: all
     container_name: qwen3-27b-5090
     ports:
       - "127.0.0.1:8000:8000"
     environment:
-      <<: *dev-env
       SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-qwen3.8-27b}  # same name as the vLLM / SGLang environments
       ENGINE_AUTOSTART: ${ENGINE_AUTOSTART:-1}     # 0: the server starts with the engine stopped (no VRAM; start it at /ui)
       MAX_TOKENS: ${MAX_TOKENS:-262144}
@@ -71,9 +78,6 @@ services:
       Q27_ATTN_FP8: ${Q27_ATTN_FP8:-}              # prefill attention MMAs: empty = 2 (FP8 KV) / 3 (NVFP4 KV: Q·K on FP4 MMAs, P7-8); 2 Q·K and P·V in FP8, 1 P·V only, 0 BF16
       Q27_ATTN_FP4_STAGE: ${Q27_ATTN_FP4_STAGE:-1} # NVFP4 KV prefill: V (mode 3) rounded to E4M3 once per call (P7-8; 1 KiB/token; 0 = per CTA, mode 2)
       Q27_ATTN_TC_F8: ${Q27_ATTN_TC_F8:-}          # decode / verify attention MMAs: empty = FP8 with NVFP4 KV (P7-7), 1 = also with FP8 KV, 0 = BF16 / f16
-    command: >-
-      bash -c 'cmake -S engine -B /build/engine -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-      && cmake --build /build/engine && exec python frontend/server.py'
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
       interval: 10s

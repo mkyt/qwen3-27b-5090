@@ -79,7 +79,7 @@ plus 4,096 output tokens, so eight long requests wait in line instead of evictin
 ### Reproduce
 
 ```bash
-docker compose up -d serve
+docker compose up -d --build serve
 uv run scripts/bench_agentic.py --label decode --scenarios decode --decode-reps 3
 uv run scripts/bench_concurrent.py --label concurrent --prompts reason --concurrency 1,4,8 --max-tokens 4096 --reps 2 \
   --extra-body '{"temperature":1.0,"top_p":0.95,"top_k":20,"presence_penalty":0}'

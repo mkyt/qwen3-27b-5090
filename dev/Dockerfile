@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Development image: CUDA toolkit (nvcc for SM120), CUTLASS headers, and a uv-managed Python
 # environment for the PyTorch reference model, tests, quantization and bench clients.
-# The serving engine image will be built separately from engine/ (no PyTorch at runtime).
+# The serving image is ../Dockerfile (the engine library and the server only, no PyTorch).
 
 FROM ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 AS uv
 

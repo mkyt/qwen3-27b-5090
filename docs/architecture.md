@@ -85,6 +85,11 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 - **No PyTorch in the engine.** The CUDA context and libraries stay small, nothing allocates while serving, and the
   memory plan does not depend on a profiling run. (In the vLLM setup this replaced, the KV cache size varied
   between 4.3 and 6.5 GiB from one start to the next.) PyTorch is used only by the reference model and the tests.
+  The server does not use it either, nor transformers: the tokenizer is `tokenizers` on the checkpoint's
+  `tokenizer.json`, the chat template renders with jinja2 as transformers sets it up, and images are
+  preprocessed with PIL and numpy (`frontend/requirements.txt`; `frontend/tests/test_tokenizer.py` compares
+  prompts, ids and image grids with transformers). The serving image (`Dockerfile`) is therefore 1.2 GB: the CUDA
+  runtime, `libq27.so`, Python and those packages.
 - **The scheduler is Python.** A speculative step takes 12 to 25 ms; the scheduler's decisions take microseconds by
   comparison, and the engine queues the next step before the host reads the previous one ([§6](#6-a-decode-step)).
 

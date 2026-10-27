@@ -84,15 +84,16 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 
 - An RTX 5090 (other GPUs are not supported: the kernels use SM120 block-scaled MMAs and are tuned for its 32 GB).
 - Linux or WSL2 with a recent NVIDIA driver, Docker with the NVIDIA Container Toolkit.
-- About 25 GB of disk for the weights and 20 GB for the build image. At least 16 GB of host RAM: the engine pins
-  about 8 GB (the embedding table, the prefix cache, the vision tower).
+- About 25 GB of disk for the weights and 1.2 GB for the serving image (the development image, for the tests and
+  benchmarks, is 20 GB). At least 16 GB of host RAM: the engine pins about 8 GB (the embedding table, the prefix
+  cache, the vision tower).
 - [uv](https://docs.astral.sh/uv/) on the host to download the weights.
 
 ## Quick start
 
 ```bash
 scripts/download-weights.sh                 # gdnfp4 weights and the draft model into ./hf (23 GB)
-docker compose up -d serve                  # builds the engine on first start, then serves 127.0.0.1:8000
+docker compose up -d --build serve          # builds the serving image (about 2 min the first time), serves 127.0.0.1:8000
 docker compose logs -f serve                # wait for "engine ready"; the log shows the memory plan
 ```
 
@@ -102,6 +103,18 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 ```
 
 `./hf` can be a symlink if the weights should live on another disk.
+
+The serving image ([Dockerfile](Dockerfile)) compiles the engine in the CUDA devel image and keeps only the result:
+the CUDA runtime, `libq27.so`, Python and the server's four packages (`frontend/requirements.txt`: tokenizers,
+jinja2, numpy, pillow). No compiler, CUTLASS, PyTorch or transformers. After `git pull`, the same
+`docker compose up -d --build serve` rebuilds it, recompiling only the engine sources that changed.
+
+`scripts/serve.sh up` does the same and waits until the server answers (`up --idle`: the server only, no VRAM until
+the engine is started at `/ui`; `down`, `status`). From Windows, double-click
+`\\wsl.localhost\<distro>\<path to the checkout>\scripts\windows\serve.cmd`, or put a shortcut to it on the desktop
+or in `shell:startup` (`serve.cmd idle` there, to start with the logon without taking the GPU). It starts the
+container in the WSL distro the checkout is in, opens the stats page, and keeps the distro running while the
+container runs (WSL shuts an idle distro down, and Docker with it).
 
 http://127.0.0.1:8000/ui shows the server live: GPU utilization and power, VRAM by owner (weights, KV cache, state,
 activations, CUDA runtime), each running request's context and prefill / decode speed, and a log of the requests
@@ -163,7 +176,7 @@ with), with an FP8 KV cache (`ref-gpu-kvfp8`, the noise floor), the BF16 origina
 
 ## Tests
 
-The `dev` image builds the engine and runs the tests; `dev-cpu` is the same image without the GPU. Unit tests:
+The `dev` image (dev/Dockerfile: the CUDA toolkit, CUTLASS, PyTorch) builds the engine and runs the tests; `dev-cpu` is the same image without the GPU. Unit tests:
 
 ```bash
 docker compose --profile dev run --rm dev-cpu python -m pytest -q frontend/tests                # server: parsing, admission (seconds)
@@ -171,7 +184,7 @@ docker compose --profile dev run --rm dev-cpu bash -c 'cd reference && pytest -q
 docker compose --profile dev run --rm dev bash -c 'cmake -S engine -B /build/engine -G Ninja && cmake --build /build/engine && cd engine/tests && python -m pytest -q'   # kernels against PyTorch (GPU, about 3 min)
 ```
 
-End-to-end checks against a running server (`docker compose up -d serve`), from the host (standard library only):
+End-to-end checks against a running server (`docker compose up -d --build serve`), from the host (standard library only):
 
 ```bash
 python3 scripts/smoke_test.py                # a few requests
@@ -191,7 +204,8 @@ reference/    PyTorch reference model, golden recordings
 scripts/      weight download, end-to-end tests, benchmarks, quality evaluations, building gdnfp4
 tools/        memory plan / roofline calculator, draft vocabulary builder
 micro/        microbenchmarks of the GPU (bandwidth, MMA peaks, PCIe)
-dev/          the build image (CUDA, CUTLASS, PyTorch for the reference)
+Dockerfile    the serving image (libq27.so, the server and four Python packages; 1.2 GB)
+dev/          the development image (CUDA, CUTLASS, PyTorch for the reference and the tests)
 bench/        golden prompts, draft vocabulary, test images
 docs/         architecture, decisions, configuration, benchmarks
 ```
