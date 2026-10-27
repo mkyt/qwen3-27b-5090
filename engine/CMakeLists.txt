@@ -34,11 +34,15 @@ add_library(q27 SHARED
   src/model.cc
   src/capi.cc
 )
-target_include_directories(q27 PRIVATE src ${CUTLASS_DIR}/include ${CUTLASS_DIR}/tools/util/include)
+target_include_directories(q27 PRIVATE src)
+# SYSTEM: no warnings from CUTLASS's own headers (e.g. #2908-D, implicit capture of `this`, in the SM100 / SM103 /
+# SM107 collectives the builder header includes); the generated code is the same.
+target_include_directories(q27 SYSTEM PRIVATE ${CUTLASS_DIR}/include ${CUTLASS_DIR}/tools/util/include)
 target_link_libraries(q27 PRIVATE CUDA::cudart)
 # CUTLASS kernels need the relaxed constexpr flag and generate a lot of template code.
 set_source_files_properties(src/gemm.cu PROPERTIES COMPILE_OPTIONS "-DCUTLASS_ENABLE_GDC_FOR_SM100=0")
 
 add_executable(q27-sfcheck tools/sfcheck.cu)
 target_link_libraries(q27-sfcheck PRIVATE CUDA::cudart)
-target_include_directories(q27-sfcheck PRIVATE src ${CUTLASS_DIR}/include)
+target_include_directories(q27-sfcheck PRIVATE src)
+target_include_directories(q27-sfcheck SYSTEM PRIVATE ${CUTLASS_DIR}/include)
