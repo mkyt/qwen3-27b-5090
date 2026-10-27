@@ -1,0 +1,212 @@
+{
+  "label": "pl575-concurrent",
+  "model": "qwen3.8-27b",
+  "started": "2026-10-27T20:40:57.623242",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "pl575-concurrent",
+    "prompts": "reason",
+    "concurrency": "1,4,8",
+    "max_tokens": 4096,
+    "reps": 2,
+    "extra_body": "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"presence_penalty\":0}"
+  },
+  "results": {
+    "reason": [
+      {
+        "concurrency": 1,
+        "tokens": [
+          4096
+        ],
+        "finish": [
+          "length"
+        ],
+        "ttft": [
+          0.06
+        ],
+        "stream_tps": [
+          318.73
+        ],
+        "sum_stream_tps": 318.73,
+        "window_s": 12.85,
+        "wall_s": 12.92,
+        "wall_tps": 316.99
+      },
+      {
+        "concurrency": 1,
+        "tokens": [
+          4096
+        ],
+        "finish": [
+          "length"
+        ],
+        "ttft": [
+          0.036
+        ],
+        "stream_tps": [
+          318.57
+        ],
+        "sum_stream_tps": 318.57,
+        "window_s": 12.85,
+        "wall_s": 12.9,
+        "wall_tps": 317.41
+      },
+      {
+        "concurrency": 4,
+        "tokens": [
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "finish": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ],
+        "ttft": [
+          0.035,
+          0.118,
+          0.171,
+          0.067
+        ],
+        "stream_tps": [
+          249.49,
+          256.95,
+          263.14,
+          250.78
+        ],
+        "sum_stream_tps": 1020.36,
+        "window_s": 15.56,
+        "wall_s": 16.46,
+        "wall_tps": 995.3
+      },
+      {
+        "concurrency": 4,
+        "tokens": [
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "finish": [
+          "length",
+          "length",
+          "length",
+          "length"
+        ],
+        "ttft": [
+          0.068,
+          0.035,
+          0.122,
+          0.173
+        ],
+        "stream_tps": [
+          249.93,
+          255.72,
+          262.39,
+          251.96
+        ],
+        "sum_stream_tps": 1020.0,
+        "window_s": 15.56,
+        "wall_s": 16.47,
+        "wall_tps": 995.02
+      },
+      {
+        "concurrency": 8,
+        "tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "finish": [
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length"
+        ],
+        "ttft": [
+          0.036,
+          0.068,
+          0.21,
+          0.178,
+          0.354,
+          0.128,
+          0.321,
+          0.264
+        ],
+        "stream_tps": [
+          187.05,
+          191.51,
+          196.2,
+          188.45,
+          196.03,
+          186.51,
+          212.33,
+          186.8
+        ],
+        "sum_stream_tps": 1544.88,
+        "window_s": 19.25,
+        "wall_s": 22.2,
+        "wall_tps": 1475.96
+      },
+      {
+        "concurrency": 8,
+        "tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "finish": [
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length",
+          "length"
+        ],
+        "ttft": [
+          0.037,
+          0.119,
+          0.069,
+          0.17,
+          0.277,
+          0.222,
+          1.052,
+          1.11
+        ],
+        "stream_tps": [
+          187.1,
+          191.85,
+          195.47,
+          188.56,
+          195.53,
+          187.24,
+          211.48,
+          189.7
+        ],
+        "sum_stream_tps": 1546.93,
+        "window_s": 19.31,
+        "wall_s": 22.71,
+        "wall_tps": 1442.78
+      }
+    ]
+  }
+}

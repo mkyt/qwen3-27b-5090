@@ -13,8 +13,8 @@ each number. The JSON files of the speed numbers are in [results/](results/).
 | Build | the `dev` image: CUDA 13.3, CUTLASS fetched at build time |
 | Date | 2026-10-11 |
 
-Prefill is power-bound at 400 W: the FP4 / FP8 GEMMs and attention all run at the power limit. The numbers at the
-card's default limit were not measured.
+Prefill is power-bound at 400 W: the FP4 / FP8 GEMMs and attention all run at the power limit. The card's default
+575 W limit and the energy per token at both limits are in [Power limit and energy](#power-limit-and-energy).
 
 ## Speed
 
@@ -155,6 +155,33 @@ The JSON files are in [results/](results/) (`20261011-1*-pr6-*.json`). Notes:
   request at a time with a 90K context.
 - `gdnfp4` also runs on vLLM (`scripts/export_gdnfp4.py` writes a checkpoint it reads); there it decoded 7 to 15%
   faster than NVIDIA's checkpoint with the same GSM8K and BFCL results (measured 2026-10-10).
+
+## Power limit and energy
+
+The same scripts at 400 W and at the card's default 575 W, on the same day (2026-10-27) and the same code (`1b1b430`),
+serving with the defaults. The energy is the whole board's, read from NVML's cumulative energy counter before and after
+each request (`scripts/bench_energy.py`), so it includes the idle power (about 30 W) during the request.
+
+| | 575 W | 400 W | 400 W vs 575 W |
+| --- | ---: | ---: | --- |
+| Decode, one request, code / JSON / prose (tok/s, median) | 391 / 507 / 263 | 386 / 500 / 259 | 1–2% slower |
+| Concurrent, sum at C=1 / 4 / 8 (tok/s) | 319 / 1,020 / 1,546 | 313 / 939 / 1,403 | 2 / 8 / 9% slower |
+| Time to first token, 19.5K / 73K-token document | 1.48 / 7.04 s | 1.86 / 8.71 s | 20% slower |
+| Board power: decode / C=8 / prefill (W) | 420–456 / 564 / 570 | 374–408 / 402 / 390–396 | |
+| Energy, decode code / JSON / prose (tok/J) | 0.72–0.88 / 1.09–1.14 / 0.58–0.59 | 0.80–0.95 / 1.22 / 0.63–0.66 | 8–13% more tokens per joule |
+| Energy, concurrent C=1 / 4 / 8 (tok/J) | 0.62 / 1.68 / 2.45 | 0.70 / 2.14 / 3.15 | 13 / 27 / 29% more |
+| Energy, prefill of 11.9K / 44.4K tokens (prompt tok/J) | 23.3 / 20.5 | 27.1 / 23.6 | 15–16% more |
+
+Decode of one request draws 420–456 W even when it may draw 575 W, so the 400 W limit barely slows it. Prefill and
+many concurrent requests use whatever the limit allows: 575 W buys 9–26% more speed for 40% more power. At 575 W the
+board peaked at 580 W and 81 °C. The energy rows of the concurrent requests are one run of 2,048 tokens per stream,
+timed until the last stream ends, so their tok/s is below the rows above (4,096 tokens, decoding streams only).
+
+```bash
+uv run scripts/bench_energy.py --label energy
+```
+
+The runs are [results/](results/) `20261027-*-pl575-*.json` and `20261027-*-pl400-*.json`.
 
 ## Quality
 

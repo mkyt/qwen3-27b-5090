@@ -16,7 +16,9 @@ GPU. That buys two things:
 
 All numbers are measured at a **400 W power limit** (the card's default is 575 W), on the same day, driver and scripts
 for every engine. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, each engine's settings and the
-commands that reproduce them.
+commands that reproduce them. At 575 W the engine is only 1–2% faster for one request and 9–26% faster for prefill
+and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
+([Power limit and energy](docs/benchmarks.md#power-limit-and-energy)).
 
 ## Fast
 
