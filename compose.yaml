@@ -1,7 +1,8 @@
 name: qwen3-27b-5090
 
 # The engine served on port 8000 (its own small image, Dockerfile), and the development services (dev/Dockerfile).
-#   docker compose up -d --build serve                    # build the serving image and serve the OpenAI / Anthropic API on 127.0.0.1:8000
+#   docker compose pull serve && docker compose up -d serve   # the published serving image; the OpenAI / Anthropic API on 127.0.0.1:8000
+#   docker compose up -d --build serve                    # the same, with the image built from this checkout
 #   docker compose --profile dev run --rm dev-cpu <cmd>   # no GPU attached (safe while another env is serving)
 #   docker compose --profile dev run --rm dev <cmd>       # GPU attached (microbenchmarks, GPU reference, engine tests)
 x-dev: &dev
@@ -39,8 +40,9 @@ services:
     profiles: [dev]
   serve:
     # libq27.so, the server and its four Python packages; the code is in the image (`--build` after a change).
+    # SERVE_TAG: a published version (`docker compose pull serve`), latest by default.
     build: .
-    image: local/qwen3-27b-5090-serve:cuda13.3
+    image: ghcr.io/mkyt/qwen3-27b-5090:${SERVE_TAG:-latest}
     user: "${UID:-1000}:${GID:-1000}"
     ipc: host
     ulimits:

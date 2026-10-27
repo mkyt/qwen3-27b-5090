@@ -4,6 +4,7 @@ rem to start with the logon). It runs scripts/serve.sh in the WSL distro this ch
 rem keeps the distro running while the container runs (WSL shuts an idle distro down, and Docker with it).
 rem   serve.cmd           start; the engine loads with the compose.yaml settings
 rem   serve.cmd idle      start the server only (ENGINE_AUTOSTART=0: no VRAM until the engine is started at /ui)
+rem   serve.cmd update    pull the published image first (a new version)
 rem   serve.cmd stop      stop the container
 rem   serve.cmd status
 setlocal
@@ -31,7 +32,9 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-if /i "%ARGS:~0,2%"=="up" (
+set "UP=%ARGS:~0,2%"
+if /i "%ARGS%"=="update" set "UP=up"
+if /i "%UP%"=="up" (
   powershell.exe -NoProfile -Command "Start-Process wsl.exe -WindowStyle Hidden -ArgumentList '-d','%DISTRO%','--cd','%DIR%','--','bash','scripts/serve.sh','keepalive'"
   start "" http://127.0.0.1:8000/ui
 )

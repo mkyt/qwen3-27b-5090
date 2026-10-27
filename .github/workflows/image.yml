@@ -1,0 +1,54 @@
+# Builds the serving image (Dockerfile) and publishes it as ghcr.io/<owner>/qwen3-27b-5090: `latest` and
+# `sha-<commit>` from main when the code in the image changes, `<version>` from a v* tag. No GPU is needed to
+# compile the engine.
+name: image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - engine/**
+      - frontend/**
+      - reference/qwen27b/**
+      - bench/draft-vocab/**
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space (the CUDA devel image of the build stage takes about 10 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+            type=semver,pattern={{version}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # (CUTLASS kernels take a few GB of RAM each to compile; the runner has 16 GB)
+          build-args: BUILD_JOBS=3

@@ -93,7 +93,8 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 
 ```bash
 scripts/download-weights.sh                 # gdnfp4 weights and the draft model into ./hf (23 GB)
-docker compose up -d --build serve          # builds the serving image (about 2 min the first time), serves 127.0.0.1:8000
+docker compose pull serve                   # the serving image from ghcr.io (1.2 GB)
+docker compose up -d serve                  # serves 127.0.0.1:8000
 docker compose logs -f serve                # wait for "engine ready"; the log shows the memory plan
 ```
 
@@ -104,13 +105,17 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 
 `./hf` can be a symlink if the weights should live on another disk.
 
-The serving image ([Dockerfile](Dockerfile)) compiles the engine in the CUDA devel image and keeps only the result:
-the CUDA runtime, `libq27.so`, Python and the server's four packages (`frontend/requirements.txt`: tokenizers,
-jinja2, numpy, pillow). No compiler, CUTLASS, PyTorch or transformers. After `git pull`, the same
-`docker compose up -d --build serve` rebuilds it, recompiling only the engine sources that changed.
+To update: `git pull`, `docker compose pull serve`, `docker compose up -d serve`. Another build than the latest:
+`SERVE_TAG=sha-<commit>` or a release version (the [package](https://github.com/mkyt/qwen3-27b-5090/pkgs/container/qwen3-27b-5090) lists them).
+
+The serving image ([Dockerfile](Dockerfile), published by [a workflow](.github/workflows/image.yml)) compiles the
+engine in the CUDA devel image and keeps only the result: the CUDA runtime, `libq27.so`, Python and the server's
+four packages (`frontend/requirements.txt`: tokenizers, jinja2, numpy, pillow). No compiler, CUTLASS, PyTorch or
+transformers. `docker compose up -d --build serve` builds it from the checkout instead (about 2 minutes the first
+time, then only the engine sources that changed), e.g. after changing the code.
 
 `scripts/serve.sh up` does the same and waits until the server answers (`up --idle`: the server only, no VRAM until
-the engine is started at `/ui`; `down`, `status`). From Windows, double-click
+the engine is started at `/ui`; `up --build`; `update`: pull first; `down`, `status`). From Windows, double-click
 `\\wsl.localhost\<distro>\<path to the checkout>\scripts\windows\serve.cmd`, or put a shortcut to it on the desktop
 or in `shell:startup` (`serve.cmd idle` there, to start with the logon without taking the GPU). It starts the
 container in the WSL distro the checkout is in, opens the stats page, and keeps the distro running while the
@@ -184,7 +189,7 @@ docker compose --profile dev run --rm dev-cpu bash -c 'cd reference && pytest -q
 docker compose --profile dev run --rm dev bash -c 'cmake -S engine -B /build/engine -G Ninja && cmake --build /build/engine && cd engine/tests && python -m pytest -q'   # kernels against PyTorch (GPU, about 3 min)
 ```
 
-End-to-end checks against a running server (`docker compose up -d --build serve`), from the host (standard library only):
+End-to-end checks against a running server (`docker compose up -d serve`; `--build` to test a change), from the host (standard library only):
 
 ```bash
 python3 scripts/smoke_test.py                # a few requests
@@ -204,7 +209,7 @@ reference/    PyTorch reference model, golden recordings
 scripts/      weight download, end-to-end tests, benchmarks, quality evaluations, building gdnfp4
 tools/        memory plan / roofline calculator, draft vocabulary builder
 micro/        microbenchmarks of the GPU (bandwidth, MMA peaks, PCIe)
-Dockerfile    the serving image (libq27.so, the server and four Python packages; 1.2 GB)
+Dockerfile    the serving image (libq27.so, the server and four Python packages; 1.2 GB, ghcr.io/mkyt/qwen3-27b-5090)
 dev/          the development image (CUDA, CUTLASS, PyTorch for the reference and the tests)
 bench/        golden prompts, draft vocabulary, test images
 docs/         architecture, decisions, configuration, benchmarks
