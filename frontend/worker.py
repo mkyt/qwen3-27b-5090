@@ -103,7 +103,11 @@ class Scheduler:
         from q27lib import Engine, KvFull
 
         self.conn, self.cfg, self.KvFull = conn, cfg, KvFull
-        os.environ.update(cfg.get("env", {}))
+        for k, v in cfg.get("env", {}).items():  # (the start settings, launch.py; None: unset)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         self.engine = Engine(cfg["model"], max_tokens=cfg["max_tokens"], prefill_chunk=cfg["prefill_chunk"],
                              kv_dtype=cfg["kv_dtype"], draft=cfg.get("draft"))
         self.spec = cfg.get("draft") is not None and self.engine.has_draft

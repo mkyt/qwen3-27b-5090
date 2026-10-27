@@ -42,6 +42,10 @@ struct Options {
   // Lower max_tokens to what the VRAM budget leaves for the KV pool (rounded down to 1,024) instead of
   // failing (MAX_TOKENS_FIT; the server sets it). Not with kv_pool_tokens.
   bool fit_max_tokens = false;
+  // Plan only (q27_plan): size the pools for a device with plan_free of plan_total bytes free and stop there, with
+  // no CUDA call (nothing allocated or loaded; memory_report, max_tokens, cache_stats and device_memory answer).
+  bool plan_only = false;
+  size_t plan_free = 0, plan_total = 0;
 };
 
 class Model {

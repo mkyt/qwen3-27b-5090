@@ -319,6 +319,11 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
   (`q27_memory_report`); the server adds NVML samples and a log of requests and engine events, and streams them to
   the page as server-sent events. The page (and `POST /admin/engine`) also stops, starts and restarts the engine
   process: it holds all the VRAM, the server none.
+- Start settings (`frontend/launch.py`): an engine can start with other weights, KV type, draft, vision tower,
+  `MAX_SEQS`, `MAX_TOKENS` or VRAM budget. What each leaves for the context comes from the engine's own memory
+  planner: `q27_plan` runs the constructor's planning (the pools, `MAX_TOKENS_FIT`, the KV pool) for a given free
+  and total device memory and stops before the first CUDA call, so the prediction is the startup log's numbers
+  exactly. A helper process runs the plans, since each sets the environment the engine reads.
 - Loading (`engine/src/prefetch.cc`): the loaders plan the byte ranges they read, `Q27_LOAD_THREADS` threads read
   them ahead into pinned slots (the embedding straight into its pinned table), and the loaders upload them in plan
   order as before. The prefix cache's pinned state slots (4 GiB) are allocated after startup, one by one while the

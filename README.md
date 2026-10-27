@@ -106,7 +106,9 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 http://127.0.0.1:8000/ui shows the server live: GPU utilization and power, VRAM by owner (weights, KV cache, state,
 activations, CUDA runtime), each running request's context and prefill / decode speed, and a log of the requests
 with their prefix-cache hits. The page also stops the engine to free the VRAM (the server stays up) and starts or
-restarts it ([docs/configuration.md](docs/configuration.md#stats-page)).
+restarts it with other settings (weights, KV cache type, speculative decoding, vision tower, requests at once,
+context limit, VRAM budget), showing for every choice the context it leaves before anything is loaded
+([docs/configuration.md](docs/configuration.md#start-settings)).
 
 ## Clients
 

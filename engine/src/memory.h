@@ -48,6 +48,8 @@ struct Budget {
 
 // VRAM_BUDGET_GIB (if set) or min(free - WDDM_MARGIN_GIB (0.6), 30.3 GiB minus the CUDA context).
 Budget make_budget();
+// The same for a device with `free` of `total` bytes free (after the CUDA context), without CUDA (Options::plan_only).
+Budget budget_for(size_t free, size_t total);
 
 // Prints a breakdown of all pools and fails if the device pools exceed the budget.
 void check_and_log(const Budget& b, const std::vector<Pool*>& pools);

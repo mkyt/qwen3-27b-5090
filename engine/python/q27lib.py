@@ -11,6 +11,7 @@ DRAFT_VOCAB = os.path.join(os.path.dirname(__file__), "../../bench/draft-vocab/v
 P, I, I64, F, SZ = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float, ctypes.c_size_t
 SIGNATURES = {
     "q27_create": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p], P),
+    "q27_plan": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p, I64, I64], P),
     "q27_spec_begin": ([P, P, I, F, I, F, ctypes.c_uint64, F, I, P], I),
     "q27_spec_step": ([P, P], I),
     "q27_spec_step2": ([P, P, I], I),
@@ -128,16 +129,28 @@ class Engine:
 
     def __init__(self, model_dir, max_tokens=32768, prefill_chunk=2048, kv_fp8=False, draft=None, kv_dtype=None):
         """kv_dtype: "bf16" | "fp8" | "nvfp4" (default: kv_fp8 picks fp8 or bf16)."""
+        self._create("q27_create", model_dir, max_tokens, prefill_chunk, kv_fp8, draft, kv_dtype)
+
+    @classmethod
+    def plan(cls, model_dir, free, total, max_tokens=32768, prefill_chunk=2048, kv_dtype="bf16", draft=None):
+        """The memory plan of Engine(...) (with the same environment) on a device with `free` of `total` bytes free
+        after the CUDA context, without CUDA: nothing is allocated or loaded. Its memory_report(), max_tokens,
+        cache_stats() and device_memory() answer; close() it."""
+        self = cls.__new__(cls)
+        self._create("q27_plan", model_dir, max_tokens, prefill_chunk, False, draft, kv_dtype, int(free), int(total))
+        return self
+
+    def _create(self, fn, model_dir, max_tokens, prefill_chunk, kv_fp8, draft, kv_dtype, *extra):
         self.max_tokens = max_tokens
         if draft and "Q27_DRAFT_VOCAB" not in os.environ and os.path.exists(DRAFT_VOCAB):
             os.environ["Q27_DRAFT_VOCAB"] = os.path.abspath(DRAFT_VOCAB)
         if os.environ.get("Q27_DRAFT_VOCAB") == "none":
             os.environ["Q27_DRAFT_VOCAB"] = ""
         kv = self.KV_TYPES[kv_dtype] if kv_dtype else int(bool(kv_fp8))
-        self.h = lib().q27_create(str(model_dir).encode(), max_tokens, prefill_chunk, kv,
-                                  str(draft).encode() if draft else None)
+        self.h = getattr(lib(), fn)(str(model_dir).encode(), max_tokens, prefill_chunk, kv,
+                                    str(draft).encode() if draft else None, *extra)
         if not self.h:
-            raise RuntimeError(f"q27_create: {lib().q27_last_error().decode()}")
+            raise RuntimeError(f"{fn}: {lib().q27_last_error().decode()}")
         self.max_tokens = lib().q27_max_tokens(self.h)  # (MAX_TOKENS_FIT=1 lowers it to what the VRAM fits)
 
     def close(self):

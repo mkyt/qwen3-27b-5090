@@ -3,7 +3,8 @@ SGLang environments (same port, model name, parsers and request options).
 
 Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses (Codex), /v1/messages,
 /v1/messages/count_tokens, /tokenize, /detokenize; GET /v1/models, /health, /metrics; GET / POST
-/admin/concurrency (the admission settings, P7-14); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
+/admin/concurrency (the admission settings, P7-14); GET / POST /admin/engine (stop, start or restart the engine,
+with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
 /ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py). Streaming everywhere (SSE), reasoning (`<think>`, returned as
 `reasoning_content` / `reasoning`, or Anthropic thinking blocks), tool calls (qwen3_coder XML, streamed call by
 call), images (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
@@ -39,6 +40,7 @@ sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 
 import worker  # noqa: E402
+from launch import Launch  # noqa: E402
 from stats import HUB, request_meta  # noqa: E402
 from chat import (STOP_REASON, AnthropicError, OutputParser, _partial_suffix, anthropic_messages,  # noqa: E402,F401
                   anthropic_template_kwargs, new_id, normalize_messages, openai_call, parse_output,
@@ -471,9 +473,11 @@ class Generation:
 class Server:
     """What the handlers share: the engine client, tokenizer, images, limits."""
 
-    def __init__(self, engine, tok, max_tokens, images, thinking_default=True):
-        self.engine, self.tok, self.images = engine, tok, images
+    def __init__(self, engine, tok, max_tokens, launch, thinking_default=True):
+        self.engine, self.tok, self.launch = engine, tok, launch
         self.tok_lock = threading.Lock()
+        self.images_lock = threading.Lock()
+        self._images = None
         self.max_tokens_conf = max_tokens
         self.thinking_default = thinking_default
         self.pad_id = tok.convert_tokens_to_ids("<|image_pad|>")
@@ -482,6 +486,17 @@ class Server:
     def max_tokens(self):
         """The engine's context capacity (MAX_TOKENS, lowered to what the VRAM fits; MAX_TOKENS_FIT)."""
         return self.engine.info.get("max_tokens", self.max_tokens_conf)
+
+    @property
+    def images(self):
+        """The image processor while the engine is set up with the vision tower (made when first needed)."""
+        cfg = self.engine.cfg
+        if cfg["env"]["VISION"] == "off":
+            return None
+        with self.images_lock:
+            if self._images is None:
+                self._images = Images(cfg["model"], int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)))
+            return self._images
 
     def encode(self, text):
         with self.tok_lock:
@@ -498,9 +513,10 @@ class Server:
         ids = self.encode(prompt)
         urls, images = Images.collect(messages), None
         if urls:
-            if self.images is None:
-                raise ApiError(400, "this server does not take images (start it with VISION=host, fp8 or bf16)")
-            ids, spans, pixels = self.images.prepare(ids, urls, self.pad_id)
+            proc = self.images
+            if proc is None:
+                raise ApiError(400, "this server does not take images (start the engine with VISION=host, fp8 or bf16)")
+            ids, spans, pixels = proc.prepare(ids, urls, self.pad_id)
             images = (spans, pixels)
         return ids, images
 
@@ -604,7 +620,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(e.code, str(e), e.kind)
             self._json(200, self.srv.engine.config)
         elif path == "/admin/engine":
-            self._json(200, {"state": self.srv.engine.state()})
+            self._json(200, self.engine_settings())
         elif path == "/version":
             self._json(200, {"version": "q27-phase6"})
         elif path == "/ui":
@@ -663,7 +679,7 @@ class Handler(BaseHTTPRequestHandler):
         routes = {"/v1/chat/completions": self.chat, "/v1/completions": self.completions, "/v1/responses": self.responses_api,
                   "/v1/messages": self.messages, "/v1/messages/count_tokens": self.count_tokens,
                   "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency,
-                  "/admin/engine": self.engine_control}
+                  "/admin/engine": self.engine_control, "/admin/engine/plan": self.engine_plan}
         fn = routes.get(path)
         if fn is None:
             return self._error(404, "not found", "not_found")
@@ -1001,16 +1017,60 @@ class Handler(BaseHTTPRequestHandler):
         changes = {k: int(v) if k in ("target_seqs", "kv_reserve") else v for k, v in body.items()}
         self._json(200, self.srv.engine.configure(changes))
 
+    def engine_settings(self):
+        """GET /admin/engine: the state, the settings of the running engine and of the next start, the weights."""
+        eng, launch = self.srv.engine, self.srv.launch
+        (device, source) = HUB.plan_device()
+        running = eng.cfg.get("settings") if eng.state() != "stopped" else None
+        return {"state": eng.state(), "running": running, "settings": launch.settings,
+                "weights": launch.weights_choices(), "device": {"free": device[0], "total": device[1], "source": source}
+                if device else None}
+
+    def engine_plan(self, body):
+        """{"settings": {...}} (changes to the next start's settings): their memory plan and, for each setting, the
+        plans of its other values."""
+        settings = body.get("settings") or {}
+        if not isinstance(settings, dict):
+            raise ApiError(400, "settings: an object")
+        device, source = HUB.plan_device()
+        if device is None:
+            raise ApiError(503, "the device's memory is unknown (no NVML and no engine started yet)", "overloaded_error")
+        s = self.srv.launch.validate(settings, device=device, check_budget=False)
+        self._json(200, dict(self.srv.launch.plans(s, device), device={"free": device[0], "total": device[1],
+                                                                        "source": source}))
+
     def engine_control(self, body):
-        """{"action": "start" | "stop" | "restart"}: the engine process (stop frees its VRAM; requests in flight fail
-        with 503). Needs Content-Type: application/json, so that a web page cannot send it with a plain form."""
+        """{"action": "start" | "stop" | "restart", "settings": {...}}: the engine process (stop frees its VRAM;
+        requests in flight fail with 503). Start and restart take changes to the start settings (launch.py), kept for
+        later starts. Needs Content-Type: application/json, so that a web page cannot send it with a plain form."""
         if self.headers.get_content_type() != "application/json":
             raise ApiError(415, "send the action as JSON (Content-Type: application/json)")
-        action = body.get("action")
+        action, settings = body.get("action"), body.get("settings")
         if action not in ("start", "stop", "restart"):
             raise ApiError(400, "action: start, stop or restart")
-        HUB.add_log("admin", None, f"engine {action} requested", level="warn" if action != "start" else "info")
-        self._json(200, {"state": self.srv.engine.control(action)})
+        eng, launch = self.srv.engine, self.srv.launch
+        note = ""
+        if settings is not None:
+            if action == "stop" or not isinstance(settings, dict):
+                raise ApiError(400, "settings: an object, with start or restart")
+            if action == "start" and eng.state() != "stopped":
+                raise ApiError(409, "the engine is running: restart it to change its settings")
+            device, _ = HUB.plan_device()
+            s = launch.validate(settings, device=device)
+            if device is not None:
+                plan = launch.plan_many([s], device)[0]
+                if "error" in plan or not plan["fits"]:
+                    raise ApiError(400, f"these settings do not fit: {plan.get('error') or 'the device pools exceed the budget'}")
+            try:
+                cfg = launch.config(s)
+            except FileNotFoundError as e:
+                raise ApiError(400, str(e)) from e
+            # (the admission settings of /admin/concurrency stay; the target number of requests with the same MAX_SEQS)
+            keep = ("admit_kv", "kv_reserve", "min_seq_tps") + (("target_seqs",) if s["max_seqs"] == eng.cfg["max_seqs"] else ())
+            launch.settings, eng.cfg = s, dict(cfg, **{k: eng.cfg[k] for k in keep if k in eng.cfg})
+            note = " with " + ", ".join(f"{k}={v}" for k, v in s.items())
+        HUB.add_log("admin", None, f"engine {action} requested{note}", level="warn" if action != "start" else "info")
+        self._json(200, {"state": eng.control(action), "settings": launch.settings})
 
     def tokenize(self, body):
         if "messages" in body:
@@ -1147,33 +1207,27 @@ def main():
 
     from transformers import AutoTokenizer
 
-    from qwen27b.weights import DFLASH2, engine_target, snapshot
+    from launch import model_dir
 
-    path = engine_target(args.weights)  # (quasar: sets Q27_LM_HEAD_CKPT, its lm_head is the BF16 original)
+    path = model_dir(args.weights)  # (the profiles share the tokenizer)
     tok = AutoTokenizer.from_pretrained(path)
-    eos = json.loads((path / "generation_config.json").read_text())["eos_token_id"]
-    draft = snapshot(*DFLASH2) if args.spec == "dflash2" else None
-    # Images by default with the vision tower in pinned host memory (no KV pool cost); the library default is off.
-    os.environ.setdefault("VISION", "host")
-    os.environ["MAX_SEQS"] = str(max(1, args.max_seqs))  # (the engine's parking areas)
     # MAX_TOKENS is an upper bound: the engine lowers it to what the VRAM budget fits (e.g. with MAX_SEQS=8).
     os.environ.setdefault("MAX_TOKENS_FIT", "1")
-    if draft and "Q27_DRAFT_VOCAB" not in os.environ:
-        vocab = ROOT / "bench/draft-vocab/vocab-128k.txt"
-        if vocab.exists():
-            os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
-    cfg = {"model": str(path), "weights": args.weights, "draft": str(draft) if draft else None, "max_tokens": args.max_tokens,
-           "prefill_chunk": args.prefill_chunk, "kv_dtype": args.kv_dtype, "max_seqs": max(1, args.max_seqs),
-           "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv), "kv_reserve": args.kv_reserve,
-           "decode_share": args.decode_share, "quantum_ms": args.quantum_ms, "batch_decode": bool(args.batch_decode),
-           "eos": eos if isinstance(eos, list) else [eos], "im_start": tok.convert_tokens_to_ids("<|im_start|>"),
-           "engine_python": str(ROOT / "engine/python")}
+    vocab = ROOT / "bench/draft-vocab/vocab-128k.txt"
+    if "Q27_DRAFT_VOCAB" not in os.environ and vocab.exists():
+        os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
+    base = {"prefill_chunk": args.prefill_chunk, "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv),
+            "kv_reserve": args.kv_reserve, "decode_share": args.decode_share, "quantum_ms": args.quantum_ms,
+            "batch_decode": bool(args.batch_decode), "im_start": tok.convert_tokens_to_ids("<|im_start|>"),
+            "engine_python": str(ROOT / "engine/python")}
+    # Images by default with the vision tower in pinned host memory (no KV pool cost); the library default is off.
+    budget = env("VRAM_BUDGET_GIB")
+    launch = Launch(base, {"weights": args.weights, "kv_dtype": args.kv_dtype, "spec": args.spec,
+                           "vision": env("VISION") or "host", "max_seqs": max(1, min(args.max_seqs, 8)),
+                           "max_tokens": args.max_tokens, "vram_budget_gib": float(budget) if budget else None})
     HUB.start()
-    engine = EngineClient(cfg, autostart=env("ENGINE_AUTOSTART", "1") != "0")
-    images = None
-    if os.environ.get("VISION", "off") != "off":  # (the image processor also needs IMAGE_MAX_PIXELS)
-        images = Images(path, int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)))
-    Handler.srv = Server(engine, tok, args.max_tokens, images)
+    engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0")
+    Handler.srv = Server(engine, tok, args.max_tokens, launch)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
 

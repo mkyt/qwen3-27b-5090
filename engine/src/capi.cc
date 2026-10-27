@@ -103,6 +103,37 @@ struct DevInt {
   }
 };
 
+// The engine's options: the arguments of q27_create and the environment (docs/configuration.md).
+Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk, int kv_fp8, const char* draft_dir) {
+  Options o;
+  o.model_dir = model_dir;
+  if (draft_dir && *draft_dir) o.draft_dir = draft_dir;
+  if (max_tokens > 0) o.max_tokens = max_tokens;
+  if (prefill_chunk > 0) o.prefill_chunk = prefill_chunk;
+  o.logits_rows = std::min(o.logits_rows, o.prefill_chunk);
+  Q27_CHECK(kv_fp8 >= 0 && kv_fp8 <= 2, "kv type: 0 BF16, 1 FP8, 2 NVFP4");
+  o.kv_type = KvType(kv_fp8);  // (kv_fp8: the KV type code; 1 / true stays FP8)
+  // Prefix cache (docs/configuration.md): STATE_HOST_CACHE (GiB of pinned checkpoint slots; 0 / unset: off),
+  // KV_POOL_TOKENS (0: what the VRAM budget leaves), CHECKPOINT_INTERVAL (tokens).
+  if (const char* e = getenv("STATE_HOST_CACHE")) o.state_cache_gib = atof(e);
+  if (const char* e = getenv("KV_POOL_TOKENS")) o.kv_pool_tokens = atoi(e);
+  if (const char* e = getenv("CHECKPOINT_INTERVAL")) o.checkpoint_interval = atoi(e);
+  // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
+  // per request).
+  if (const char* e = getenv("VISION"); e && *e) {
+    const std::string v = e;
+    Q27_CHECK(v == "off" || v == "bf16" || v == "host" || v == "fp8", "VISION: off, bf16, host or fp8");
+    o.vision = v == "bf16" ? 1 : v == "host" ? 2 : v == "fp8" ? 3 : 0;
+  }
+  if (const char* e = getenv("IMAGE_MAX_PIXELS")) o.image_max_pixels = atoi(e);
+  if (const char* e = getenv("IMAGE_TOKENS")) o.image_tokens = atoi(e);
+  // Several sequences (Phase 6): MAX_SEQS - 1 parking areas (unset / 1: one sequence at a time).
+  if (const char* e = getenv("MAX_SEQS"); e && *e) o.park_slots = std::max(0, atoi(e) - 1);
+  // MAX_TOKENS_FIT=1: lower max_tokens to what the VRAM budget fits (q27_max_tokens) instead of failing.
+  if (const char* e = getenv("MAX_TOKENS_FIT"); e && *e) o.fit_max_tokens = atoi(e) != 0;
+  return o;
+}
+
 }  // namespace
 
 namespace q27 {
@@ -119,33 +150,19 @@ void q27t_gdn_probe(long long* out) { q27::gdn_probe_read(out); }
 
 void* q27_create(const char* model_dir, int max_tokens, int prefill_chunk, int kv_fp8, const char* draft_dir) {
   Model* m = nullptr;
+  guard([&] { m = new Model(engine_options(model_dir, max_tokens, prefill_chunk, kv_fp8, draft_dir)); });
+  return m;
+}
+
+// The memory plan of q27_create(...) on a device with `free` of `total` bytes free after the CUDA context, without
+// CUDA: nothing is allocated or loaded (the checkpoints' headers are read). Ask it with q27_memory_report,
+// q27_max_tokens, q27_cache_stats and q27_device_memory, then q27_destroy it (the stats page's start settings).
+void* q27_plan(const char* model_dir, int max_tokens, int prefill_chunk, int kv_fp8, const char* draft_dir, int64_t free,
+               int64_t total) {
+  Model* m = nullptr;
   guard([&] {
-    Options o;
-    o.model_dir = model_dir;
-    if (draft_dir && *draft_dir) o.draft_dir = draft_dir;
-    if (max_tokens > 0) o.max_tokens = max_tokens;
-    if (prefill_chunk > 0) o.prefill_chunk = prefill_chunk;
-    o.logits_rows = std::min(o.logits_rows, o.prefill_chunk);
-    Q27_CHECK(kv_fp8 >= 0 && kv_fp8 <= 2, "kv type: 0 BF16, 1 FP8, 2 NVFP4");
-    o.kv_type = KvType(kv_fp8);  // (kv_fp8: the KV type code; 1 / true stays FP8)
-    // Prefix cache (docs/configuration.md): STATE_HOST_CACHE (GiB of pinned checkpoint slots; 0 / unset: off),
-    // KV_POOL_TOKENS (0: what the VRAM budget leaves), CHECKPOINT_INTERVAL (tokens).
-    if (const char* e = getenv("STATE_HOST_CACHE")) o.state_cache_gib = atof(e);
-    if (const char* e = getenv("KV_POOL_TOKENS")) o.kv_pool_tokens = atoi(e);
-    if (const char* e = getenv("CHECKPOINT_INTERVAL")) o.checkpoint_interval = atoi(e);
-    // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
-    // per request).
-    if (const char* e = getenv("VISION"); e && *e) {
-      const std::string v = e;
-      Q27_CHECK(v == "off" || v == "bf16" || v == "host" || v == "fp8", "VISION: off, bf16, host or fp8");
-      o.vision = v == "bf16" ? 1 : v == "host" ? 2 : v == "fp8" ? 3 : 0;
-    }
-    if (const char* e = getenv("IMAGE_MAX_PIXELS")) o.image_max_pixels = atoi(e);
-    if (const char* e = getenv("IMAGE_TOKENS")) o.image_tokens = atoi(e);
-    // Several sequences (Phase 6): MAX_SEQS - 1 parking areas (unset / 1: one sequence at a time).
-    if (const char* e = getenv("MAX_SEQS"); e && *e) o.park_slots = std::max(0, atoi(e) - 1);
-    // MAX_TOKENS_FIT=1: lower max_tokens to what the VRAM budget fits (q27_max_tokens) instead of failing.
-    if (const char* e = getenv("MAX_TOKENS_FIT"); e && *e) o.fit_max_tokens = atoi(e) != 0;
+    Options o = engine_options(model_dir, max_tokens, prefill_chunk, kv_fp8, draft_dir);
+    o.plan_only = true, o.plan_free = size_t(free), o.plan_total = size_t(total);
     m = new Model(o);
   });
   return m;

@@ -87,6 +87,43 @@ form.
 
 `GET /ui/stream` is the page's event stream (server-sent events) and `GET /ui/state` returns one snapshot as JSON.
 
+### Start settings
+
+The page's header shows the running engine's start settings (with the engine stopped, the next start's); clicking
+them opens "Start settings", which choose what the next start or restart of the engine uses, in place of these
+variables:
+
+| Setting | Variable | Values |
+| --- | --- | --- |
+| `weights` | `WEIGHTS` | `gdnfp4`, `nvidia`, `quasar` (those downloaded), or the model directory the service started with |
+| `kv_dtype` | `KV_DTYPE` | `nvfp4`, `fp8`, `bf16` |
+| `spec` | `SPEC` | `dflash2`, `none` |
+| `vision` | `VISION` | `host`, `fp8`, `bf16`, `off` |
+| `max_seqs` | `MAX_SEQS` | 1 to 8 |
+| `max_tokens` | `MAX_TOKENS` | 2,048 to 262,144 (lowered to what the budget holds, `MAX_TOKENS_FIT`) |
+| `vram_budget_gib` | `VRAM_BUDGET_GIB` | `null` (automatic) or 4 GiB up to the automatic budget |
+
+Under every choice the page shows the longest context of one request and the KV pool all requests share if only that
+setting changed, and for the settings as chosen the device pools against the budget. These come from the engine's own
+memory planner (`q27_plan`: the pools of an engine start, nothing allocated or loaded, about 10 to 80 ms each), so
+they are the numbers the startup log then prints. The free device memory they assume is the running engine's (before
+its pools; a restart sees the same), or with the engine stopped the free memory NVML reports now less an engine's
+CUDA context (about 1.2 GiB on WSL2, measured at each start).
+
+The settings stay for later starts and restarts (also after a crash) until the service restarts, which starts from
+the variables again. Changes of `/admin/concurrency` stay too (`target_seqs` only while `max_seqs` is the same).
+The same from a script:
+
+- `GET /admin/engine`: the state, `running` (the running engine's settings), `settings` (the next start's),
+  `weights` (null for each profile that can be loaded, else why not) and `device` (the free and total memory the
+  plans assume).
+- `POST /admin/engine/plan` with `{"settings": {...}}` (changes to the next start's settings): `plan` (`max_tokens`,
+  `kv_tokens`, `budget`, `device` and `pools` in bytes, `fits`, or `error`) and `variants` (the plans with each
+  setting's other values).
+- `POST /admin/engine` with `{"action": "start" | "restart", "settings": {...}}`: starts with those changes, if they
+  fit (HTTP 400 otherwise; 409 for `start` while the engine runs). Example:
+  `curl -s -X POST localhost:8000/admin/engine -H 'Content-Type: application/json' -d '{"action": "restart", "settings": {"kv_dtype": "fp8", "max_seqs": 4}}'`.
+
 ## Prefix cache
 
 The server takes checkpoints at message boundaries and at the end of each generation; the next request resumes from

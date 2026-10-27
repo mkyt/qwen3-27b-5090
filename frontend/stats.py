@@ -18,6 +18,7 @@ HISTORY_S = 600   # s of samples kept
 LOG_SIZE = 500    # log entries kept
 PREVIEW = 160     # characters of the last user message in a log entry
 MiB = 1 << 20
+CONTEXT_BYTES = int(1.21 * (1 << 30))  # an engine's CUDA context and runtime before its pools (RTX 5090, WSL2)
 
 
 class Nvml:
@@ -126,8 +127,11 @@ class Hub:
         self.log = collections.deque(maxlen=LOG_SIZE)
         self.log_n = 0
         self.engine_state = "loading"
+        self.device = None                  # (free at the start, total) of the last engine (cudaMemGetInfo)
+        self.context_bytes = CONTEXT_BYTES  # what an engine's CUDA context takes (NVML free before it - free at start)
         self._counters = None               # (t, generated, prefilled) at the last sample
         self.nvml = None
+        self.nvml_total = None
 
     def start(self):
         """Starts the GPU sampler (server.main; not at import: the engine process imports server.py again)."""
@@ -144,8 +148,10 @@ class Hub:
         with self.lock:
             self.engine_state = "loading"
             self.snap = self.snap_prev = None
+            self.device = None
             if self.nvml:
-                self.baseline_used = self.nvml.sample()["used"]
+                g = self.nvml.sample()
+                self.baseline_used, self.nvml_total = g["used"], g["total"]
         self.add_log("engine", None, "engine process starting")
 
     def engine_ready(self, info, cfg):
@@ -182,6 +188,11 @@ class Hub:
 
     def set_snapshot(self, snap):
         with self.lock:
+            d = snap["device"]
+            if self.device is None or self.device[0] != d["free_at_start"]:
+                self.device = (d["free_at_start"], d["total"])
+                if self.baseline_used is not None and self.nvml_total:
+                    self.context_bytes = max(0, self.nvml_total - self.baseline_used - d["free_at_start"])
             prev = self.snap
             if prev is not None:
                 dt = snap["t"] - prev["t"]
@@ -265,6 +276,19 @@ class Hub:
             time.sleep(max(0.05, SAMPLE_S - (time.time() - t0)))
 
     # ------------------------------------------------------------ outputs
+
+    def plan_device(self):
+        """(free after the CUDA context, total) bytes an engine started now would see, and how it is known: "engine"
+        (the running or last engine's cudaMemGetInfo, the same after a restart), "nvml" (free memory now minus an
+        engine's CUDA context), or None without NVML."""
+        with self.lock:
+            if self.device is not None and self.engine_state != "stopped":
+                return self.device, "engine"
+            g = self.samples[-1] if self.samples else (self.nvml.sample() if self.nvml else None)
+        if not g or g.get("used") is None:
+            return (self.device, "engine") if self.device else (None, None)
+        total = self.device[1] if self.device else g["total"]
+        return (max(0, g["total"] - g["used"] - self.context_bytes), total), "nvml"
 
     def vram(self):
         """The device memory by owner (bytes; the parts add up to the device total)."""

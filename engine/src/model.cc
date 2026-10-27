@@ -33,8 +33,8 @@ Model::Model(const Options& opt) : opt_(opt) {
   Q27_CHECK(opt.prefill_chunk > 0 && opt.prefill_chunk % 128 == 0, "prefill_chunk must be a multiple of 128");
   Q27_CHECK(opt.logits_rows > 0 && opt.logits_rows % 128 == 0 && opt.logits_rows <= opt.prefill_chunk,
             "logits_rows must be a multiple of 128 and <= prefill_chunk");
-  Budget budget = vram_ = make_budget();
-  Q27_CUDA(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking));
+  Budget budget = vram_ = opt.plan_only ? budget_for(opt.plan_free, opt.plan_total) : make_budget();
+  if (!opt.plan_only) Q27_CUDA(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking));
   ckpt_ = std::make_unique<SafeTensors>(opt.model_dir);
   // End-of-sequence ids (speculative steps end at an accepted one).
   if (std::ifstream f(opt.model_dir + "/generation_config.json"); f) {
@@ -198,6 +198,10 @@ Model::Model(const Options& opt) : opt_(opt) {
   const char* high = getenv("Q27_PAGES_HIGH");
   pool_.init(kv_total, high && atoi(high) != 0);
   const size_t o_kv = kv_.add("K | V pages (and parking areas)", size_t(kv_total) * per_page);
+  if (opt.plan_only) {  // (the caller compares the device pools with the budget, as check_and_log does)
+    slot_used_.assign(slots, false);
+    return;
+  }
 
   check_and_log(budget, {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_cache_, &host_mm_});
   // The pinned state cache (host_cache_, 4 GiB: about 1.8 s to pin on WSL2, and other CUDA calls wait meanwhile) is
@@ -676,8 +680,8 @@ std::string Model::memory_report() const {
 }
 
 void Model::device_memory(int64_t* out) const {
-  size_t free = 0, total = 0;
-  Q27_CUDA(cudaMemGetInfo(&free, &total));
+  size_t free = vram_.free_at_start, total = vram_.total;
+  if (!opt_.plan_only) Q27_CUDA(cudaMemGetInfo(&free, &total));
   out[0] = int64_t(free), out[1] = int64_t(total), out[2] = int64_t(vram_.free_at_start);
   out[3] = int64_t(vram_.budget);
 }

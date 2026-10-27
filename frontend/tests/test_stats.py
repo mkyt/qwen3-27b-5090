@@ -20,6 +20,7 @@ def hub():
     h.info, h.memory, h.baseline_used, h.snap, h.snap_prev = {}, None, None, None, None
     h.rates, h.meta, h.samples, h.log, h.log_n = {}, {}, collections.deque(maxlen=10), collections.deque(maxlen=50), 0
     h.engine_state, h._counters, h.nvml, h.started = "ready", None, None, 0.0
+    h.device, h.context_bytes, h.nvml_total = None, stats.CONTEXT_BYTES, None
     return h
 
 

@@ -105,6 +105,35 @@ td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; white-space:
 .lvl { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .prev { max-width: 380px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
 label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--ink2); }
+.opts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 14px; align-items: start; }
+.opts > .k { color: var(--ink2); padding-top: 6px; white-space: nowrap; }
+.opts > .k small { display: block; color: var(--muted); font-size: 11px; }
+.choices { display: flex; flex-wrap: wrap; gap: 6px; align-items: stretch; }
+.opt { font: inherit; text-align: left; color: var(--ink); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; padding: 3px 16px 3px 9px; cursor: pointer; min-width: 92px; position: relative; }
+.opt:hover:not(:disabled) { background: var(--wash); }
+.opt[aria-pressed="true"] { border-color: var(--s1); box-shadow: inset 0 0 0 1px var(--s1); background: var(--wash); }
+.opt:disabled { cursor: default; opacity: 0.5; }
+.opt b { font-weight: 600; }
+.opt .n { display: block; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.opt .n.bad { color: var(--critical); }
+.opt .run { position: absolute; top: 4px; right: 5px; width: 6px; height: 6px; border-radius: 50%; background: var(--good); }
+.opt input { width: 64px; font: inherit; font-size: 12px; color: var(--ink); background: var(--page); border: 1px solid var(--border);
+  border-radius: 4px; padding: 0 4px; }
+.plan-sum { display: grid; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--grid); }
+.plan-sum .big { font-size: 15px; }
+.plan-sum .big b { font-size: 18px; font-variant-numeric: tabular-nums; }
+.plan-sum .bad { color: var(--critical); }
+.cfgbtn { font: inherit; color: var(--ink2); background: transparent; border: 1px solid transparent; border-radius: 6px;
+  padding: 1px 8px; cursor: pointer; text-align: left; }
+.cfgbtn:hover, .cfgbtn[aria-expanded="true"] { border-color: var(--border); background: var(--wash); }
+.cfgbtn .edited { color: var(--s1); font-weight: 600; }
+.primary { font: inherit; font-weight: 600; color: #fff; background: var(--s1); border: 1px solid var(--s1); border-radius: 6px;
+  padding: 3px 12px; cursor: pointer; }
+.primary:disabled { opacity: 0.5; cursor: default; }
+.plain { font: inherit; color: var(--ink2); background: transparent; border: 1px solid var(--border); border-radius: 6px;
+  padding: 3px 10px; cursor: pointer; }
+@media (max-width: 600px) { .opts { grid-template-columns: 1fr; } .opts > .k { padding-top: 0; } }
 @media (max-width: 600px) { main { padding: 16px; } .tile .value { font-size: 18px; } }
 </style>
 </head>
@@ -116,9 +145,19 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
     <span class="ctl" id="ctl" role="group" aria-label="Engine">
       <button data-a="start">Start</button><button data-a="stop">Stop</button><button data-a="restart">Restart</button>
     </span>
-    <span class="sub" id="cfg"></span>
+    <button class="cfgbtn" id="cfg" type="button" aria-expanded="false" aria-controls="launch" title="Start settings"></button>
     <span class="muted" id="conn" style="margin-left:auto"></span>
   </header>
+
+  <section class="card" id="launch" hidden>
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
+      <div><h2 style="margin:0">Start settings</h2>
+        <div class="muted" style="font-size:12px">Under each choice: the longest context of one request · the KV pool all requests share, if only that setting changes. <span style="display:inline-flex;align-items:center;gap:4px"><i class="dot" style="background:var(--good);width:6px;height:6px"></i>running engine</span></div></div>
+      <div class="row"><button class="plain" id="l-reset">Reset</button><button class="primary" id="l-go">Start</button><button class="plain" id="l-close" aria-label="Close the start settings">Close</button></div>
+    </div>
+    <div class="opts" id="opts"></div>
+    <div class="plan-sum" id="plan-sum"></div>
+  </section>
 
   <section class="tiles" id="tiles"></section>
 
@@ -546,22 +585,152 @@ function drawHeader() {
   $("engine").replaceChildren(el("span", { class: "dot", style: `background:var(${color})` }), el("span", {}, `engine ${eng}`));
   const can = { start: eng === "stopped", stop: ["ready", "loading", "restarting"].includes(eng), restart: ["ready", "loading", "restarting"].includes(eng) };
   document.querySelectorAll("#ctl button").forEach((b) => { b.disabled = state.busy || !can[b.dataset.a]; });
-  $("cfg").textContent = i.max_tokens ? [i.gpu, i.model, `KV ${i.kv_dtype}`, `context ${fmtTok(i.max_tokens)}`, `${i.max_seqs} sequences`,
-    i.spec ? "DFlash2" : "no speculative decoding", i.vision ? "vision" : null].filter(Boolean).join(" · ") : "";
+  // The running engine's start settings (when stopped, the next start's), with its context after MAX_TOKENS_FIT.
+  const st = (eng !== "stopped" && L.running) || L.saved, b = $("cfg");
+  b.replaceChildren();
+  if (st) {
+    const ctx = eng === "ready" && i.max_tokens ? i.max_tokens : st.max_tokens;
+    b.append([st.weights, `KV ${st.kv_dtype}`, st.spec === "dflash2" ? "DFlash2" : "no spec", `vision ${st.vision}`,
+      `${st.max_seqs} req`, `ctx ${ctx % 1024 ? fmtTok(ctx) : ctx / 1024 + "K"}`, `VRAM ${fmtVal("vram_budget_gib", st.vram_budget_gib)}`].join(" · "));
+    if (launchChanges().length) b.append(" · ", el("span", { class: "edited" }, "edited"));
+  }
+  b.append(" ", $("launch").hidden ? "▾" : "▴");
 }
-function drawAll() { drawHeader(); drawTiles(); drawCharts(); drawVram(); drawSessions(); }
+function drawAll() { drawHeader(); drawGo(); drawTiles(); drawCharts(); drawVram(); drawSessions(); }
 
-document.querySelectorAll("#ctl button").forEach((b) => b.addEventListener("click", async () => {
-  const a = b.dataset.a, n = state.tick?.seqs?.length || 0;
-  if (a !== "start" && !confirm(`${a === "stop" ? "Stop" : "Restart"} the engine?` +
+async function engineAction(a) {
+  const n = state.tick?.seqs?.length || 0, changes = launchChanges();
+  if (a !== "start" && !confirm(`${a === "stop" ? "Stop" : "Restart"} the engine` + (a === "restart" && changes.length ? ` with ${changes.join(", ")}` : "") + "?" +
       (n ? ` ${n} request${n > 1 ? "s" : ""} in flight will fail.` : "") + " The prefix cache is dropped.")) return;
-  state.busy = true; drawHeader();
+  state.busy = true; drawHeader(); drawLaunch();
   try {
-    const r = await fetch("/admin/engine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: a }) });
+    const body = { action: a, ...(a !== "stop" && L.form ? { settings: L.form } : {}) };
+    const r = await fetch("/admin/engine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (!r.ok) alert(`engine ${a}: ${(await r.json()).error?.message || r.status}`);
   } catch (e) { alert(`engine ${a}: ${e}`); }
   state.busy = false; drawHeader();
-}));
+  await loadLaunch(false);
+}
+document.querySelectorAll("#ctl button").forEach((b) => b.addEventListener("click", () => engineAction(b.dataset.a)));
+
+// ---------------------------------------------------------------- start settings (launch.py)
+const L = { saved: null, running: null, form: null, weights: {}, plan: null, err: null, seq: 0, timer: null, eng: null };
+const OPTS = [
+  { key: "weights", label: "Weights", note: "model kind", names: { gdnfp4: ["gdnfp4", "GDN NVFP4, attn FP8"], nvidia: ["nvidia", "GDN / attn FP8"], quasar: ["quasar", "all NVFP4 (QAT)"] } },
+  { key: "kv_dtype", label: "KV cache", note: "quantization", names: { nvfp4: ["NVFP4"], fp8: ["FP8"], bf16: ["BF16"] } },
+  { key: "spec", label: "Speculative decoding", names: { dflash2: ["DFlash2"], none: ["off"] } },
+  { key: "vision", label: "Vision tower", note: "image input", names: { host: ["host", "pinned RAM, streamed"], fp8: ["GPU FP8"], bf16: ["GPU BF16"], off: ["off", "no images"] } },
+  { key: "max_seqs", label: "Requests at once", note: "MAX_SEQS" },
+  { key: "max_tokens", label: "Context limit", note: "per request, MAX_TOKENS" },
+  { key: "vram_budget_gib", label: "VRAM budget", note: "allocated by the engine", custom: true },
+];
+const fmtVal = (k, v) => k === "vram_budget_gib" ? (v == null ? "auto" : `${v} GiB`) :
+  k === "max_tokens" ? (v % 1024 ? v.toLocaleString() : `${v / 1024}K`) + (v === 262144 ? " (262,144)" : "") : String(v);
+const planNote = (p) => !p ? "…" : p.error ? "does not fit" : `${fmtTok(p.max_tokens)} · pool ${fmtTok(p.kv_tokens)}`;
+function launchChanges() {
+  if (!L.form || !L.running) return [];
+  return Object.keys(L.form).filter((k) => L.form[k] !== L.running[k]).map((k) => `${k} ${fmtVal(k, L.running[k])} → ${fmtVal(k, L.form[k])}`);
+}
+
+async function loadLaunch(resetForm) {
+  try {
+    const r = await fetch("/admin/engine");
+    const d = await r.json();
+    L.saved = d.settings; L.running = d.running; L.weights = d.weights || {}; L.eng = d.state;
+    if (resetForm || !L.form) L.form = { ...d.settings };
+  } catch (e) { L.err = String(e); }
+  replan();
+}
+function replan() {
+  clearTimeout(L.timer);
+  L.timer = setTimeout(async () => {
+    const seq = ++L.seq;
+    try {
+      const r = await fetch("/admin/engine/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: L.form }) });
+      const d = await r.json();
+      if (seq !== L.seq) return;
+      if (r.ok) { L.plan = d; L.err = null; } else { L.plan = null; L.err = d.error?.message || String(r.status); }
+    } catch (e) { if (seq === L.seq) { L.plan = null; L.err = String(e); } }
+    drawLaunch();
+  }, 120);
+  drawLaunch();
+}
+function setForm(k, v) { L.form = { ...L.form, [k]: v }; replan(); }
+
+function optButton(o, v, p) {
+  let [name, sub] = o.names?.[v] || [fmtVal(o.key, v)];
+  if (o.key === "vram_budget_gib" && v == null && p?.budget) sub = fmtGiB(p.budget);
+  const unavailable = o.key === "weights" && L.weights[v];
+  const b = el("button", { class: "opt", "aria-pressed": String(L.form[o.key] === v), type: "button" },
+    el("b", {}, name), sub ? el("span", { class: "muted", style: "font-size:11px" }, " " + sub) : null,
+    el("span", { class: "n" + (p?.error || unavailable ? " bad" : "") }, unavailable ? "not downloaded" : planNote(p)));
+  if (L.running && L.running[o.key] === v) b.append(el("i", { class: "run", title: "the running engine" }));
+  if (unavailable) { b.disabled = true; b.title = L.weights[v]; }
+  else if (p?.error) b.title = p.error;
+  else if (p) b.title = `context per request ${p.max_tokens.toLocaleString()} tokens\nKV pool ${p.kv_tokens.toLocaleString()} tokens (all requests)\ndevice pools ${fmtGiB(p.device)} of a ${fmtGiB(p.budget)} budget`;
+  b.addEventListener("click", () => setForm(o.key, v));
+  return b;
+}
+function drawLaunch() {
+  const box = $("opts"), sum = $("plan-sum");
+  if (!L.form) { box.replaceChildren(el("div", { class: "empty" }, L.err || "Loading the settings…")); sum.replaceChildren(); return; }
+  const variants = L.plan?.variants || {};
+  box.replaceChildren();
+  for (const o of OPTS) {
+    const row = el("div", { class: "choices" });
+    const vs = (variants[o.key] || []).slice();
+    if (!vs.some((x) => x.value === L.form[o.key])) vs.push({ value: L.form[o.key], plan: L.plan?.plan });
+    if (o.key === "weights") for (const w of Object.keys(L.weights)) if (!vs.some((x) => x.value === w)) vs.push({ value: w, plan: null });
+    for (const { value, plan } of vs) row.append(optButton(o, value, plan));
+    if (o.custom) {
+      const inp = el("input", { type: "number", min: "4", step: "0.25", placeholder: "GiB", "aria-label": "VRAM budget in GiB" });
+      if (L.form.vram_budget_gib != null) inp.value = L.form.vram_budget_gib;
+      inp.addEventListener("change", () => { const v = parseFloat(inp.value); setForm("vram_budget_gib", isFinite(v) ? v : null); });
+      row.append(el("label", { class: "opt", style: "cursor:default" }, el("b", {}, "custom "), inp, el("span", { class: "n" }, "GiB")));
+    }
+    box.append(el("div", { class: "k" }, o.label, o.note ? el("small", {}, o.note) : null), row);
+  }
+  // The plan of the settings as chosen.
+  const p = L.plan?.plan, dev = L.plan?.device;
+  sum.replaceChildren();
+  if (L.err) sum.append(el("div", { class: "bad" }, L.err));
+  else if (!p) sum.append(el("div", { class: "muted" }, "Planning…"));
+  else if (p.error) sum.append(el("div", { class: "bad" }, `These settings do not fit: ${p.error}`));
+  else {
+    sum.append(el("div", { class: "big" }, "Context per request ", el("b", {}, p.max_tokens.toLocaleString()), " tokens",
+      p.max_tokens < L.form.max_tokens ? el("span", { class: "muted" }, ` (lowered from ${L.form.max_tokens.toLocaleString()} to what the budget holds)`) : null,
+      " · KV pool ", el("b", {}, p.kv_tokens.toLocaleString()), ` tokens shared by up to ${L.form.max_seqs} request${L.form.max_seqs > 1 ? "s" : ""}`));
+    const pools = [["weights", p.pools.weights, "--s1"], ["KV cache", p.pools.kv, "--s2"], ["sequence state", p.pools.state, "--s3"],
+      ["activations", p.pools.activations, "--s4"], ["budget left", Math.max(0, p.budget - p.device), "--track"]];
+    const bar = el("div", { class: "stack thin" }), leg = el("div", { class: "legend", style: "margin-top:4px" });
+    stackBar(bar, leg, pools.map(([name, bytes, c]) => ({ name, bytes, c })), p.budget, (q) => q.c, "planned");
+    sum.append(bar, leg);
+    sum.append(el("div", { class: "muted" }, `Device pools ${fmtGiB(p.device)} of a ${fmtGiB(p.budget)} budget` +
+      (L.form.vram_budget_gib == null ? " (automatic: free memory minus 0.6 GiB, at most 30.3 GiB for the process)" : "") +
+      ` · pinned host memory ${fmtGiB(p.host)} · free device memory ${fmtGiB(dev.free)} ` +
+      (dev.source === "engine" ? "(the running engine's, before its pools)" : "(now, less an engine's CUDA context: estimated)")));
+  }
+  const changes = launchChanges();
+  if (changes.length) sum.append(el("div", {}, el("span", { class: "muted" }, "Changes from the running engine: "), changes.join(" · ")));
+  drawGo();
+}
+function drawGo() {
+  drawHeader();
+  const p = L.plan?.plan, eng = state.tick?.engine || L.eng, changes = launchChanges(), running = !!eng && eng !== "stopped";
+  const go = $("l-go");
+  go.textContent = running ? (changes.length ? "Restart with these settings" : "Restart") : "Start with these settings";
+  go.disabled = state.busy || !p || !!p.error || !p.fits || ["stopping", "loading"].includes(eng);
+  go.onclick = () => engineAction(running ? "restart" : "start");
+}
+$("l-reset").addEventListener("click", () => { L.form = { ...(L.running || L.saved) }; replan(); });
+function showLaunch(open) {
+  $("launch").hidden = !open;
+  $("cfg").setAttribute("aria-expanded", String(open));
+  try { localStorage.setItem("q27-launch-open", open ? "1" : ""); } catch (e) { /* (no storage) */ }
+  drawHeader();
+}
+$("cfg").addEventListener("click", () => showLaunch($("launch").hidden));
+$("l-close").addEventListener("click", () => showLaunch(false));
 document.querySelectorAll("#range button").forEach((b) => b.addEventListener("click", () => {
   document.querySelectorAll("#range button").forEach((o) => o.setAttribute("aria-pressed", String(o === b)));
   state.range = +b.dataset.s; drawCharts();
@@ -586,6 +755,7 @@ function connect() {
   es.addEventListener("tick", (ev) => {
     const d = JSON.parse(ev.data);
     state.tick = d; addSample(d.sample);
+    if (L.eng !== null && d.engine !== L.eng && ["ready", "stopped"].includes(d.engine)) { L.eng = d.engine; loadLaunch(false); }
     if (d.engine === "ready" && !state.info.max_tokens) { es.close(); connect(); return; }
     drawAll();
   });
@@ -597,6 +767,8 @@ function connect() {
   es.onerror = () => { $("conn").textContent = "disconnected, retrying"; };
 }
 buildCharts();
+loadLaunch(true);
+try { if (localStorage.getItem("q27-launch-open")) showLaunch(true); } catch (e) { /* (no storage) */ }
 connect();
 </script>
 </body>

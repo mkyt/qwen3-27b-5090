@@ -33,9 +33,15 @@ void Pool::commit() {
 }
 
 Budget make_budget() {
-  Budget b;
+  size_t free = 0, total = 0;
   Q27_CUDA(cudaFree(nullptr));  // create the context first so its own allocation is not counted as ours
-  Q27_CUDA(cudaMemGetInfo(&b.free_at_start, &b.total));
+  Q27_CUDA(cudaMemGetInfo(&free, &total));
+  return budget_for(free, total);
+}
+
+Budget budget_for(size_t free, size_t total) {
+  Budget b;
+  b.free_at_start = free, b.total = total;
   double margin = 0.6, cap = 30.3;
   if (const char* m = getenv("WDDM_MARGIN_GIB")) margin = atof(m);
   if (const char* v = getenv("VRAM_BUDGET_GIB")) {
