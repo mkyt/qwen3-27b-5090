@@ -1,65 +1,14 @@
 """Lazy reader for the pinned safetensors checkpoints in the shared HF cache."""
 
 import json
-import os
 import pathlib
 
 import torch
 from safetensors import safe_open
 
+from .paths import (BF16, DFLASH2, GDNFP4, GDNFP4_DIR, HF_HUB, LOCAL_COPIES, QUASAR, TARGET,  # noqa: F401
+                    engine_target, snapshot)
 from .quant import QLinear, dequant_fp8, dequant_nvfp4
-
-HF_HUB = pathlib.Path(os.environ.get("HF_HOME", pathlib.Path.home() / ".cache/huggingface")) / "hub"
-
-TARGET = ("nvidia/Qwen3.8-27B-NVFP4", "dbb8f445b3145f8a4c18ddc769f032d57d32867c")
-DFLASH2 = ("incoai/Qwen3.8-27B-DFlash2", "015e795645c74b1a0eeef3b570031fb62e769bc5")
-# allfp4 candidate (Phase Q): every linear in NVFP4 (QAT), compressed-tensors; lm_head is the BF16 original,
-# so the engine takes the NVFP4 lm_head of TARGET (Q27_LM_HEAD_CKPT).
-QUASAR = ("QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4", "15d2e47bffe5d8ad23928879f8f7d2f74909e259")
-BF16 = ("Qwen/Qwen3.8-27B", "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0")  # the original (Phase Q quality reference)
-# The gdnfp4 weight profile as published: scripts/build-gdnfp4.sh + scripts/export_gdnfp4.py (the GDN projections in
-# NVFP4, the rest as TARGET). The serve default; scripts/download-weights.sh fetches it.
-GDNFP4 = ("juzbox/Qwen3.8-27B-NVFP4-GDN", "3e686408cf61c2b579c67ab21696c9fc94e41e25")
-
-
-# Development copy on the Linux file system (gitignored): the HF cache on /mnt/d loads at ~1.1 GB/s,
-# a copy here comes from the page cache. Used when present, e.g.
-#   cp -L <HF cache>/models--nvidia--Qwen3.8-27B-NVFP4/snapshots/<rev>/* cache/weights/nvidia--Qwen3.8-27B-NVFP4/<rev>/
-LOCAL_COPIES = pathlib.Path(__file__).resolve().parents[2] / "cache/weights"
-# A local build of the gdnfp4 profile (scripts/build-gdnfp4.sh: a shard of NVFP4 GDN projections + links to TARGET),
-# used when the published GDNFP4 is not downloaded. Its outputs are the same as the published one's.
-GDNFP4_DIR = "allfp4-gdn"
-
-
-def snapshot(repo: str, rev: str) -> pathlib.Path:
-    local = LOCAL_COPIES / repo.replace("/", "--") / rev
-    if (local / "config.json").is_file():
-        return local
-    path = HF_HUB / f"models--{repo.replace('/', '--')}" / "snapshots" / rev
-    if not path.is_dir():
-        raise FileNotFoundError(f"{repo}@{rev} is not in {HF_HUB} (scripts/download-weights.sh)")
-    return path
-
-
-def engine_target(weights: str = "nvidia") -> pathlib.Path:
-    """The model directory the engine opens for a weight profile (nvidia | gdnfp4 | quasar | a directory, e.g. one from
-    scripts/quantize_proj.py). QUASAR keeps the BF16 original lm_head, so the engine reads TARGET's NVFP4 one
-    (Q27_LM_HEAD_CKPT, set here)."""
-    if weights == "gdnfp4":  # Phase Q: GDN projections in NVFP4 (GPTQ), attention FP8
-        try:
-            return snapshot(*GDNFP4)
-        except FileNotFoundError:
-            path = LOCAL_COPIES / GDNFP4_DIR
-            if not (path / "config.json").is_file():
-                raise FileNotFoundError(f"{GDNFP4[0]}@{GDNFP4[1]} is not in {HF_HUB}: "
-                                        "run scripts/download-weights.sh") from None
-            return path
-    if weights not in ("nvidia", "quasar"):
-        return pathlib.Path(weights)
-    if weights == "quasar":
-        os.environ["Q27_LM_HEAD_CKPT"] = str(snapshot(*TARGET))
-        return snapshot(*QUASAR)
-    return snapshot(*TARGET)
 
 
 class Checkpoint:

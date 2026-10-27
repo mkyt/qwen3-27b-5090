@@ -1,0 +1,6 @@
+# Python packages of the API server and the engine process (frontend/, engine/python/q27lib.py): no PyTorch or
+# transformers. The versions are those of the dev image (dev/uv.lock), which the tests compare with transformers.
+jinja2==3.1.6
+numpy==2.5.3
+pillow==12.3.0
+tokenizers==0.23.2

@@ -75,9 +75,9 @@ class Images:
     MAX_BYTES = 32 << 20
 
     def __init__(self, path, max_pixels):
-        from transformers import AutoImageProcessor
+        from imageproc import ImageProcessor
 
-        self.proc = AutoImageProcessor.from_pretrained(path)
+        self.proc = ImageProcessor(path)
         self.max_pixels = max_pixels
 
     @staticmethod
@@ -123,15 +123,14 @@ class Images:
 
     def prepare(self, ids, urls, pad_id):
         """(ids with each image's pad expanded to its token ids, [(start, gh, gw)], [pixel_values per image])."""
-        from qwen27b.vision import expand_image_pads, image_token_ids
+        from qwen27b.image_tokens import expand_image_pads, image_token_ids
 
         raws, imgs = zip(*(self.load(u) for u in urls))
-        batch = self.proc(images=list(imgs), size={"shortest_edge": 65536, "longest_edge": self.max_pixels},
-                          return_tensors="np")
-        grids = batch["image_grid_thw"].tolist()
+        pv, grids = self.proc(imgs, self.max_pixels)
+        grids = [list(g) for g in grids]
         keys = [raw + repr((g, self.max_pixels)).encode() for raw, g in zip(raws, grids)]
         ids, spans = expand_image_pads(ids, grids, pad_id, fill=lambda i, n: image_token_ids(keys[i], n))
-        pv, out, r = batch["pixel_values"], [], 0
+        out, r = [], 0
         for t, h, w in grids:
             out.append(pv[r:r + t * h * w])
             r += t * h * w
@@ -367,7 +366,7 @@ class Detokenizer:
 
     def _decode(self, ids):
         with self.lock:
-            return self.tok.decode(ids, skip_special_tokens=False)
+            return self.tok.decode(ids)
 
     def add(self, ids, final=False):
         self.ids += ids
@@ -480,7 +479,7 @@ class Server:
         self._images = None
         self.max_tokens_conf = max_tokens
         self.thinking_default = thinking_default
-        self.pad_id = tok.convert_tokens_to_ids("<|image_pad|>")
+        self.pad_id = tok.token_id("<|image_pad|>")
 
     @property
     def max_tokens(self):
@@ -500,14 +499,13 @@ class Server:
 
     def encode(self, text):
         with self.tok_lock:
-            return self.tok(text, add_special_tokens=False).input_ids
+            return self.tok.encode(text)
 
     def render(self, messages, tools, kwargs):
         """Prompt ids (images expanded) and the images, of chat messages."""
         try:
             with self.tok_lock:
-                prompt = self.tok.apply_chat_template(messages, tools=tools or None, add_generation_prompt=True,
-                                                      tokenize=False, **kwargs)
+                prompt = self.tok.render(messages, tools=tools or None, **kwargs)
         except Exception as e:  # noqa: BLE001 - template errors (no user message, bad roles) are the client's
             raise ApiError(400, f"chat template: {e}") from e
         ids = self.encode(prompt)
@@ -1082,7 +1080,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def detokenize(self, body):
         with self.srv.tok_lock:
-            text = self.srv.tok.decode(body.get("tokens") or [], skip_special_tokens=False)
+            text = self.srv.tok.decode(body.get("tokens") or [])
         self._json(200, {"prompt": text})
 
 
@@ -1205,12 +1203,11 @@ def main():
                     help="1: requests in decode step together (batched speculative steps); 0: they take turns")
     args = ap.parse_args()
 
-    from transformers import AutoTokenizer
-
     from launch import model_dir
+    from tokenizer import Tokenizer
 
     path = model_dir(args.weights)  # (the profiles share the tokenizer)
-    tok = AutoTokenizer.from_pretrained(path)
+    tok = Tokenizer(path)
     # MAX_TOKENS is an upper bound: the engine lowers it to what the VRAM budget fits (e.g. with MAX_SEQS=8).
     os.environ.setdefault("MAX_TOKENS_FIT", "1")
     vocab = ROOT / "bench/draft-vocab/vocab-128k.txt"
@@ -1218,7 +1215,7 @@ def main():
         os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
     base = {"prefill_chunk": args.prefill_chunk, "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv),
             "kv_reserve": args.kv_reserve, "decode_share": args.decode_share, "quantum_ms": args.quantum_ms,
-            "batch_decode": bool(args.batch_decode), "im_start": tok.convert_tokens_to_ids("<|im_start|>"),
+            "batch_decode": bool(args.batch_decode), "im_start": tok.token_id("<|im_start|>"),
             "engine_python": str(ROOT / "engine/python")}
     # Images by default with the vision tower in pinned host memory (no KV pool cost); the library default is off.
     budget = env("VRAM_BUDGET_GIB")

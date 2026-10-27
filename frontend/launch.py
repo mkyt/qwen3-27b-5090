@@ -13,7 +13,7 @@ import multiprocessing as mp
 import os
 import threading
 
-from qwen27b.weights import DFLASH2, TARGET, engine_target, snapshot
+from qwen27b.paths import DFLASH2, TARGET, engine_target, snapshot
 
 PROFILES = ("gdnfp4", "nvidia", "quasar")
 CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
