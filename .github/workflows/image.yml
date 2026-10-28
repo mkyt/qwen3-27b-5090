@@ -25,10 +25,10 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - name: Free disk space (the CUDA devel image of the build stage takes about 10 GB)
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+      # (No disk cleanup: the build stage's CUDA devel image is 3.6 GB to pull, about 10 GB unpacked, and the runner has
+      # well over 70 GB free. Deleting the preinstalled SDKs took 1.5-3 minutes, half of the job, and left 105 GB.)
+      - name: Disk space
+        run: df -h /
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
