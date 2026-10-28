@@ -360,6 +360,7 @@ class Model {
   void* ws_ = nullptr;
   size_t ws_bytes_ = 0;
   bool mlp_bf16_ = true;                              // prefill MLP gate / up in BF16 (Q27_MLP_BF16)
+  bool mlp_fused_ = true;   // prefill MLP gate | up + silu * up + NVFP4 quantization in one GEMM (Q27_MLP_FUSED)
   static constexpr int kSkinnyMaxM = 64;              // decode and verify-sized GEMMs use skinny.cu
   static constexpr size_t kSkinnyWsBytes = 32 << 20;  // split-K partials (up to 64 rows) and counters
   void* skinny_ws_ = nullptr;

@@ -368,6 +368,14 @@ int q27t_silu_mul_quant_fp4_bf16(const bf16* g, const bf16* u, int64_t ld, int T
                                  uint8_t* sf) {
   return kernel([&] { silu_mul_quant_fp4(g, u, ld, T, I, in_scale, q, sf, ts()); });
 }
+int q27t_silu_mul_quant_fp4_glu(const float* gu, int T, int I, float ag, float au, float in_scale, uint8_t* q,
+                                uint8_t* sf) {
+  return kernel([&] { silu_mul_quant_fp4_glu(gu, T, I, ag, au, in_scale, q, sf, ts()); });
+}
+int q27t_silu_mul_quant_fp4_glu_bf16(const bf16* gu, int T, int I, float ag, float au, float in_scale, uint8_t* q,
+                                     uint8_t* sf) {
+  return kernel([&] { silu_mul_quant_fp4_glu(gu, T, I, ag, au, in_scale, q, sf, ts()); });
+}
 int q27t_gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
                        float alpha, bf16* d, void* ws, size_t ws_bytes) {
   return kernel([&] { gemm_fp4_bf16(M, N, K, a, a_sf, b, b_sf, alpha, d, ws, ws_bytes, ts()); });
@@ -378,10 +386,26 @@ int q27t_linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T,
 int q27t_swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst) {
   return kernel([&] { swizzle_sf(src, rows, kblocks, dst, ts()); });
 }
+int q27t_swizzle_sf_glu(const uint8_t* src, int rows, int kblocks, uint8_t* dst, int half) {
+  return kernel([&] { swizzle_sf(src, rows, kblocks, dst, ts(), half); });
+}
 int64_t q27t_sf_bytes(int64_t rows, int64_t kblocks) { return sf_bytes(rows, kblocks); }
 int q27t_gemm_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
                   float alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
   return kernel([&] { gemm_fp4(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, ws, ws_bytes, ts()); });
+}
+int q27t_gemm_fp4_mma(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b,
+                      const uint8_t* b_sf, float alpha, const float* c, float beta, float* d) {
+  return kernel([&] { gemm_fp4_mma(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, ts()); });
+}
+int q27t_gemm_fp4_glu_mma(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
+                          const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
+                          uint8_t* q_sf) {
+  return kernel([&] { gemm_fp4_glu_mma(M, I, K, a, a_sf, gate_up, gate_up_sf, alpha_gate, alpha_up, out_scale, q, q_sf, ts()); });
+}
+int q27t_gemm_fp4_bf16_mma(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b,
+                           const uint8_t* b_sf, float alpha, bf16* d) {
+  return kernel([&] { gemm_fp4_bf16_mma(M, N, K, a, a_sf, b, b_sf, alpha, d, ts()); });
 }
 int q27t_gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
                   float* d, void* ws, size_t ws_bytes) {
@@ -401,7 +425,7 @@ int q27t_skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, flo
 }
 // Microbenchmark: average time (us) of `iters` calls, cycling through `nbuf` weight copies spaced
 // w_stride / sf_stride bytes apart (to defeat L2). fp4 != 0: skinny_fp4, else skinny_fp8;
-// cutlass != 0: the Phase 1 CUTLASS kernel instead.
+// cutlass != 0: the Phase 1 CUTLASS kernel instead (fp4 and cutlass == 2: gemm_fp4_mma).
 int q27t_bench_gemm(int fp4, int cutlass, int M, int N, int K, const uint8_t* a, const uint8_t* a_sf,
                     const uint8_t* w, const uint8_t* w_sf, int64_t w_stride, int64_t sf_stride, int nbuf, int iters,
                     float* d, void* ws, size_t ws_bytes, float* us) {
@@ -412,7 +436,8 @@ int q27t_bench_gemm(int fp4, int cutlass, int M, int N, int K, const uint8_t* a,
     auto run = [&](int i) {
       const uint8_t* wi = w + (i % nbuf) * w_stride;
       const uint8_t* si = w_sf ? w_sf + (i % nbuf) * sf_stride : nullptr;
-      if (fp4 && cutlass) gemm_fp4(M, N, K, a, a_sf, wi, si, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts());
+      if (fp4 && cutlass == 2) gemm_fp4_mma(M, N, K, a, a_sf, wi, si, 1.f, nullptr, 0.f, d, ts());
+      else if (fp4 && cutlass) gemm_fp4(M, N, K, a, a_sf, wi, si, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts());
       else if (fp4) skinny_fp4(M, N, K, a, a_sf, wi, si, AlphaSegments::one(1.f), nullptr, 0.f, d, ws, ws_bytes, ts());
       else if (cutlass) gemm_fp8(M, N, K, a, wi, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts());
       else skinny_fp8(M, N, K, a, wi, AlphaSegments::one(1.f), nullptr, 0.f, d, ws, ws_bytes, ts());

@@ -52,8 +52,8 @@ struct LayerWeights {
   const bf16 *in_norm = nullptr, *post_norm = nullptr;
   GdnWeights gdn;
   AttnWeights attn;
-  LinearFp4 gate, up, down;
-  LinearFp4 gate_up;  // gate | up as one GEMM
+  LinearFp4 gate, up, down;  // (gate / up: the alphas and scales; their weights are only in gate_up)
+  LinearFp4 gate_up;  // gate | up as one GEMM, interleaved in blocks of 64 rows (kernels.h glu_row), alpha 1
 };
 
 class Weights {
@@ -87,6 +87,7 @@ class Weights {
     std::string dq;  // non-empty: an NVFP4 layer (this prefix, compressed-tensors) dequantized to BF16
     int q8_rows = 0;      // > 0: a BF16 matrix quantized to e4m3 with row scales (vision_quant_fp8)
     size_t q8_scale = 0;  // the scales' offset in pool
+    int glu = 0;          // 1 / 2: the MLP's gate / up, stored interleaved from offset (glu_row, fp4_glu)
   };
   std::vector<Job> jobs_;
   struct ScalarJob {
@@ -104,6 +105,10 @@ class Weights {
   void fp8(const SafeTensors& ckpt, const std::string& prefix, Pool& dev, LinearFp8& l);
   // NVFP4 layers planned as a group: all weights adjacent, then all scale factors adjacent.
   void fp4(const SafeTensors& ckpt, const std::vector<std::pair<std::string, LinearFp4*>>& group, Pool& dev);
+  // The MLP's gate and up as one interleaved [2 I][K] gate | up (kernels.h glu_row): gate.w / gate.sf are its
+  // start; fuse() makes it gate_up and clears the parts' pointers.
+  void fp4_glu(const SafeTensors& ckpt, const std::string& gate, const std::string& up, LinearFp4& g, LinearFp4& u,
+               Pool& dev);
   // Projections in FP8 or NVFP4 (as the checkpoint has them), planned as a group.
   void proj(const SafeTensors& ckpt, const std::vector<std::pair<std::string, LinearQ*>>& group, Pool& dev);
   // A small BF16 weight [out][in] that may be stored as NVFP4 (dequantized at load).

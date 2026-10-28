@@ -61,6 +61,12 @@ void silu_mul_quant_fp4(const float* gate, const float* up, int64_t ld, int T, i
                         uint8_t* sf, cudaStream_t s);
 void silu_mul_quant_fp4(const bf16* gate, const bf16* up, int64_t ld, int T, int I, float input_scale, uint8_t* q,
                         uint8_t* sf, cudaStream_t s);
+// The same from the [T][2 I] output of the interleaved gate | up weights (glu_row: gate and up in alternate blocks
+// of 64 rows), with the gate's and the up's alphas applied here (the GEMM ran with alpha 1).
+void silu_mul_quant_fp4_glu(const float* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
+                            uint8_t* q, uint8_t* sf, cudaStream_t s);
+void silu_mul_quant_fp4_glu(const bf16* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
+                            uint8_t* q, uint8_t* sf, cudaStream_t s);
 // x' = e4m3(x / input_scale), [n] elements.
 void quant_fp8(const float* x, int64_t n, float input_scale, uint8_t* q, cudaStream_t s);
 // out = silu(gate) * up, [n] elements.
@@ -82,8 +88,16 @@ void add_pos_dev(int32_t* pos, const int32_t* n, cudaStream_t s);
 // Exchanges two device buffers in place (16-byte aligned, bytes a multiple of 16): parking a sequence's
 // state while resuming another one (Model::seq_swap).
 void swap_bytes(void* a, void* b, size_t bytes, cudaStream_t s);
-// Reorders row-major e4m3 scale factors [rows][kblocks] into the CUTLASS swizzled layout.
-void swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst, cudaStream_t s);
+// The MLP's gate | up weights are stored interleaved (Weights::fp4_glu): blocks of 64 rows, gate and up in turn,
+// so that a 128-row tile (and its 128-row scale atom) holds the gate and the up rows of the same 64 outputs
+// (the fused prefill GEMM gemm_fp4_glu_mma reads one scale atom per tile instead of two half-used ones).
+// Row r of the gate (half 0) or the up (half 1) is row glu_row(r, half); column c of the gate in the GEMM's
+// output is gate_glu_offset(c) (the up 64 further).
+__host__ __device__ inline int64_t glu_row(int64_t r, int half) { return (r / 64) * 128 + half * 64 + r % 64; }
+__host__ __device__ inline int64_t gate_glu_offset(int64_t c) { return glu_row(c, 0); }
+// Reorders row-major e4m3 scale factors [rows][kblocks] into the CUTLASS swizzled layout (glu_half 0 / 1: the
+// rows of the gate / the up into the interleaved gate | up, dst its start).
+void swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst, cudaStream_t s, int glu_half = -1);
 // Byte offset of scale factor (row, kblock) in the swizzled layout (host and device).
 __host__ __device__ inline int64_t sf_offset(int64_t row, int64_t kb, int64_t kblocks) {
   int64_t katoms = (kblocks + 3) / 4;
@@ -104,6 +118,17 @@ void gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, c
                    float alpha, bf16* d, void* workspace, size_t ws_bytes, cudaStream_t s);
 void gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
               float* d, void* workspace, size_t ws_bytes, cudaStream_t s);
+// The NVFP4 GEMMs on mma.sync (gemm_mma.cu): no workspace; N and K multiples of 128.
+void gemm_fp4_mma(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
+                  float alpha, const float* c, float beta, float* d, cudaStream_t s);
+void gemm_fp4_bf16_mma(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b,
+                       const uint8_t* b_sf, float alpha, bf16* d, cudaStream_t s);
+// The MLP's gate | up GEMM with silu(gate) * up NVFP4-quantized in the epilogue: gate_up is the [2 I][K]
+// weight (gate rows, then up rows; scales likewise), q [M][I / 2] and q_sf (swizzled) the down GEMM's
+// activations, quantized with the global scale out_scale (I a multiple of 128).
+void gemm_fp4_glu_mma(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
+                      const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
+                      uint8_t* q_sf, cudaStream_t s);
 size_t gemm_workspace_bytes(int max_m);
 // Fills the MXFP8 unit scales of a workspace of gemm_workspace_bytes (gemm_fp8 then runs block-scaled).
 void gemm_workspace_init(void* workspace, size_t ws_bytes, cudaStream_t s);

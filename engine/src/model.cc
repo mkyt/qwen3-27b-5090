@@ -352,6 +352,7 @@ void Model::configure() {
   spec_paths_ = std::clamp(env_int("Q27_SPEC_PATHS", 1), 1, kTreePaths);
   spec_pipeline_ = env_int("Q27_SPEC_PIPELINE", 1) != 0;
   mlp_bf16_ = env_int("Q27_MLP_BF16", 1) != 0;
+  mlp_fused_ = env_int("Q27_MLP_FUSED", 1) != 0;
   const char* prof = getenv("Q27_PROFILE");
   prof_.on = prof && *prof && *prof != '0';
   graphs_ = !getenv("Q27_NO_GRAPH") && !skinny_check_;
@@ -951,30 +952,39 @@ void Model::mlp(int i, int T) {
   const auto& L = w_.layers[i];
   mark("norm+quant");
   if (!skip("norm")) rmsnorm_quant(x_, L.post_norm, T, kEps, nullptr, q4(L.gate.in_scale), s_);
-  float *gate = big1_, *up = big2_;
-  int64_t ld = kInter;
-  if (fused(T)) {
-    gemm_q("mlp gate_up", L.gate_up, T, big1_, false);
-    up = big1_ + kInter;
-    ld = 2 * kInter;
-  } else if (mlp_bf16_ && T > kSkinnyMaxM) {
-    // Prefill: gate / up in BF16 (they only feed silu * up and its FP4 quantization).
-    bf16 *gb = reinterpret_cast<bf16*>(big1_), *ub = reinterpret_cast<bf16*>(big2_);
-    for (auto [what, l, d] : {std::tuple{"mlp gate", &L.gate, gb}, std::tuple{"mlp up", &L.up, ub}}) {
-      mark(what);
-      if (!skip("gemm") && !skip("gemm4"))
-        gemm_fp4_bf16(T, l->out, l->in, aq_, asf_, l->w, l->sf, l->alpha.alpha[0], d, ws_, ws_bytes_, s_);
-    }
-    mark("mlp silu+quant");
-    if (!skip("silu")) silu_mul_quant_fp4(gb, ub, kInter, T, kInter, L.down.in_scale, aq_, asf_, s_);
-    gemm_q("mlp down", L.down, T, x_, true);
+  // gate_up is the interleaved gate | up with alpha 1 (Weights::fp4_glu): the silu step reads it as such and
+  // applies the gate's and the up's alphas.
+  const float ag = L.gate.alpha.alpha[0], au = L.up.alpha.alpha[0];
+  if (mlp_fused_ && T > kSkinnyMaxM && !fused(T)) {
+    // Prefill: one GEMM for gate | up whose epilogue writes silu(gate) * up as the down GEMM's NVFP4
+    // activations (big1_ / big2_: aq_ is this GEMM's input), instead of BF16 gate / up written and read
+    // back.
+    auto* q = reinterpret_cast<uint8_t*>(big1_);
+    auto* qsf = reinterpret_cast<uint8_t*>(big2_);
+    mark("mlp gate_up+silu");
+    if (!skip("gemm") && !skip("gemm4"))
+      gemm_fp4_glu_mma(T, kInter, kHidden, aq_, asf_, L.gate_up.w, L.gate_up.sf, ag, au, L.down.in_scale, q, qsf, s_);
+    mark("mlp down");
+    if (!skip("gemm") && !skip("gemm4"))
+      gemm_fp4(T, kHidden, kInter, q, qsf, L.down.w, L.down.sf, L.down.alpha.alpha[0], x_, 1.f, x_, ws_, ws_bytes_, s_);
     return;
-  } else {
-    gemm_q("mlp gate", L.gate, T, big1_, false);
-    gemm_q("mlp up", L.up, T, big2_, false);
   }
-  mark("mlp silu+quant");
-  if (!skip("silu")) silu_mul_quant_fp4(gate, up, ld, T, kInter, L.down.in_scale, aq_, asf_, s_);
+  if (mlp_bf16_ && T > kSkinnyMaxM && !fused(T)) {
+    // Prefill: gate | up in BF16 (it only feeds silu * up and its FP4 quantization; [T][2 I] in big1_).
+    bf16* gu = reinterpret_cast<bf16*>(big1_);
+    mark("mlp gate_up");
+    if (!skip("gemm") && !skip("gemm4"))
+      gemm_fp4_bf16(T, L.gate_up.out, L.gate_up.in, aq_, asf_, L.gate_up.w, L.gate_up.sf, 1.f, gu, ws_, ws_bytes_, s_);
+    mark("mlp silu+quant");
+    if (!skip("silu")) silu_mul_quant_fp4_glu(gu, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
+  } else {
+    // fp32 [T][2 I]: in big1_ ([Tc][I]) up to Tc / 2 rows, beyond that also in big2_ (adjacent).
+    Q27_CHECK(2 * T <= opt_.prefill_chunk || big2_ == big1_ + size_t(opt_.prefill_chunk) * kInter,
+              "MLP: big1_ / big2_ not adjacent");
+    gemm_q("mlp gate_up", L.gate_up, T, big1_, false);
+    mark("mlp silu+quant");
+    if (!skip("silu")) silu_mul_quant_fp4_glu(big1_, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
+  }
   gemm_q("mlp down", L.down, T, x_, true);
 }
 

@@ -55,6 +55,16 @@ void Weights::fp4(const SafeTensors& ckpt, const std::vector<std::pair<std::stri
     tensor(ckpt, p + ".weight_scale", dev, reinterpret_cast<const void**>(&l->sf), l->out, l->in / 16);
 }
 
+void Weights::fp4_glu(const SafeTensors& ckpt, const std::string& gate, const std::string& up, LinearFp4& g,
+                      LinearFp4& u, Pool& dev) {
+  fp4(ckpt, {{gate, &g}, {up, &u}}, dev);
+  // fp4 added the jobs gate data, up data, gate scales, up scales: the up's go to the gate's offsets.
+  Job* j = &jobs_[jobs_.size() - 4];
+  Q27_CHECK(!dev.host() && g.out == u.out && g.in == u.in && g.out % 128 == 0, "unexpected MLP gate / up");
+  j[0].glu = j[2].glu = 1, j[1].glu = j[3].glu = 2;
+  j[1].offset = j[0].offset, j[3].offset = j[2].offset;
+}
+
 void Weights::proj(const SafeTensors& ckpt, const std::vector<std::pair<std::string, LinearQ*>>& group, Pool& dev) {
   const std::string& p0 = group.front().first;
   if (ckpt.has(p0 + ".weight") && ckpt.info(p0 + ".weight").dtype == "F8_E4M3") {
@@ -80,6 +90,24 @@ void Weights::bf16_weight(const SafeTensors& ckpt, const std::string& p, Pool& d
 }
 
 namespace {
+
+// Bytes [off, off + len) of the gate (half 0) or the up (half 1), in buf, to their places in the interleaved
+// gate | up at dst: blocks of 64 rows (block bytes each), the gate's block b at 2 b, the up's at 2 b + 1.
+void copy_glu(char* dst, size_t off, const void* buf, size_t len, size_t block, int half, cudaStream_t s) {
+  const char* src = static_cast<const char*>(buf);
+  auto at = [&](size_t o) { return dst + (2 * (o / block) + half) * block + o % block; };
+  const size_t end = off + len;
+  if (off % block) {  // the end of a block
+    const size_t n = std::min(end, (off / block + 1) * block) - off;
+    Q27_CUDA(cudaMemcpyAsync(at(off), src, n, cudaMemcpyHostToDevice, s));
+    src += n, off += n;
+  }
+  if (const size_t rows = (end - off) / block) {  // whole blocks: every other one
+    Q27_CUDA(cudaMemcpy2DAsync(at(off), 2 * block, src, block, block, rows, cudaMemcpyHostToDevice, s));
+    src += rows * block, off += rows * block;
+  }
+  if (off < end) Q27_CUDA(cudaMemcpyAsync(at(off), src, end - off, cudaMemcpyHostToDevice, s));
+}
 
 // Concatenation along the output dimension of layers stored back to back.
 LinearFp8 fuse8(std::initializer_list<const LinearFp8*> parts) {
@@ -141,7 +169,14 @@ void Weights::fuse() {
       L.gdn.qkvz = fuseq(L.gdn.qkv, L.gdn.z);
     }
     for (auto* l : {&L.gate, &L.up, &L.down}) one4(*l);
-    L.gate_up = fuse4({&L.gate, &L.up});
+    // (interleaved: fp4_glu. The GEMMs run with alpha 1, the silu step applies the gate's and the up's.)
+    Q27_CHECK(L.up.w == L.gate.w + size_t(L.gate.out) * (L.gate.in / 2) &&
+                  L.up.sf == L.gate.sf + sf_bytes(L.gate.out, L.gate.in / 16) && L.up.in_scale == L.gate.in_scale,
+              "MLP gate / up are not adjacent");
+    L.gate_up = L.gate;
+    L.gate_up.out = 2 * L.gate.out;
+    L.gate_up.alpha = AlphaSegments::one(1.f);
+    for (auto* l : {&L.gate, &L.up}) l->w = nullptr, l->sf = nullptr;
   }
   one4(lm_head);
 }
@@ -184,7 +219,7 @@ void Weights::plan(const SafeTensors& ckpt, const SafeTensors* lm_ckpt, Pool& de
       bf(g + ".conv1d.weight", &L.gdn.conv);
       bf(g + ".norm.weight", &L.gdn.norm);
     }
-    fp4(ckpt, {{p + ".mlp.gate_proj", &L.gate}, {p + ".mlp.up_proj", &L.up}}, dev);
+    fp4_glu(ckpt, p + ".mlp.gate_proj", p + ".mlp.up_proj", L.gate, L.up, dev);
     fp4(ckpt, {{p + ".mlp.down_proj", &L.down}}, dev);
   }
   bf(kLM + ".norm.weight", &final_norm);
@@ -343,7 +378,7 @@ void Weights::load(cudaStream_t s) {
     }
     if (j.sf_rows) {  // whole scale-factor tensor in one staging buffer, swizzled from host memory
       if (Prefetcher::fits(info.nbytes)) {
-        swizzle_sf(static_cast<uint8_t*>(pf.get(ri, j.name, 0)), j.sf_rows, j.sf_kblocks, reinterpret_cast<uint8_t*>(dst), s);
+        swizzle_sf(static_cast<uint8_t*>(pf.get(ri, j.name, 0)), j.sf_rows, j.sf_kblocks, reinterpret_cast<uint8_t*>(dst), s, j.glu - 1);
         pf.release(ri++, s);
         continue;
       }
@@ -351,7 +386,7 @@ void Weights::load(cudaStream_t s) {
       staging();
       Q27_CUDA(cudaEventSynchronize(done[cur]));
       ckpt.read(j.name, stage[cur]);
-      swizzle_sf(static_cast<uint8_t*>(stage[cur]), j.sf_rows, j.sf_kblocks, reinterpret_cast<uint8_t*>(dst), s);
+      swizzle_sf(static_cast<uint8_t*>(stage[cur]), j.sf_rows, j.sf_kblocks, reinterpret_cast<uint8_t*>(dst), s, j.glu - 1);
       Q27_CUDA(cudaEventRecord(done[cur], s));
       cur ^= 1;
       continue;
@@ -362,7 +397,11 @@ void Weights::load(cudaStream_t s) {
         ri++;
         continue;
       }
-      Q27_CUDA(cudaMemcpyAsync(dst + off, buf, size_t(std::min<int64_t>(kChunk, info.nbytes - off)), cudaMemcpyHostToDevice, s));
+      const size_t len = size_t(std::min<int64_t>(kChunk, info.nbytes - off));
+      if (j.glu)
+        copy_glu(dst, size_t(off), buf, len, size_t(info.shape[1]) * 64, j.glu - 1, s);
+      else
+        Q27_CUDA(cudaMemcpyAsync(dst + off, buf, len, cudaMemcpyHostToDevice, s));
       pf.release(ri++, s);
     }
   }

@@ -23,6 +23,7 @@ add_library(q27 SHARED
   src/weights.cc
   src/kernels.cu
   src/gemm.cu
+  src/gemm_mma.cu
   src/gemm_bf16.cu
   src/skinny.cu
   src/gdn.cu

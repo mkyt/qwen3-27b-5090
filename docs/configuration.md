@@ -154,7 +154,8 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_PAGES_HIGH=1` | Hand out KV pages from the top (tests, P7-13): the KV cache then occupies the parking areas, so every park moves pages. Read at startup |
 | `Q27_ATTN_PREFILL_TC=0` | Prefill attention on CUDA cores (static) |
 | `Q27_GDN_CHUNK=0` | Sequential GDN in prefill (static) |
-| `Q27_MLP_BF16=0` | fp32 outputs for the prefill MLP's gate / up |
+| `Q27_MLP_FUSED=0` | Prefill MLP: gate \| up as a BF16 CUTLASS GEMM, then SiLU and NVFP4 quantization in a separate kernel. Default 1: one GEMM (`gemm_mma.cu`) whose epilogue writes silu(gate) * up as the down GEMM's NVFP4 activations (prefill +2% at 19K / 73K, P5-12) |
+| `Q27_MLP_BF16=0` | With `Q27_MLP_FUSED=0`: fp32 outputs for the prefill MLP's gate \| up |
 | `Q27_GEMM_MXFP8=0` | Prefill FP8 GEMMs with the plain FP8 CUTLASS kernel (default: block-scaled MXFP8 with unit scales, bit-identical, P5-11; read per call) |
 | `Q27_SPEC_PATHS=K` | Paths of tree verification (default 1 = a chain; 2 / 4 accept more but take longer and break even) |
 | `Q27_LOOKUP=1` | Lookup drafting (off: no gain with the 8-row chain) |

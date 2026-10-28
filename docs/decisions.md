@@ -243,6 +243,17 @@ gate without an explicit decision, recorded below with its numbers.
     along the keys the MMA reduces over.
   - (C, dropped) A softmax per 64 keys (half the output rescales): -0.5 to 1.5%, within noise. Three heads per CTA
     ran out of registers.
+- **P5-12: the MLP's gate | up stored interleaved (blocks of 64 rows, gate and up in turn).** The fused prefill
+  GEMM (`gemm_fp4_glu_mma`, `Q27_MLP_FUSED=1`, the default since 2026-10-28: gate | up, then silu(gate) * up NVFP4-quantized in the epilogue)
+  needs the gate and the up rows of the same outputs in one tile. With the two stored apart, a 128-row tile took
+  half of a gate and half of an up scale atom (the NVFP4 scale layout groups 128 rows), 50% more B-scale bytes per
+  K step: the interleaved layout makes it one atom, -3.8% time and about -2% energy per call. The loader places
+  the rows (no extra memory), the GEMMs on gate | up run with alpha 1 and the SiLU step applies the gate's and the
+  up's. Decode and the fused prefill are bit-identical to before; the BF16 prefill (`Q27_MLP_FUSED=0`) now writes
+  one BF16 gate | up (KL to the previous engine 0.048, to the BF16 original unchanged). With the fused path, prefill
+  at 19K / 73K is 2.2 / 1.7% faster and uses 2.1% less energy per token than the BF16 path. Quality against it:
+  GSM8K 95.3 / 95.3%, BFCL 88.9 / 89.1%, Japanese reference scores within their CIs (JSQuAD F1 +1.6), needles at
+  256K 56 / 58 of 64, KL to the BF16 original 0.0470 / 0.0454.
 - **Not done: FP4 attention for P V (SageAttention3 style), a megakernel.** See [Not done](#not-done).
 
 ## Vision
