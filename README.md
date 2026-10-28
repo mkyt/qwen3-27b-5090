@@ -110,7 +110,7 @@ To update: `git pull`, `docker compose pull serve`, `docker compose up -d serve`
 
 The serving image ([Dockerfile](Dockerfile), published by [a workflow](.github/workflows/image.yml)) compiles the
 engine in the CUDA devel image and keeps only the result: the CUDA runtime, `libq27.so`, Python and the server's
-four packages (`frontend/requirements.txt`: tokenizers, jinja2, numpy, pillow). No compiler, CUTLASS, PyTorch or
+four packages (`frontend/requirements.txt`: tokenizers, jinja2, numpy, pillow). No compiler, PyTorch or
 transformers. `docker compose up -d --build serve` builds it from the checkout instead (about 2 minutes the first
 time, then only the engine sources that changed), e.g. after changing the code.
 
@@ -181,9 +181,9 @@ with), with an FP8 KV cache (`ref-gpu-kvfp8`, the noise floor), the BF16 origina
 
 ## Tests
 
-The `dev` image (dev/Dockerfile: the CUDA toolkit, CUTLASS, PyTorch) builds the engine and runs the tests; `dev-cpu` is the same image without the GPU. The prefill GEMMs are the engine's own (`engine/src/gemm_mma.cu`, on
-`mma.sync` and TMA); CUTLASS's SM120 kernels (`gemm.cu`, `gemm_bf16.cu`) are built alongside for comparison (`Q27_GEMM_CUTLASS`,
-[docs/configuration.md](docs/configuration.md)) and can be left out with `-DQ27_CUTLASS_GEMM=OFF`, which a Windows (MSVC) build needs. Unit tests:
+The `dev` image (dev/Dockerfile: the CUDA toolkit, PyTorch) builds the engine and runs the tests; `dev-cpu` is the same image without the GPU. Every kernel is the engine's own, the prefill GEMMs included (`engine/src/gemm_mma.cu`, on
+`mma.sync` and TMA; they replaced CUTLASS's SM120 kernels with bit-identical results), so the engine has no
+dependency beyond the CUDA toolkit. Unit tests:
 
 ```bash
 docker compose --profile dev run --rm dev-cpu python -m pytest -q frontend/tests                # server: parsing, admission (seconds)
@@ -212,14 +212,14 @@ scripts/      weight download, end-to-end tests, benchmarks, quality evaluations
 tools/        memory plan / roofline calculator, draft vocabulary builder
 micro/        microbenchmarks of the GPU (bandwidth, MMA peaks, PCIe)
 Dockerfile    the serving image (libq27.so, the server and four Python packages; 1.2 GB, ghcr.io/mkyt/qwen3-27b-5090)
-dev/          the development image (CUDA, CUTLASS, PyTorch for the reference and the tests)
+dev/          the development image (CUDA, PyTorch for the reference and the tests)
 bench/        golden prompts, draft vocabulary, test images
 docs/         architecture, decisions, configuration, benchmarks
 ```
 
 ## License
 
-MIT ([LICENSE](LICENSE)). The build image fetches [CUTLASS](https://github.com/NVIDIA/cutlass) (BSD-3-Clause); the
+MIT ([LICENSE](LICENSE)). The
 model weights (Qwen3.8-27B, NVIDIA's NVFP4 checkpoint, DFlash2, the gdnfp4 build) are Apache-2.0 and are downloaded,
 not distributed here. The golden prompt texts are public domain or from this repository
 ([bench/golden/sources/README.md](bench/golden/sources/README.md)).

@@ -357,8 +357,6 @@ class Model {
   float* topk_logp_ = nullptr;
   float* uniform_ = nullptr;
   int32_t* sampled_ = nullptr;
-  void* ws_ = nullptr;
-  size_t ws_bytes_ = 0;
   bool mlp_bf16_ = true;                              // prefill MLP gate / up in BF16 (Q27_MLP_BF16)
   bool mlp_fused_ = true;   // prefill MLP gate | up + silu * up + NVFP4 quantization in one GEMM (Q27_MLP_FUSED)
   static constexpr int kSkinnyMaxM = 64;              // decode and verify-sized GEMMs use skinny.cu
@@ -367,7 +365,7 @@ class Model {
   void* attn_ws_ = nullptr;  // split-KV partials of attention_decode
   void* fa_stage_ = nullptr;  // NVFP4 KV: the context rounded to E4M3 for the prefill attention (P7-8)
   size_t fa_stage_bytes_ = 0;
-  bool skinny_ = true;         // Q27_NO_SKINNY=1: CUTLASS for every M (Phase 1 path)
+  bool skinny_ = true;         // Q27_NO_SKINNY=1: the many-row GEMMs for every M (Phase 1 path)
   bool skinny_check_ = false;
   std::string skip_;  // Q27_SKIP (debug timing)
   bool skip(const char* kind) const;

@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Development image: CUDA toolkit (nvcc for SM120), CUTLASS headers, and a uv-managed Python
+# Development image: CUDA toolkit (nvcc for SM120) and a uv-managed Python
 # environment for the PyTorch reference model, tests, quantization and bench clients.
 # The serving image is ../Dockerfile (the engine library and the server only, no PyTorch).
 
@@ -10,13 +10,6 @@ FROM nvidia/cuda:13.3.0-devel-ubuntu24.04@sha256:ef2203909e80b8b976cfc672f7e2ae2
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git cmake ninja-build ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
-
-# CUTLASS / CuTe headers (SM120 block-scaled MMA, TMA), pinned to the v4.8.0 commit.
-ARG CUTLASS_COMMIT=098de2a652cf8f00fd70b2df54051c7eccbb855a
-RUN git clone --filter=blob:none --no-checkout https://github.com/NVIDIA/cutlass /opt/cutlass \
- && git -C /opt/cutlass checkout -q ${CUTLASS_COMMIT} \
- && rm -rf /opt/cutlass/.git
-ENV CUTLASS_DIR=/opt/cutlass
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 ENV UV_PYTHON_INSTALL_DIR=/opt/python \

@@ -10,7 +10,7 @@ each number. The JSON files of the speed numbers are in [results/](results/).
 | --- | --- |
 | GPU | RTX 5090 (32 GB), power limit **400 W** (below the card's default 575 W; every number here is at 400 W) |
 | Host | WSL2 (kernel 6.18), NVIDIA driver 617.42, Docker with the NVIDIA Container Toolkit |
-| Build | the `dev` image: CUDA 13.3, CUTLASS fetched at build time |
+| Build | the `dev` image: CUDA 13.3 |
 | Date | 2026-10-11 |
 
 Prefill is power-bound at 400 W: the FP4 / FP8 GEMMs and attention all run at the power limit. The card's default

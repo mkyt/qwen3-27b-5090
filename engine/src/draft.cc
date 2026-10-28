@@ -411,7 +411,7 @@ void Draft::append_ctx(const bf16* cap, int rows, const int32_t* pos, int pos_ad
     return;
   }
   Q27_CHECK(!rowmap, "draft append_ctx: rowmap needs <= 8 rows");
-  // Prompt: BF16 GEMMs through CUTLASS, quantized weights dequantized slice by slice into scratch.
+  // Prompt: BF16 GEMMs (gemm_bf16), quantized weights dequantized slice by slice into scratch.
   auto big = [&](const DLinear& l, int r0, int n, const bf16* a, float* d, int ldd) {
     if (!l.scale) {
       Q27_CHECK(ldd == n, "draft: strided output");

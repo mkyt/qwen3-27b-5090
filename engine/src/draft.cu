@@ -621,7 +621,7 @@ __device__ __forceinline__ float e2m1_value(uint32_t code) {
   return code & 8 ? -m : m;
 }
 
-// Dequantization of weight rows to BF16 (prompt context through CUTLASS): thread per 16 values.
+// Dequantization of weight rows to BF16 (prompt context through the BF16 GEMM): thread per 16 values.
 __global__ void dequant_weight_kernel(DLinear l, int fmt, int row0, int n, bf16* out) {
   const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const int groups = l.K / 16;

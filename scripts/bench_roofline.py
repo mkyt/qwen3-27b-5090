@@ -137,7 +137,6 @@ def kernels(args, telemetry):
     from q27lib import call, lib
     torch.manual_seed(7)
     rows = []
-    ws = torch.empty(4 << 20, dtype=torch.uint8, device="cuda")
     for precision, name, m, n, k, bf16_out in [
         ("fp4", "gate_up_bf16", 2048, 17408, 5120, True),
         ("fp4", "down_f32", 2048, 5120, 17408, False),
@@ -157,17 +156,17 @@ def kernels(args, telemetry):
             out = torch.empty(m, n, dtype=torch.bfloat16 if bf16_out else torch.float32, device="cuda")
             if bf16_out:
                 def run():
-                    call("q27t_gemm_fp4_bf16", m, n, k, a, sf[0], b, sf[1], 1.0, out, ws, ws.numel())
+                    call("q27t_gemm_fp4_bf16", m, n, k, a, sf[0], b, sf[1], 1.0, out)
             else:
                 def run():
-                    call("q27t_gemm_fp4", m, n, k, a, sf[0], b, sf[1], 1.0, None, 0.0, out, ws, ws.numel())
+                    call("q27t_gemm_fp4", m, n, k, a, sf[0], b, sf[1], 1.0, None, 0.0, out)
         else:
             a = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn).view(torch.uint8)
             b = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn).view(torch.uint8)
             out = torch.empty(m, n, device="cuda")
 
             def run():
-                call("q27t_gemm_fp8", m, n, k, a, b, 1.0, None, 0.0, out, ws, ws.numel())
+                call("q27t_gemm_fp8", m, n, k, a, b, 1.0, None, 0.0, out)
 
         for _ in range(100):
             run()

@@ -80,7 +80,7 @@ services:
       Q27_ATTN_FP8: ${Q27_ATTN_FP8:-}              # prefill attention MMAs: empty = 2 (FP8 KV) / 3 (NVFP4 KV: Q·K on FP4 MMAs, P7-8); 2 Q·K and P·V in FP8, 1 P·V only, 0 BF16
       Q27_ATTN_FP4_STAGE: ${Q27_ATTN_FP4_STAGE:-1} # NVFP4 KV prefill: V (mode 3) rounded to E4M3 once per call (P7-8; 1 KiB/token; 0 = per CTA, mode 2)
       Q27_ATTN_TC_F8: ${Q27_ATTN_TC_F8:-}          # decode / verify attention MMAs: empty = FP8 with NVFP4 KV (P7-7), 1 = also with FP8 KV, 0 = BF16 / f16
-      Q27_MLP_FUSED: ${Q27_MLP_FUSED:-1}           # prefill MLP: 1 = gate | up, silu * up and its NVFP4 quantization in one GEMM (gemm_mma.cu); 0 = BF16 gate | up (CUTLASS)
+      Q27_MLP_FUSED: ${Q27_MLP_FUSED:-1}           # prefill MLP: 1 = gate | up, silu * up and its NVFP4 quantization in one GEMM (gemm_mma.cu); 0 = BF16 gate | up, then the silu step
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
       interval: 10s

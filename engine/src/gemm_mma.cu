@@ -1,4 +1,4 @@
-// Prefill GEMMs on warp-level mma.sync (no CUTLASS), and the dispatch between them and gemm.cu's CUTLASS kernels.
+// Prefill GEMMs on warp-level mma.sync. (They replaced CUTLASS's SM120 kernels, with bit-identical results: P5-12.)
 // A = activations [M][K] row-major, B = weights [N][K] (K contiguous), D fp32 or BF16 row-major [M][N].
 // NVFP4: mma m16n8k64 kind::mxf4nvf4 with the ue4m3 scales in the CUTLASS swizzled layout (sf_offset),
 // read in place: for one row and one k64 step the four block scales are one 32-bit word of a 512-byte
@@ -7,9 +7,6 @@
 // m16n8k16. Their fragments hold the same bytes as the NVFP4 k64 ones (32 bytes of a row per k step), so the
 // tiles, ldmatrix and the epilogue are shared; a stage is 64 bytes of each row (NVFP4 128 elements of K, E4M3 64,
 // BF16 32) and only NVFP4 carries scales.
-#ifndef Q27_GEMM_CUTLASS_DEFAULT
-#define Q27_GEMM_CUTLASS_DEFAULT "1"  // (builds with CUTLASS: prefill 0.2-0.6% faster than all mma.sync, P5-12)
-#endif
 // A CTA owns a 128 x 128 tile of D: 8 MMA warps (2 x 4, 64 x 32 each: 4 m16 x 4 n8 MMA tiles) and one
 // producer warp. K moves in stages of 64 bytes per row through a ring of kStages: the producer fills a
 // stage with TMA (A and B tiles: 64 bytes per row, 64-byte swizzle = 16-byte piece c of row r at
@@ -72,6 +69,7 @@ struct MmaParams {
   float alpha_up, out_scale;
   uint8_t* q;
   uint8_t* sf;
+  int gm;  // tile order: groups of gm M tiles, M fastest within a group (tile_mn)
 };
 enum { kEpiStore, kEpiAdd, kEpiLoadC };
 
@@ -90,6 +88,15 @@ static_assert(sizeof(TmaDesc) == sizeof(CUtensorMap), "TmaDesc: the size of CUte
 // Shared-memory offset of 16-byte piece `c` (0..3) of tile row `r` (the TMA 64-byte swizzle).
 __device__ __forceinline__ uint32_t tile_off(int r, int c) { return r * kRowBytes + ((c ^ ((r >> 1) & 3)) << 4); }
 
+// Tile -> (M tile, N tile) in groups of gm M tiles, M fastest within a group. run() takes gm = 1 (N fastest: the CTAs
+// running at the same time share the activation rows; M fastest, sharing the weight tiles, was 2-5% slower at 400 W
+// for most prefill shapes, gdn z ~1% faster) unless the weights do not stay in L2 between the passes over them, one per
+// M tile: then gm = all (each weight tile from DRAM once; the fused gate | up, 89 MB: N fastest 8% slower).
+__device__ __forceinline__ void tile_mn(int tile, int mtiles, int ntn, int gm, int& mi, int& ni) {
+  const int g = tile / (gm * ntn), idx = tile - g * gm * ntn, gsz = min(gm, mtiles - g * gm);
+  mi = g * gm + idx % gsz, ni = idx / gsz;
+}
+
 __device__ __forceinline__ void mbar_init(uint32_t bar, int count) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(count));
 }
@@ -105,23 +112,42 @@ __device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
       ::"r"(bar), "r"(parity), "r"(0x989680u)
       : "memory");
 }
+// mbarrier.arrive from lane 0 as a predicated instruction, not a branch: a lane-dependent branch in the K loop makes the
+// compiler treat the ring position as divergent and keep the stage arithmetic on the vector datapath.
+__device__ __forceinline__ void mbar_arrive_lane0(uint32_t bar, int lane) {
+  asm volatile("{\n.reg .pred p;\nsetp.eq.u32 p, %1, 0;\n@p mbarrier.arrive.shared::cta.b64 _, [%0];\n}" ::"r"(bar), "r"(lane)
+               : "memory");
+}
 __device__ __forceinline__ void mbar_arrive(uint32_t bar) {
   asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(bar) : "memory");
 }
-__device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes) {
-  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(bytes) : "memory");
-}
-__device__ __forceinline__ void tma_2d(uint32_t dst, const TmaDesc* map, int x, int y, uint32_t bar) {
-  asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" ::"r"(
-          dst),
-      "l"(map), "r"(x), "r"(y), "r"(bar)
-      : "memory");
-}
-__device__ __forceinline__ void bulk_copy(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
-  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(dst),
-               "l"(src), "r"(bytes), "r"(bar)
-               : "memory");
+
+// One ring stage's loads, issued by one lane (elect.sync) of the whole producer warp: the expected bytes, the A and B
+// tiles and (kScales) the two scale atoms of each. Predicated, not branched: in a lane-0 branch the compiler cannot
+// keep the operands in uniform registers, which the TMA instructions take, and wrapped every copy in a loop over the
+// lanes' values (~120 instructions per stage, 14% of the GEMM's).
+template <bool kScales>
+__device__ __forceinline__ void issue_stage(uint32_t st, uint32_t bar, uint32_t bytes, const TmaDesc* ma, const TmaDesc* mb,
+                                            int x, int ya, int yb, const void* sfa, const void* sfb) {
+  if constexpr (kScales)
+    asm volatile(
+        "{\n.reg .pred p;\nelect.sync _|p, 0xffffffff;\n"
+        "@p mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %2;\n"
+        "@p cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%3, {%5, %6}], [%1];\n"
+        "@p cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%8], [%4, {%5, %7}], [%1];\n"
+        "@p cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%9], [%11], 1024, [%1];\n"
+        "@p cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%10], [%12], 1024, [%1];\n}" ::"r"(st),
+        "r"(bar), "r"(bytes), "l"(ma), "l"(mb), "r"(x), "r"(ya), "r"(yb), "r"(st + kTileBytes), "r"(st + 2 * kTileBytes),
+        "r"(st + 2 * kTileBytes + kSfBytes), "l"(sfa), "l"(sfb)
+        : "memory");
+  else
+    asm volatile(
+        "{\n.reg .pred p;\nelect.sync _|p, 0xffffffff;\n"
+        "@p mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %2;\n"
+        "@p cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%3, {%5, %6}], [%1];\n"
+        "@p cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%8], [%4, {%5, %7}], [%1];\n}" ::"r"(st),
+        "r"(bar), "r"(bytes), "l"(ma), "l"(mb), "r"(x), "r"(ya), "r"(yb), "r"(st + kTileBytes)
+        : "memory");
 }
 
 // mma_fp4_16864 with the B scales taken from lane (l / 4) * 4 + tid_b of each quad.
@@ -149,21 +175,22 @@ struct Frags {
 // (t == 1, 3) gives all four, and the warp's 16 lines are 256 contiguous bytes (no bank conflicts; with
 // 64 contiguous rows per warp it took two 64-bit loads at twice the shared-memory wavefronts). B scales: ldmatrix
 // over the lines nt * 8 .. + 7 of the atom gives lane (g, t) word t of line nt * 8 + g; the column's word
-// is kWc = wn / 32, so the MMA takes it from lane t = kWc.
+// is kWc = wn / 32, so the MMA takes it from lane t = kWc. a1 / b1: the offsets of k64 step 1 (piece 2 + c).
 struct FragOffsets {
-  uint32_t a, b, sa, sb;
+  uint32_t a, b, sa, sb, a1, b1;
   __device__ FragOffsets(int wm, int wn, int lane) {
     const int q = lane / 8, lr = lane % 8, g = lane / 4, t = lane % 4;
     a = tile_off(wm + (q % 2) * 8 + lr, q / 2);  // (wm: 0 or 16; m16 tile mt at rows wm + 32 mt)
     b = kTileBytes + tile_off(wn + (q / 2) * 8 + lr, q % 2);
     sa = 2 * kTileBytes + (wm + g + (t % 2) * 8) * 16;
     sb = 2 * kTileBytes + kSfBytes + (q * 8 + lr) * 16;
+    a1 = a ^ 32, b1 = b ^ 32;
   }
 };
 
 template <int kKs, bool kGlu, int kIn>
 __device__ __forceinline__ void load_frags(Frags& f, uint32_t st, const FragOffsets& o) {
-  const uint32_t a = st + (o.a ^ (kKs * 32)), b = st + (o.b ^ (kKs * 32));
+  const uint32_t a = st + (kKs ? o.a1 : o.a), b = st + (kKs ? o.b1 : o.b);
 #pragma unroll
   for (int mt = 0; mt < 4; mt++) ldsm_x4(f.a[mt], a + mt * 2048);
   if (kIn == kInFp4)
@@ -230,9 +257,11 @@ __device__ __forceinline__ void mainloop(float (&acc)[4][4][4], uint32_t base, u
   mbar_wait(full + 8 * s, phase);
   load_frags<0, kGlu, kIn>(f0, base + s * kStageBytes<kIn>, o);
   for (int kt = 0; kt < ktiles; kt++) {
-    // (opaque: otherwise the compiler recomputes the offsets from the thread index in every iteration,
-    // ~45 integer instructions per 32 MMAs)
-    asm volatile("" : "+r"(o.a), "+r"(o.b), "+r"(o.sa), "+r"(o.sb), "+r"(base), "+r"(full), "+r"(empty));
+    // (the per-lane offsets opaque: otherwise the compiler recomputes them from the thread index in every
+    // iteration, ~45 integer instructions per 32 MMAs. Only those: the stage addresses and the barrier phase are
+    // warp-uniform and stay on the uniform datapath, the ldmatrix addresses [R + UR]; with the bases opaque as well
+    // they took ~30 vector integer instructions per 32 MMAs and the GEMM ~2% more energy; CUTLASS keeps them uniform too)
+    asm volatile("" : "+r"(o.a), "+r"(o.b), "+r"(o.sa), "+r"(o.sb), "+r"(o.a1), "+r"(o.b1));
     const uint32_t st = base + s * kStageBytes<kIn>;
     load_frags<1, kGlu, kIn>(f1, st, o);
     mma_step<kWc, kGlu, kIn>(acc, f0);
@@ -244,7 +273,7 @@ __device__ __forceinline__ void mainloop(float (&acc)[4][4][4], uint32_t base, u
     }
     mma_step<kWc, kGlu, kIn>(acc, f1);
     __syncwarp();
-    if (lane == 0) mbar_arrive(empty + 8 * s);
+    mbar_arrive_lane0(empty + 8 * s, lane);
     s = s1, phase = phase1;
   }
 }
@@ -252,11 +281,6 @@ __device__ __forceinline__ void mainloop(float (&acc)[4][4][4], uint32_t base, u
 __device__ __forceinline__ void tma_store_2d(const TmaDesc* map, uint32_t src, int x, int y) {
   asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];" ::"l"(map), "r"(x), "r"(y),
                "r"(src)
-               : "memory");
-}
-__device__ __forceinline__ void tma_add_2d(const TmaDesc* map, uint32_t src, int x, int y) {
-  asm volatile("cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group [%0, {%1, %2}], [%3];" ::"l"(map),
-               "r"(x), "r"(y), "r"(src)
                : "memory");
 }
 __device__ __forceinline__ void st_shared_u32(uint32_t a, uint32_t v) {
@@ -269,28 +293,34 @@ __device__ __forceinline__ void st_shared_f32x2(uint32_t a, float x, float y) {
   asm volatile("st.shared.v2.f32 [%0], {%1, %2};" ::"r"(a), "f"(x), "f"(y) : "memory");
 }
 
-// Before a warp rewrites its staging buffer: the previous TMA store has read it.
-__device__ __forceinline__ void epi_wait(int lane) {
-  if (lane == 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+// Before a warp rewrites its staging buffer: the previous TMA store has read it. (The bulk-group operations are
+// per thread: the same elected lane issues, commits and waits; predicated rather than branched, as issue_stage.)
+__device__ __forceinline__ void epi_wait() {
+  asm volatile("{\n.reg .pred p;\nelect.sync _|p, 0xffffffff;\n@p cp.async.bulk.wait_group.read 0;\n}" ::: "memory");
   __syncwarp();
 }
 // After the warp wrote its staging buffer: make the writes visible to the TMA unit and store (or add) it.
 // kBoxes boxes of 16 rows, box i (box_bytes each in the buffer) at rows y + 32 i (the warp's m16 tiles).
 template <int kBoxes>
-__device__ __forceinline__ void epi_issue(const TmaDesc& map, uint32_t buf, int box_bytes, int x, int y, bool add,
-                                          int lane) {
+__device__ __forceinline__ void epi_issue(const TmaDesc& map, uint32_t buf, int box_bytes, int x, int y, bool add) {
   asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
   __syncwarp();
-  if (lane == 0) {
 #pragma unroll
-    for (int i = 0; i < kBoxes; i++) {
-      if (add)
-        tma_add_2d(&map, buf + i * box_bytes, x, y + 32 * i);
-      else
-        tma_store_2d(&map, buf + i * box_bytes, x, y + 32 * i);
-    }
-    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+  for (int i = 0; i < kBoxes; i++) {
+    if (add)
+      asm volatile(
+          "{\n.reg .pred p;\nelect.sync _|p, 0xffffffff;\n"
+          "@p cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group [%0, {%1, %2}], [%3];\n}" ::"l"(&map),
+          "r"(x), "r"(y + 32 * i), "r"(buf + i * box_bytes)
+          : "memory");
+    else
+      asm volatile(
+          "{\n.reg .pred p;\nelect.sync _|p, 0xffffffff;\n"
+          "@p cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];\n}" ::"l"(&map), "r"(x),
+          "r"(y + 32 * i), "r"(buf + i * box_bytes)
+          : "memory");
   }
+  asm volatile("{\n.reg .pred p;\nelect.sync _|p, 0xffffffff;\n@p cp.async.bulk.commit_group;\n}" ::: "memory");
 }
 
 // An MMA warp: its part of every tile of the CTA, then the epilogue (c[0..1] = row r0, columns 2t, 2t + 1
@@ -306,7 +336,9 @@ __device__ __forceinline__ void consumer(const MmaParams& p, const TmaDesc& map_
   int s = 0;
   uint32_t phase = 0;
   for (int tile = blockIdx.x, it = 0; tile < ntiles; tile += gridDim.x, it++) {
-    const int m0 = (tile % mtiles) * kBM, n0 = (tile / mtiles) * (kGlu ? kBN / 2 : kBN);
+    int mi, ni;
+    tile_mn(tile, mtiles, ntiles / mtiles, p.gm, mi, ni);
+    const int m0 = mi * kBM, n0 = ni * (kGlu ? kBN / 2 : kBN);
     float acc[4][4][4] = {};
     mainloop<kStages, kWc, kOut, kIn>(acc, base, full, empty, ktiles, o, lane, s, phase);
     if constexpr (kGlu) {
@@ -368,7 +400,7 @@ __device__ __forceinline__ void consumer(const MmaParams& p, const TmaDesc& map_
       // at c ^ ((r / 2) % 4).
 #pragma unroll
       for (int half = 0; half < 2; half++) {
-        epi_wait(lane);
+        epi_wait();
 #pragma unroll
         for (int mi = 0; mi < 2; mi++)
 #pragma unroll
@@ -381,14 +413,14 @@ __device__ __forceinline__ void consumer(const MmaParams& p, const TmaDesc& map_
               st_shared_u32(epi + r * 64 + ((nt ^ ((r >> 1) & 3)) << 4) + 4 * t, *reinterpret_cast<const uint32_t*>(&v));
             }
           }
-        epi_issue<2>(map_d, epi, 1024, n0 + wn, m0 + wm + 64 * half, false, lane);
+        epi_issue<2>(map_d, epi, 1024, n0 + wn, m0 + wm + 64 * half, false);
       }
     } else {
       // Four boxes (m16 tiles) of 16 rows x 32 columns of fp32 in turn: 128-byte rows, 16-byte piece c of row r at
       // c ^ (r % 8).
 #pragma unroll
       for (int mt = 0; mt < 4; mt++) {
-        epi_wait(lane);
+        epi_wait();
 #pragma unroll
         for (int h = 0; h < 2; h++) {
           const int r = g + 8 * h, row = m0 + wm + mt * 32 + r;
@@ -402,15 +434,14 @@ __device__ __forceinline__ void consumer(const MmaParams& p, const TmaDesc& map_
             st_shared_f32x2(epi + r * 128 + (((2 * nt + t / 2) ^ (r & 7)) << 4) + 8 * (t % 2), x, y);
           }
         }
-        epi_issue<1>(map_d, epi, 2048, n0 + wn, m0 + wm + 32 * mt, p.epi == kEpiAdd, lane);
+        epi_issue<1>(map_d, epi, 2048, n0 + wn, m0 + wm + 32 * mt, p.epi == kEpiAdd);
       }
     }
   }
-  if (lane == 0) asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+  asm volatile("{\n.reg .pred p;\nelect.sync _|p, 0xffffffff;\n@p cp.async.bulk.wait_group 0;\n}" ::: "memory");
 }
 
-// Persistent: CTA i takes tiles i, i + gridDim.x, ... (M-tile fastest: the CTAs running at the same time
-// share the weight tiles in L2).
+// Persistent: CTA i takes tiles i, i + gridDim.x, ... (in the order of tile_mn).
 template <int kStages, int kOut, int kIn>
 __global__ void __launch_bounds__(kThreads) gemm_mma_kernel(const __grid_constant__ TmaDesc map_a,
                                                             const __grid_constant__ TmaDesc map_b,
@@ -421,7 +452,10 @@ __global__ void __launch_bounds__(kThreads) gemm_mma_kernel(const __grid_constan
   constexpr int kStage = kStageBytes<kIn>;
   const uint32_t epi = base + kStages * kStage, full = epi + kMmaWarps * kEpiBytes, empty = full + 8 * kStages;
   const uint32_t epi_bar = empty + 8 * kStages;  // kOutGlu: epi full [2] (the MMA warps arrive), epi empty [2]
-  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+  const int tid = threadIdx.x, lane = tid % 32;
+  // (as CUTLASS's canonical_warp_idx_sync: the compiler then knows the warp index and the role branches are
+  // warp-uniform, which the uniform stage arithmetic of the K loop needs)
+  const int warp = __shfl_sync(0xffffffffu, tid / 32, 0);
   constexpr bool kGlu = kOut == kOutGlu;
   const int mtiles = (p.M + kBM - 1) / kBM, ntiles = mtiles * ((p.N + kBN - 1) / kBN * (kGlu ? 2 : 1));
   const int ktiles = (p.K + kStageK<kIn> - 1) / kStageK<kIn>, steps = p.K / 64;
@@ -436,7 +470,9 @@ __global__ void __launch_bounds__(kThreads) gemm_mma_kernel(const __grid_constan
   if (warp == kMmaWarps + 1) {  // kOutGlu: the store warp
     if (kGlu && lane == 0) {
       for (int tile = blockIdx.x, it = 0; tile < ntiles; tile += gridDim.x, it++) {
-        const int m0 = (tile % mtiles) * kBM, n0 = (tile / mtiles) * (kBN / 2), b = it & 1;
+        int mi, ni;
+        tile_mn(tile, mtiles, ntiles / mtiles, p.gm, mi, ni);
+        const int m0 = mi * kBM, n0 = ni * (kBN / 2), b = it & 1;
         const uint32_t qb = epi + b * kGluEpiBytes;
         mbar_wait(epi_bar + 8 * b, (it >> 1) & 1);
         tma_store_2d(&map_d, qb, n0 / 2, m0);
@@ -452,26 +488,20 @@ __global__ void __launch_bounds__(kThreads) gemm_mma_kernel(const __grid_constan
     }
     return;
   }
-  if (warp == kMmaWarps) {  // producer
-    if (lane == 0) {
-      int s = 0;
-      uint32_t phase = 0;
-      for (int tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
-        const int mi = tile % mtiles, ni = tile / mtiles;
-        const uint8_t* sfa = p.a_sf + int64_t(mi) * steps * 512;
-        const uint8_t* sfb = p.b_sf + int64_t(ni) * steps * 512;
-        for (int kt = 0; kt < ktiles; kt++) {
-          mbar_wait(empty + 8 * s, phase ^ 1);
-          const uint32_t st = base + s * kStage, bar = full + 8 * s;
-          mbar_expect_tx(bar, kStage);
-          tma_2d(st, &map_a, kt * kRowBytes, mi * kBM, bar);
-          tma_2d(st + kTileBytes, &map_b, kt * kRowBytes, ni * kBN, bar);  // (kGlu: rows 128 ni = gate | up)
-          if (kIn == kInFp4) {
-            bulk_copy(st + 2 * kTileBytes, sfa + kt * kSfBytes, kSfBytes, bar);
-            bulk_copy(st + 2 * kTileBytes + kSfBytes, sfb + kt * kSfBytes, kSfBytes, bar);
-          }
-          if (++s == kStages) s = 0, phase ^= 1;
-        }
+  if (warp == kMmaWarps) {  // producer (the whole warp; one lane issues)
+    int s = 0;
+    uint32_t phase = 0;
+    for (int tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+      int mi, ni;
+      tile_mn(tile, mtiles, ntiles / mtiles, p.gm, mi, ni);
+      const uint8_t* sfa = p.a_sf + int64_t(mi) * steps * 512;
+      const uint8_t* sfb = p.b_sf + int64_t(ni) * steps * 512;
+      for (int kt = 0; kt < ktiles; kt++) {
+        mbar_wait(empty + 8 * s, phase ^ 1);
+        // (kGlu: B rows 128 ni = gate | up)
+        issue_stage<kIn == kInFp4>(base + s * kStage, full + 8 * s, kStage, &map_a, &map_b, kt * kRowBytes, mi * kBM,
+                                   ni * kBN, sfa + kt * kSfBytes, sfb + kt * kSfBytes);
+        if (++s == kStages) s = 0, phase ^= 1;
       }
     }
     return;
@@ -528,7 +558,8 @@ void launch(const TmaDesc& ma, const TmaDesc& mb, const TmaDesc& md, const MmaPa
     return n;
   }();
   const int tiles = (p.M + kBM - 1) / kBM * ((p.N + kBN - 1) / kBN * (kOut == kOutGlu ? 2 : 1));
-  const int grid = std::min(tiles, sms);  // (a grid of all tiles, 1 CTA per SM: +1.4-3.1%)
+  // (a grid of all tiles, 1 CTA per SM: +1.4-3.1%; as many tiles on every CTA, e.g. 154 x 5 for 768: the same)
+  const int grid = std::min(tiles, sms);
   gemm_mma_kernel<kStages, kOut, kIn><<<grid, kThreads, smem, s>>>(ma, mb, md, p);
   Q27_CUDA(cudaGetLastError());
 }
@@ -552,100 +583,47 @@ void run(const uint8_t* a, const uint8_t* b, const MmaParams& p, cudaStream_t s)
                        : kBf16 ? map_2d(p.d16, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, p.M, p.N, 16, 32, CU_TENSOR_MAP_SWIZZLE_64B)
                                : map_2d(p.d, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4, p.M, p.N, 16, 32, CU_TENSOR_MAP_SWIZZLE_128B);
   MmaParams q = p;
+  static const size_t l2 = [] {
+    int dev = 0, n = 0;
+    Q27_CUDA(cudaGetDevice(&dev));
+    Q27_CUDA(cudaDeviceGetAttribute(&n, cudaDevAttrL2CacheSize, dev));
+    return size_t(n);
+  }();
+  const size_t wbytes = size_t(kGlu ? 2 * p.N : p.N) * row_bytes;
+  q.gm = wbytes * 3 > l2 * 2 ? (p.M + kBM - 1) / kBM : 1;  // (attention q, 63 MB of 96: N fastest 3% faster)
   q.epi = !p.c || p.beta == 0.f ? kEpiStore : p.c == p.d && p.beta == 1.f ? kEpiAdd : kEpiLoadC;
   launch<kRingStages<kIn>, kOut, kIn>(ma, mb, md, q, s);
 }
 
 }  // namespace
 
-void gemm_fp4_mma(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-                  float alpha, const float* c, float beta, float* d, cudaStream_t s) {
+void gemm_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
+              float alpha, const float* c, float beta, float* d, cudaStream_t s) {
   run<kOutF32>(a, b, {M, N, K, a_sf, b_sf, alpha, beta, c, d, nullptr}, s);
 }
 
-void gemm_fp4_bf16_mma(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b,
-                       const uint8_t* b_sf, float alpha, bf16* d, cudaStream_t s) {
+void gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
+                   float alpha, bf16* d, cudaStream_t s) {
   run<kOutBf16>(a, b, {M, N, K, a_sf, b_sf, alpha, 0.f, nullptr, nullptr, d}, s);
 }
 
-void gemm_fp8_mma(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
-                  float* d, cudaStream_t s) {
-  run<kOutF32, kInFp8>(a, b, {M, N, K, nullptr, nullptr, alpha, beta, c, d, nullptr}, s);
-}
-
-void gemm_bf16_mma(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta,
-                   float* d, cudaStream_t s) {
-  run<kOutF32, kInBf16>(reinterpret_cast<const uint8_t*>(a), reinterpret_cast<const uint8_t*>(w),
-                        {M, N, K, nullptr, nullptr, alpha, beta, c, d, nullptr}, s);
-}
-
-void gemm_fp4_glu_mma(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
-                      const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
-                      uint8_t* q_sf, cudaStream_t s) {
-  MmaParams p{M, I, K, a_sf, gate_up_sf, alpha_gate, 0.f, nullptr, nullptr, nullptr};
-  p.alpha_up = alpha_up, p.out_scale = out_scale, p.q = q, p.sf = q_sf;
-  run<kOutGlu>(a, gate_up, p, s);
-}
-
-// The prefill GEMMs: the mma.sync kernels above, or gemm.cu's CUTLASS ones (builds with Q27_CUTLASS_GEMM only:
-// CUTLASS 3.x does not compile with MSVC). Q27_GEMM_CUTLASS = 1 (all), 0 (none) or a list of the types to run on
-// CUTLASS (fp4, fp8, bf16: "fp4,bf16"); read per call: A/B in one process. The results are bit-identical.
-#ifdef Q27_CUTLASS_GEMM
-static bool use_cutlass(const char* type) {
-  const char* e = getenv("Q27_GEMM_CUTLASS");
-  if (!e) e = Q27_GEMM_CUTLASS_DEFAULT;
-  if (*e >= '0' && *e <= '9') return atoi(e) != 0;
-  return strstr(e, type) != nullptr;
-}
-#endif
-
-void gemm_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-              float alpha, const float* c, float beta, float* d, void* workspace, size_t ws_bytes, cudaStream_t s) {
-#ifdef Q27_CUTLASS_GEMM
-  if (use_cutlass("fp4")) return gemm_fp4_cutlass(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, workspace, ws_bytes, s);
-#endif
-  gemm_fp4_mma(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, s);
-}
-
-void gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-                   float alpha, bf16* d, void* workspace, size_t ws_bytes, cudaStream_t s) {
-#ifdef Q27_CUTLASS_GEMM
-  if (use_cutlass("fp4")) return gemm_fp4_bf16_cutlass(M, N, K, a, a_sf, b, b_sf, alpha, d, workspace, ws_bytes, s);
-#endif
-  gemm_fp4_bf16_mma(M, N, K, a, a_sf, b, b_sf, alpha, d, s);
-}
-
 void gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
-              float* d, void* workspace, size_t ws_bytes, cudaStream_t s) {
-#ifdef Q27_CUTLASS_GEMM
-  if (use_cutlass("fp8")) return gemm_fp8_cutlass(M, N, K, a, b, alpha, c, beta, d, workspace, ws_bytes, s);
-#endif
-  gemm_fp8_mma(M, N, K, a, b, alpha, c, beta, d, s);
+              float* d, cudaStream_t s) {
+  run<kOutF32, kInFp8>(a, b, {M, N, K, nullptr, nullptr, alpha, beta, c, d, nullptr}, s);
 }
 
 void gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,
                cudaStream_t s) {
-#ifdef Q27_CUTLASS_GEMM
-  if (use_cutlass("bf16")) return gemm_bf16_cutlass(M, N, K, a, w, alpha, c, beta, d, s);
-#endif
-  gemm_bf16_mma(M, N, K, a, w, alpha, c, beta, d, s);
+  run<kOutF32, kInBf16>(reinterpret_cast<const uint8_t*>(a), reinterpret_cast<const uint8_t*>(w),
+                        {M, N, K, nullptr, nullptr, alpha, beta, c, d, nullptr}, s);
 }
 
-size_t gemm_workspace_bytes(int max_m) {
-#ifdef Q27_CUTLASS_GEMM
-  return gemm_cutlass_workspace_bytes(max_m);
-#else
-  (void)max_m;
-  return 0;  // (the mma.sync kernels need none)
-#endif
-}
-
-void gemm_workspace_init(void* workspace, size_t ws_bytes, cudaStream_t s) {
-#ifdef Q27_CUTLASS_GEMM
-  gemm_cutlass_workspace_init(workspace, ws_bytes, s);
-#else
-  (void)workspace, (void)ws_bytes, (void)s;
-#endif
+void gemm_fp4_glu(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
+                  const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
+                  uint8_t* q_sf, cudaStream_t s) {
+  MmaParams p{M, I, K, a_sf, gate_up_sf, alpha_gate, 0.f, nullptr, nullptr, nullptr};
+  p.alpha_up = alpha_up, p.out_scale = out_scale, p.q = q, p.sf = q_sf;
+  run<kOutGlu>(a, gate_up, p, s);
 }
 
 }  // namespace q27

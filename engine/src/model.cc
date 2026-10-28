@@ -123,8 +123,6 @@ Model::Model(const Options& opt) : opt_(opt) {
   size_t o_logits = f32("logits", L * kVocab);
   size_t o_tki = act_.add("topk ids", L * 64 * 4), o_tkl = f32("topk logp", L * 64);
   size_t o_u = f32("uniform", 1), o_sm = act_.add("sampled", 4);
-  ws_bytes_ = gemm_workspace_bytes(int(Tc));
-  size_t o_ws = act_.add("gemm workspace", ws_bytes_);
   size_t o_sws = act_.add("skinny workspace", kSkinnyWsBytes);
   size_t o_aws = act_.add("attention workspace", kAttnDecodeWsBytes);
   // NVFP4 KV (P7-8): the prefill attention reads the context rounded to E4M3 from here: V only (1 KiB / token)
@@ -265,8 +263,6 @@ Model::Model(const Options& opt) : opt_(opt) {
   logits_ = act_.at<float>(o_logits);
   topk_ids_ = act_.at<int32_t>(o_tki), topk_logp_ = act_.at<float>(o_tkl);
   uniform_ = act_.at<float>(o_u), sampled_ = act_.at<int32_t>(o_sm);
-  ws_ = act_.at<void>(o_ws);
-  gemm_workspace_init(ws_, ws_bytes_, s_);
   skinny_ws_ = act_.at<void>(o_sws);
   attn_ws_ = act_.at<void>(o_aws);
   if (fa_stage_bytes_) fa_stage_ = act_.at<void>(o_fst);
@@ -700,9 +696,10 @@ int Model::prefill_cut(int T, bool last) const {
 
 
 namespace {
-// Debug (Q27_SKINNY_CHECK=1): runs `cutlass` into a scratch buffer next to `skinny` and logs the difference.
+// Debug (Q27_SKINNY_CHECK=1): runs `many` (the many-row GEMM) into a scratch buffer next to `skinny` and logs the
+// difference.
 template <class FC, class FS>
-void check_skinny(const char* what, int T, int N, float* out, bool residual, cudaStream_t s, FC cutlass, FS skinny) {
+void check_skinny(const char* what, int T, int N, float* out, bool residual, cudaStream_t s, FC many, FS skinny) {
   static float *c0 = nullptr, *c1 = nullptr;
   if (!c0) {
     Q27_CUDA(cudaMalloc(&c0, size_t(8) * 248320 * 4));
@@ -710,7 +707,7 @@ void check_skinny(const char* what, int T, int N, float* out, bool residual, cud
   }
   size_t n = size_t(T) * N;
   Q27_CUDA(cudaMemcpyAsync(c0, out, n * 4, cudaMemcpyDeviceToDevice, s));
-  cutlass(residual ? c0 : nullptr, c1);
+  many(residual ? c0 : nullptr, c1);
   skinny();
   std::vector<float> a(n), b(n);
   Q27_CUDA(cudaMemcpyAsync(a.data(), c1, n * 4, cudaMemcpyDeviceToHost, s));
@@ -760,14 +757,14 @@ void Model::gemm_q(const char* what, const LinearFp8& l, int T, float* out, bool
     auto run = [&] { skinny_fp8(T, l.out, l.in, aq_, l.w, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_); };
     if (skinny_check_ && l.alpha.count == 1)
       check_skinny(what, T, l.out, out, residual, s_, [&](const float* cc, float* d) {
-        gemm_fp8(T, l.out, l.in, aq_, l.w, l.alpha.alpha[0], cc, cc ? 1.f : 0.f, d, ws_, ws_bytes_, s_);
+        gemm_fp8(T, l.out, l.in, aq_, l.w, l.alpha.alpha[0], cc, cc ? 1.f : 0.f, d, s_);
       }, run);
     else
       run();
     return;
   }
   Q27_CHECK(l.alpha.count == 1, std::string(what) + ": fused projections need the skinny path");
-  gemm_fp8(T, l.out, l.in, aq_, l.w, l.alpha.alpha[0], c, beta, out, ws_, ws_bytes_, s_);
+  gemm_fp8(T, l.out, l.in, aq_, l.w, l.alpha.alpha[0], c, beta, out, s_);
 }
 
 void Model::gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool residual) {
@@ -781,19 +778,19 @@ void Model::gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool
     };
     if (skinny_check_ && l.alpha.count == 1)
       check_skinny(what, T, l.out, out, residual, s_, [&](const float* cc, float* d) {
-        gemm_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha.alpha[0], cc, cc ? 1.f : 0.f, d, ws_, ws_bytes_, s_);
+        gemm_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha.alpha[0], cc, cc ? 1.f : 0.f, d, s_);
       }, run);
     else
       run();
     return;
   }
   Q27_CHECK(l.alpha.count == 1, std::string(what) + ": fused projections need the skinny path");
-  gemm_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha.alpha[0], c, beta, out, ws_, ws_bytes_, s_);
+  gemm_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha.alpha[0], c, beta, out, s_);
 }
 
 // Up to 8 tokens (decode, speculative verify) run the fused projections (qkv|z, q|k|v, gate|up) on the
 // skinny path; their outputs are rows of the concatenation, so the parts are offsets with the fused
-// row stride. Larger chunks run the projections separately (CUTLASS).
+// row stride. Larger chunks run the projections separately (the many-row GEMMs).
 // Fused projections (strided outputs: decode-style attention). A batched verify (up to 64 rows, Phase 7)
 // takes them too: its rows must run the GEMMs of a single sequence's verify (another shape splits K
 // differently).
@@ -963,10 +960,10 @@ void Model::mlp(int i, int T) {
     auto* qsf = reinterpret_cast<uint8_t*>(big2_);
     mark("mlp gate_up+silu");
     if (!skip("gemm") && !skip("gemm4"))
-      gemm_fp4_glu_mma(T, kInter, kHidden, aq_, asf_, L.gate_up.w, L.gate_up.sf, ag, au, L.down.in_scale, q, qsf, s_);
+      gemm_fp4_glu(T, kInter, kHidden, aq_, asf_, L.gate_up.w, L.gate_up.sf, ag, au, L.down.in_scale, q, qsf, s_);
     mark("mlp down");
     if (!skip("gemm") && !skip("gemm4"))
-      gemm_fp4(T, kHidden, kInter, q, qsf, L.down.w, L.down.sf, L.down.alpha.alpha[0], x_, 1.f, x_, ws_, ws_bytes_, s_);
+      gemm_fp4(T, kHidden, kInter, q, qsf, L.down.w, L.down.sf, L.down.alpha.alpha[0], x_, 1.f, x_, s_);
     return;
   }
   if (mlp_bf16_ && T > kSkinnyMaxM && !fused(T)) {
@@ -974,7 +971,7 @@ void Model::mlp(int i, int T) {
     bf16* gu = reinterpret_cast<bf16*>(big1_);
     mark("mlp gate_up");
     if (!skip("gemm") && !skip("gemm4"))
-      gemm_fp4_bf16(T, L.gate_up.out, L.gate_up.in, aq_, asf_, L.gate_up.w, L.gate_up.sf, 1.f, gu, ws_, ws_bytes_, s_);
+      gemm_fp4_bf16(T, L.gate_up.out, L.gate_up.in, aq_, asf_, L.gate_up.w, L.gate_up.sf, 1.f, gu, s_);
     mark("mlp silu+quant");
     if (!skip("silu")) silu_mul_quant_fp4_glu(gu, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
   } else {

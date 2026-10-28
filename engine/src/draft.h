@@ -103,7 +103,7 @@ class Draft {
                const Lookup& lk, cudaStream_t s);
   // Context K/V for `rows` target rows whose BF16 features (layers 5..61) are in cap [rows][25600], at
   // positions *pos + pos_add + r; only rows < *n_dev (if n_dev) are written. More than 8 rows go through
-  // CUTLASS with the weights dequantized into `scratch` (BF16 slices).
+  // the BF16 GEMM with the weights dequantized into `scratch` (BF16 slices).
   // rowmap (optional, <= 8 rows): row r of the context is cap row rowmap[r] (the accepted tree path).
   void append_ctx(const bf16* cap, int rows, const int32_t* pos, int pos_add, const int32_t* n_dev, void* ws,
                   size_t ws_bytes, void* scratch, size_t scratch_bytes, cudaStream_t s,
@@ -239,7 +239,7 @@ void draft_quant_weight(const bf16* w, int n, int K, DraftQuant fmt, const DLine
 // Rows ids[0..n) of an NVFP4 head [V][K] (packed values + swizzled block scales) into a compact head [n][K].
 void draft_gather_head(const uint8_t* w, const uint8_t* sf, const int32_t* ids, int n, int K, uint8_t* dw, uint8_t* dsf,
                        cudaStream_t s);
-// Rows row0 .. row0 + n of a quantized layer back to BF16 [n][K] (prompt context through CUTLASS).
+// Rows row0 .. row0 + n of a quantized layer back to BF16 [n][K] (prompt context through the BF16 GEMM).
 void draft_dequant_weight(const DLinear& l, DraftQuant fmt, int row0, int n, bf16* out, cudaStream_t s);
 
 }  // namespace q27

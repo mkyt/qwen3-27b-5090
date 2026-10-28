@@ -377,8 +377,8 @@ int q27t_silu_mul_quant_fp4_glu_bf16(const bf16* gu, int T, int I, float ag, flo
   return kernel([&] { silu_mul_quant_fp4_glu(gu, T, I, ag, au, in_scale, q, sf, ts()); });
 }
 int q27t_gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-                       float alpha, bf16* d, void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_fp4_bf16(M, N, K, a, a_sf, b, b_sf, alpha, d, ws, ws_bytes, ts()); });
+                       float alpha, bf16* d) {
+  return kernel([&] { gemm_fp4_bf16(M, N, K, a, a_sf, b, b_sf, alpha, d, ts()); });
 }
 int q27t_linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T, int N, int K, float* oa, float* ob) {
   return kernel([&] { linear_bf16_pair(x, wa, wb, T, N, K, oa, ob, ts()); });
@@ -391,41 +391,17 @@ int q27t_swizzle_sf_glu(const uint8_t* src, int rows, int kblocks, uint8_t* dst,
 }
 int64_t q27t_sf_bytes(int64_t rows, int64_t kblocks) { return sf_bytes(rows, kblocks); }
 int q27t_gemm_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-                  float alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_fp4(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, ws, ws_bytes, ts()); });
+                  float alpha, const float* c, float beta, float* d) {
+  return kernel([&] { gemm_fp4(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, ts()); });
 }
-int q27t_gemm_fp4_mma(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b,
-                      const uint8_t* b_sf, float alpha, const float* c, float beta, float* d) {
-  return kernel([&] { gemm_fp4_mma(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, ts()); });
-}
-int q27t_gemm_fp4_glu_mma(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
-                          const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
-                          uint8_t* q_sf) {
-  return kernel([&] { gemm_fp4_glu_mma(M, I, K, a, a_sf, gate_up, gate_up_sf, alpha_gate, alpha_up, out_scale, q, q_sf, ts()); });
-}
-int q27t_gemm_fp4_bf16_mma(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b,
-                           const uint8_t* b_sf, float alpha, bf16* d) {
-  return kernel([&] { gemm_fp4_bf16_mma(M, N, K, a, a_sf, b, b_sf, alpha, d, ts()); });
+int q27t_gemm_fp4_glu(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
+                      const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
+                      uint8_t* q_sf) {
+  return kernel([&] { gemm_fp4_glu(M, I, K, a, a_sf, gate_up, gate_up_sf, alpha_gate, alpha_up, out_scale, q, q_sf, ts()); });
 }
 int q27t_gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
-                  float* d, void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_fp8(M, N, K, a, b, alpha, c, beta, d, ws, ws_bytes, ts()); });
-}
-int q27t_gemm_fp8_mma(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
-                      float* d) {
-  return kernel([&] { gemm_fp8_mma(M, N, K, a, b, alpha, c, beta, d, ts()); });
-}
-// 1 when the CUTLASS prefill GEMMs are built in (Q27_GEMM_CUTLASS=1 selects them).
-int q27t_gemm_cutlass() {
-#ifdef Q27_CUTLASS_GEMM
-  return 1;
-#else
-  return 0;
-#endif
-}
-size_t q27t_gemm_workspace_bytes() { return gemm_workspace_bytes(0); }
-int q27t_gemm_workspace_init(void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_workspace_init(ws, ws_bytes, ts()); });
+                  float* d) {
+  return kernel([&] { gemm_fp8(M, N, K, a, b, alpha, c, beta, d, ts()); });
 }
 int q27t_skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                     float alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
@@ -436,9 +412,9 @@ int q27t_skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, flo
   return kernel([&] { skinny_fp8(M, N, K, a, w, AlphaSegments::one(alpha), c, beta, d, ws, ws_bytes, ts()); });
 }
 // Microbenchmark: average time (us) of `iters` calls, cycling through `nbuf` weight copies spaced
-// w_stride / sf_stride bytes apart (to defeat L2). fp4 != 0: skinny_fp4, else skinny_fp8;
-// cutlass == 1: the CUTLASS kernel instead (builds with Q27_CUTLASS_GEMM), cutlass == 2: the mma.sync one.
-int q27t_bench_gemm(int fp4, int cutlass, int M, int N, int K, const uint8_t* a, const uint8_t* a_sf,
+// w_stride / sf_stride bytes apart (to defeat L2). fp4 != 0: skinny_fp4, else skinny_fp8; many != 0: the many-row
+// GEMM (gemm_fp4 / gemm_fp8) instead.
+int q27t_bench_gemm(int fp4, int many, int M, int N, int K, const uint8_t* a, const uint8_t* a_sf,
                     const uint8_t* w, const uint8_t* w_sf, int64_t w_stride, int64_t sf_stride, int nbuf, int iters,
                     float* d, void* ws, size_t ws_bytes, float* us) {
   return kernel([&] {
@@ -448,14 +424,8 @@ int q27t_bench_gemm(int fp4, int cutlass, int M, int N, int K, const uint8_t* a,
     auto run = [&](int i) {
       const uint8_t* wi = w + (i % nbuf) * w_stride;
       const uint8_t* si = w_sf ? w_sf + (i % nbuf) * sf_stride : nullptr;
-      if (fp4 && cutlass == 2) gemm_fp4_mma(M, N, K, a, a_sf, wi, si, 1.f, nullptr, 0.f, d, ts());
-      else if (cutlass == 2) gemm_fp8_mma(M, N, K, a, wi, 1.f, nullptr, 0.f, d, ts());
-#ifdef Q27_CUTLASS_GEMM
-      else if (fp4 && cutlass) gemm_fp4_cutlass(M, N, K, a, a_sf, wi, si, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts());
-      else if (cutlass) gemm_fp8_cutlass(M, N, K, a, wi, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts());
-#else
-      else if (cutlass) Q27_CHECK(false, "q27t_bench_gemm: built without the CUTLASS GEMMs");
-#endif
+      if (fp4 && many) gemm_fp4(M, N, K, a, a_sf, wi, si, 1.f, nullptr, 0.f, d, ts());
+      else if (many) gemm_fp8(M, N, K, a, wi, 1.f, nullptr, 0.f, d, ts());
       else if (fp4) skinny_fp4(M, N, K, a, a_sf, wi, si, AlphaSegments::one(1.f), nullptr, 0.f, d, ws, ws_bytes, ts());
       else skinny_fp8(M, N, K, a, wi, AlphaSegments::one(1.f), nullptr, 0.f, d, ws, ws_bytes, ts());
     };
@@ -526,16 +496,10 @@ int q27t_skinny_bf16(int M, int N, int K, const bf16* a, const bf16* w, float* d
 int q27t_gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float* d) {
   return kernel([&] { gemm_bf16(M, N, K, a, w, 1.f, nullptr, 0.f, d, ts()); });
 }
-// The general form (C, beta) on the own kernel or, with cutlass != 0, CUTLASS's (builds with Q27_CUTLASS_GEMM).
+// The general form (C, beta).
 int q27t_gemm_bf16_ex(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta,
-                      float* d, int cutlass) {
-  return kernel([&] {
-#ifdef Q27_CUTLASS_GEMM
-    if (cutlass) return gemm_bf16_cutlass(M, N, K, a, w, alpha, c, beta, d, ts());
-#endif
-    Q27_CHECK(!cutlass, "q27t_gemm_bf16_ex: built without the CUTLASS GEMMs");
-    gemm_bf16_mma(M, N, K, a, w, alpha, c, beta, d, ts());
-  });
+                      float* d) {
+  return kernel([&] { gemm_bf16(M, N, K, a, w, alpha, c, beta, d, ts()); });
 }
 // GDN verify of T tokens on one layer: ptrs of the two input buffers (raw, k, v, ab each), the parity and the
 // commit count of the previous verify (device ints).

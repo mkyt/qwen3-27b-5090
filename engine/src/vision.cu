@@ -1,7 +1,7 @@
 // Vision tower (P4-12, see vision.h and reference/qwen27b/vision.py).
 //
 // Per image of P patches: patch embed (a GEMM on the flattened patches) + the bilinearly resampled position
-// table, 27 pre-LN blocks, the 2x2 merger. GEMMs are gemm_bf16 (CUTLASS, fp32 out); rows are processed in
+// table, 27 pre-LN blocks, the 2x2 merger. GEMMs are gemm_bf16 (fp32 out); rows are processed in
 // chunks of kRows where a GEMM needs a wide temporary. Attention is non-causal over the image's patches:
 // a flash-attention kernel with BF16 mma.sync, head_dim 72 padded to 80 in shared memory.
 //

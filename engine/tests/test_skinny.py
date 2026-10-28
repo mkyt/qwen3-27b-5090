@@ -167,13 +167,13 @@ def test_bench(capsys):
             d = torch.empty(M, N, device=dev)
             ws = torch.zeros(WS, dtype=torch.uint8, device=dev)
             res = []
-            for cutlass in (0, 1 if lib().q27t_gemm_cutlass() else 2):
+            for many in (0, 1):
                 us = ctypes.c_float()
-                call("q27t_bench_gemm", fp4, cutlass, M, N, K, a, asf, w, wsf, wbytes, max(sfb, 1), nbuf, 50, d, ws,
+                call("q27t_bench_gemm", fp4, many, M, N, K, a, asf, w, wsf, wbytes, max(sfb, 1), nbuf, 50, d, ws,
                      WS, ctypes.addressof(us))
                 res.append(us.value)
             gbs = (wbytes + sfb) / (res[0] * 1e-6) / 1e9
             lines.append(f"{'fp4' if fp4 else 'fp8'} M={M} N={N} K={K}: skinny {res[0]:.1f} us ({gbs:.0f} GB/s), "
-                         f"{'cutlass' if lib().q27t_gemm_cutlass() else 'mma'} {res[1]:.1f} us")
+                         f"many-row {res[1]:.1f} us")
     with capsys.disabled():
         print("\n" + "\n".join(lines))

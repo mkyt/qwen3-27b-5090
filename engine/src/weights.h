@@ -1,4 +1,4 @@
-// Target model weights on the GPU (checkpoint layout, NVFP4 scale factors swizzled for CUTLASS) and
+// Target model weights on the GPU (checkpoint layout, NVFP4 scale factors in the CUTLASS SM1xx swizzled layout) and
 // the embedding table in pinned host memory (read through UVA).
 #pragma once
 

@@ -50,5 +50,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # (CUTLASS kernels take a few GB of RAM each to compile; the runner has 16 GB)
+          # (the largest CUDA files take a few GB of RAM each to compile; the runner has 16 GB)
           build-args: BUILD_JOBS=3

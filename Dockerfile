@@ -1,21 +1,15 @@
 # syntax=docker/dockerfile:1
 # The serving image: libq27.so built in the CUDA devel image, then only the CUDA runtime, Python and the server's
-# four packages (frontend/requirements.txt). No compiler, CUTLASS or PyTorch at runtime (dev/Dockerfile has those,
-# for development). Published as ghcr.io/mkyt/qwen3-27b-5090 (.github/workflows/image.yml); built here by
+# four packages (frontend/requirements.txt). No compiler or PyTorch at runtime (dev/Dockerfile has those, for
+# development). Published as ghcr.io/mkyt/qwen3-27b-5090 (.github/workflows/image.yml); built here by
 # `docker compose up -d --build serve`.
 
 FROM ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 AS uv
 
 FROM nvidia/cuda:13.3.0-devel-ubuntu24.04@sha256:ef2203909e80b8b976cfc672f7e2ae2b00bc0e25c404ee86d89e10a3802f1c52 AS build
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git cmake ninja-build ca-certificates \
+ && apt-get install -y --no-install-recommends cmake ninja-build \
  && rm -rf /var/lib/apt/lists/*
-# CUTLASS / CuTe headers, the same commit as dev/Dockerfile.
-ARG CUTLASS_COMMIT=098de2a652cf8f00fd70b2df54051c7eccbb855a
-RUN git clone --filter=blob:none --no-checkout https://github.com/NVIDIA/cutlass /opt/cutlass \
- && git -C /opt/cutlass checkout -q ${CUTLASS_COMMIT} \
- && rm -rf /opt/cutlass/.git
-ENV CUTLASS_DIR=/opt/cutlass
 COPY engine /src/engine
 # Parallel compile jobs (empty: one per CPU); the GitHub workflow limits them to fit the runner's RAM.
 ARG BUILD_JOBS=

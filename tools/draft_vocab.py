@@ -144,6 +144,8 @@ CODE_DIRS = [  # (directory, suffixes): source code in the dev image and the ext
     (ROOT / "cache/sglang-src", (".py",)),
     (pathlib.Path("/opt/venv/lib/python3.12/site-packages/transformers"), (".py",)),
     (pathlib.Path("/opt/venv/lib/python3.12/site-packages/torch"), (".py",)),
+    # (CUTLASS v4.8.0's headers were in the dev image when the published vocabulary was built; the engine no longer
+    # uses CUTLASS and the image no longer has them, so a rebuild skips this entry)
     (pathlib.Path("/opt/cutlass/include"), (".h", ".hpp", ".cuh")),
     (ROOT / "engine", (".cu", ".cc", ".h", ".cuh", ".py")),
     (ROOT / "reference", (".py",)),
