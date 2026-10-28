@@ -141,7 +141,7 @@ All default to the faster setting. Except those marked static, they can be switc
 | --- | --- |
 | `Q27_PROFILE=1` | GPU time per operation, also inside CUDA graphs (`Engine.profile_dump()`) |
 | `Q27_NO_GRAPH=1` / `Q27_NO_PDL=1` / `Q27_NO_SKINNY=1` | Disable CUDA graphs / programmatic dependent launch / the skinny GEMMs |
-| `Q27_SKINNY_CHECK=1` | Compare the skinny GEMMs with CUTLASS and log the difference |
+| `Q27_SKINNY_CHECK=1` | Compare the skinny GEMMs with the prefill GEMMs and log the difference |
 | `Q27_SKINNY_EXACT=1` | Make a row's skinny-GEMM result independent of M (tests of tree verification and preemption) |
 | `Q27_SKINNY_EXT_REDUCE_M` | Rows from which the skinny GEMM's split-K reduction runs as a separate kernel (default 1: M >= 2; at M = 1 the last CTA reduces; same result; P7-4) |
 | `Q27_DRAFT_ATTN_TC=0` | The draft's attention on CUDA cores (default: tensor cores; P7-4) |
@@ -154,9 +154,10 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_PAGES_HIGH=1` | Hand out KV pages from the top (tests, P7-13): the KV cache then occupies the parking areas, so every park moves pages. Read at startup |
 | `Q27_ATTN_PREFILL_TC=0` | Prefill attention on CUDA cores (static) |
 | `Q27_GDN_CHUNK=0` | Sequential GDN in prefill (static) |
-| `Q27_MLP_FUSED=0` | Prefill MLP: gate \| up as a BF16 CUTLASS GEMM, then SiLU and NVFP4 quantization in a separate kernel. Default 1: one GEMM (`gemm_mma.cu`) whose epilogue writes silu(gate) * up as the down GEMM's NVFP4 activations (prefill +2% at 19K / 73K, P5-12) |
+| `Q27_MLP_FUSED=0` | Prefill MLP: gate \| up as a BF16-output GEMM, then SiLU and NVFP4 quantization in a separate kernel. Default 1: one GEMM (`gemm_mma.cu`) whose epilogue writes silu(gate) * up as the down GEMM's NVFP4 activations (prefill +2% at 19K / 73K, P5-12) |
 | `Q27_MLP_BF16=0` | With `Q27_MLP_FUSED=0`: fp32 outputs for the prefill MLP's gate \| up |
-| `Q27_GEMM_MXFP8=0` | Prefill FP8 GEMMs with the plain FP8 CUTLASS kernel (default: block-scaled MXFP8 with unit scales, bit-identical, P5-11; read per call) |
+| `Q27_GEMM_CUTLASS=1` / `0` / `fp4,fp8,bf16` | Many-row GEMMs (prefill NVFP4 and its BF16-output form, E4M3; BF16 for the draft context and vision) on CUTLASS (`gemm.cu` SM120, `gemm_bf16.cu` 2.x) for all, none or the listed types; the others run the engine's own `mma.sync` kernels (`gemm_mma.cu`). Default 1 in builds with CUTLASS (prefill 0.2-0.6% faster than all own kernels at 19K / 73K); builds without it (`-DQ27_CUTLASS_GEMM=OFF`, required on Windows) always use the own kernels. Both produce bit-identical results (P5-12; read per call) |
+| `Q27_GEMM_MXFP8=0` | Prefill FP8 GEMMs on CUTLASS with the plain FP8 kernel (default: block-scaled MXFP8 with unit scales, bit-identical, P5-11; read per call) |
 | `Q27_SPEC_PATHS=K` | Paths of tree verification (default 1 = a chain; 2 / 4 accept more but take longer and break even) |
 | `Q27_LOOKUP=1` | Lookup drafting (off: no gain with the 8-row chain) |
 | `Q27_SPEC_PIPELINE=0` | Enqueue a speculative step after reading the previous result (default 1: before) |

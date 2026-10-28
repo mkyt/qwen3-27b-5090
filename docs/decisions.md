@@ -254,6 +254,17 @@ gate without an explicit decision, recorded below with its numbers.
   at 19K / 73K is 2.2 / 1.7% faster and uses 2.1% less energy per token than the BF16 path. Quality against it:
   GSM8K 95.3 / 95.3%, BFCL 88.9 / 89.1%, Japanese reference scores within their CIs (JSQuAD F1 +1.6), needles at
   256K 56 / 58 of 64, KL to the BF16 original 0.0470 / 0.0454.
+- **P5-12: own GEMMs for every many-row GEMM; CUTLASS optional.** `gemm_mma.cu` now also runs E4M3 (the block-scaled
+  MMA with unit scales) and BF16 (the draft's context, vision; any N and K through TMA's edge handling) with the same
+  tiles and epilogue: the m16n8k32 E4M3 and m16n8k16 BF16 fragments hold the same bytes per K step as the NVFP4 k64
+  ones. Results are bit-identical to CUTLASS. CUTLASS (SM120 3.x and the 2.x BF16 kernel) is built with
+  `-DQ27_CUTLASS_GEMM=ON` (default; off for MSVC, which cannot compile CuTe) and chosen per call with
+  `Q27_GEMM_CUTLASS` (default 1 in such builds). At 400 W the own E4M3 GEMM is 1.5-5.6% faster than CUTLASS's MXFP8
+  one; the own NVFP4 and BF16 GEMMs are 1-3% slower: same L2 traffic and active cycles at a fixed clock, but more
+  power per cycle, so a lower clock at the power limit. Two changes closed part of the gap: a suspend-time hint on
+  the mbarrier waits (as CUTLASS's; spinning waits were ~20% of the instructions) and a 2 KiB epilogue staging per
+  warp (one more ring stage). The fused MLP GEMM's epilogue dropped denormal handling it never needs (ftz exp2 and
+  reciprocal, a branch-free division by 6; bit-identical): -28% of its instructions, -0.9% time.
 - **Not done: FP4 attention for P V (SageAttention3 style), a megakernel.** See [Not done](#not-done).
 
 ## Vision

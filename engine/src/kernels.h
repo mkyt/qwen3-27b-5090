@@ -108,9 +108,11 @@ inline int64_t sf_bytes(int64_t rows, int64_t kblocks) {
   return ((rows + 127) / 128) * 128 * ((kblocks + 3) / 4) * 4;
 }
 
-// ---------------------------------------------------------------- GEMM (gemm.cu, CUTLASS SM120)
+// ---------------------------------------------------------------- GEMM (prefill: gemm_mma.cu; gemm.cu CUTLASS SM120)
 
 // D[M][N] = alpha * A[M][K] . B[N][K]^T + beta * C[M][N] (fp32, row-major; C may alias D or be null).
+// The mma.sync kernels (gemm_mma.cu: N and K multiples of 128), or with Q27_GEMM_CUTLASS=1 in a build with
+// Q27_CUTLASS_GEMM the CUTLASS ones (gemm.cu, which use the workspace).
 void gemm_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
               float alpha, const float* c, float beta, float* d, void* workspace, size_t ws_bytes, cudaStream_t s);
 // The same with BF16 output (no C).
@@ -118,21 +120,40 @@ void gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, c
                    float alpha, bf16* d, void* workspace, size_t ws_bytes, cudaStream_t s);
 void gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
               float* d, void* workspace, size_t ws_bytes, cudaStream_t s);
-// The NVFP4 GEMMs on mma.sync (gemm_mma.cu): no workspace; N and K multiples of 128.
+// The GEMM workspace (0 bytes without CUTLASS) and its initialization (the CUTLASS MXFP8 unit scales).
+size_t gemm_workspace_bytes(int max_m);
+void gemm_workspace_init(void* workspace, size_t ws_bytes, cudaStream_t s);
+// The mma.sync GEMMs (gemm_mma.cu): no workspace; N and K multiples of 128.
 void gemm_fp4_mma(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
                   float alpha, const float* c, float beta, float* d, cudaStream_t s);
 void gemm_fp4_bf16_mma(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b,
                        const uint8_t* b_sf, float alpha, bf16* d, cudaStream_t s);
+void gemm_fp8_mma(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
+                  float* d, cudaStream_t s);
+void gemm_bf16_mma(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta,
+                   float* d, cudaStream_t s);
 // The MLP's gate | up GEMM with silu(gate) * up NVFP4-quantized in the epilogue: gate_up is the [2 I][K]
 // weight (gate rows, then up rows; scales likewise), q [M][I / 2] and q_sf (swizzled) the down GEMM's
 // activations, quantized with the global scale out_scale (I a multiple of 128).
 void gemm_fp4_glu_mma(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
                       const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
                       uint8_t* q_sf, cudaStream_t s);
-size_t gemm_workspace_bytes(int max_m);
-// Fills the MXFP8 unit scales of a workspace of gemm_workspace_bytes (gemm_fp8 then runs block-scaled).
-void gemm_workspace_init(void* workspace, size_t ws_bytes, cudaStream_t s);
-// BF16 x BF16 -> fp32 for many rows (gemm_bf16.cu): D[M][N] = alpha * A[M][K] . W[N][K]^T + beta * C.
+#ifdef Q27_CUTLASS_GEMM
+// The CUTLASS kernels (gemm.cu). The FP8 one runs block-scaled MXFP8 when the workspace was initialized by
+// gemm_cutlass_workspace_init (unit scales at its end).
+void gemm_fp4_cutlass(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b,
+                      const uint8_t* b_sf, float alpha, const float* c, float beta, float* d, void* workspace,
+                      size_t ws_bytes, cudaStream_t s);
+void gemm_fp4_bf16_cutlass(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b,
+                           const uint8_t* b_sf, float alpha, bf16* d, void* workspace, size_t ws_bytes, cudaStream_t s);
+void gemm_fp8_cutlass(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
+                      float* d, void* workspace, size_t ws_bytes, cudaStream_t s);
+size_t gemm_cutlass_workspace_bytes(int max_m);
+void gemm_cutlass_workspace_init(void* workspace, size_t ws_bytes, cudaStream_t s);
+void gemm_bf16_cutlass(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta,
+                       float* d, cudaStream_t s);
+#endif
+// BF16 x BF16 -> fp32 for many rows (gemm_mma.cu, or CUTLASS 2.x with Q27_GEMM_CUTLASS; N and K multiples of 8): D[M][N] = alpha * A[M][K] . W[N][K]^T + beta * C.
 void gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,
                cudaStream_t s);
 

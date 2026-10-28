@@ -49,8 +49,8 @@ attention layers (every fourth layer). Hidden size 5120, MLP 17408, vocabulary 2
 loops at 2,014 TFLOPS (NVFP4), 1,007 TFLOPS (FP8 as block-scaled `mxf8f6f4`; the plain FP8 MMA with FP32
 accumulation runs at half that rate) and 253 TFLOPS (BF16) (`micro/`). SM120 has the warp-level `mma.sync`
 instructions with block scales, but not the `tcgen05` / TMEM / `wgmma` of data-center Blackwell and Hopper, so
-kernels written for those GPUs do not run; the engine uses CUTLASS's SM120 GEMMs for prefill and its own kernels
-for the rest.
+kernels written for those GPUs do not run; the engine's kernels, prefill GEMMs included, are its own (CUTLASS's
+SM120 GEMMs remain as an optional comparison).
 
 At 400 W, compute-bound work runs at the power limit: an FP4 GEMM holds the SM clock at about 1.8 GHz. Prefill
 speed is therefore set by energy per FLOP, which favors the FP4 and FP8 tensor cores over BF16. Decode is
@@ -219,10 +219,14 @@ on Japanese prose (a property of the draft model, also seen in other engines).
 
 Prefill runs in chunks of 2,048 tokens through the same weights.
 
-- **GEMMs**: CUTLASS's SM120 block-scaled GEMMs with 128 x 128 x 128 tiles: FP4 for the MLP and the GDN
-  projections, and for FP8 the block-scaled MXFP8 kernel with unit scales (P5-11), which is bit-identical to the
-  plain FP8 GEMM and twice as fast on this GPU. Other tiles and splits made no difference: the GEMMs run at the
-  power limit (P5-3).
+- **GEMMs** (`gemm_mma.cu`, P5-12): the engine's own kernels on `mma.sync` with 128 x 128 tiles, TMA loads into a
+  ring of shared-memory stages filled by a producer warp, 8 MMA warps and TMA stores (or TMA reduce-adds for the
+  residual) in the epilogue. NVFP4 reads the swizzled block scales in place; E4M3 runs the block-scaled MXFP8 MMA
+  with unit scales (P5-11: bit-identical to the plain FP8 MMA and twice as fast on this GPU); BF16 (draft context,
+  vision) any N and K. The MLP's gate | up GEMM writes silu(gate) * up NVFP4-quantized from its epilogue. Results
+  are bit-identical to CUTLASS's SM120 kernels, which builds with CUTLASS still use for the plain NVFP4 GEMMs by
+  default (`Q27_GEMM_CUTLASS`: 1-3% faster on those shapes at 400 W; the own E4M3 GEMM is 1.5-5.6% faster than
+  CUTLASS's). Other tiles and splits made no difference: the GEMMs run at the power limit (P5-3).
 - **Attention** (`attention.cu`, flash attention on tensor cores, `Q27_ATTN_FP8`):
   - FP8 KV cache (mode 2): Q K^T and P V on FP8 MMAs; K and V as stored, Q with a per-row scale, P scaled by 256
     into E4M3. Exponentials in f16x2 with base 2, masking only on the diagonal chunk (P5-10).

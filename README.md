@@ -181,7 +181,9 @@ with), with an FP8 KV cache (`ref-gpu-kvfp8`, the noise floor), the BF16 origina
 
 ## Tests
 
-The `dev` image (dev/Dockerfile: the CUDA toolkit, CUTLASS, PyTorch) builds the engine and runs the tests; `dev-cpu` is the same image without the GPU. Unit tests:
+The `dev` image (dev/Dockerfile: the CUDA toolkit, CUTLASS, PyTorch) builds the engine and runs the tests; `dev-cpu` is the same image without the GPU. The prefill GEMMs are the engine's own (`engine/src/gemm_mma.cu`, on
+`mma.sync` and TMA); CUTLASS's SM120 kernels (`gemm.cu`, `gemm_bf16.cu`) are built alongside for comparison (`Q27_GEMM_CUTLASS`,
+[docs/configuration.md](docs/configuration.md)) and can be left out with `-DQ27_CUTLASS_GEMM=OFF`, which a Windows (MSVC) build needs. Unit tests:
 
 ```bash
 docker compose --profile dev run --rm dev-cpu python -m pytest -q frontend/tests                # server: parsing, admission (seconds)

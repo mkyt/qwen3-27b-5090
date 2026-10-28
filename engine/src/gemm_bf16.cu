@@ -19,7 +19,7 @@ using Bf16Gemm = cutlass::gemm::device::Gemm<
 
 }  // namespace
 
-void gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,
+void gemm_bf16_cutlass(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,
                cudaStream_t s) {
   if (M == 0) return;
   using E = cutlass::bfloat16_t;
