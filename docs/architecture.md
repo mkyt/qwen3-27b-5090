@@ -88,8 +88,9 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
   The server does not use it either, nor transformers: the tokenizer is `tokenizers` on the checkpoint's
   `tokenizer.json`, the chat template renders with jinja2 as transformers sets it up, and images are
   preprocessed with PIL and numpy (`frontend/requirements.txt`; `frontend/tests/test_tokenizer.py` compares
-  prompts, ids and image grids with transformers). The serving image (`Dockerfile`) is therefore 1.2 GB: the CUDA
-  runtime, `libq27.so`, Python and those packages.
+  prompts, ids and image grids with transformers). The serving image (`Dockerfile`) is therefore 350 MB: Ubuntu, the
+  CUDA runtime library, `libq27.so`, Python and those packages (1.21 GB on the nvidia/cuda base image, 456 MB of it
+  the forward-compatibility driver package, which GeForce GPUs do not use).
 - **The scheduler is Python.** A speculative step takes 12 to 25 ms; the scheduler's decisions take microseconds by
   comparison, and the engine queues the next step before the host reads the previous one ([§6](#6-a-decode-step)).
 

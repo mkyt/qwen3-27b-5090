@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
-# The serving image: libq27.so built in the CUDA devel image, then only the CUDA runtime, Python and the server's
-# four packages (frontend/requirements.txt). No compiler or PyTorch at runtime (dev/Dockerfile has those, for
-# development). Published as ghcr.io/mkyt/qwen3-27b-5090 (.github/workflows/image.yml); built here by
+# The serving image: libq27.so built in the CUDA devel image, then plain Ubuntu with the CUDA runtime library
+# (libcudart, the engine's only CUDA dependency; the driver comes from the NVIDIA container runtime), Python and the
+# server's packages (frontend/requirements.txt). No compiler or PyTorch at runtime (dev/Dockerfile has those, for
+# development). (On the nvidia/cuda base image it was 1.21 GB, 456 MB of it the forward-compatibility driver
+# package, which GeForce GPUs cannot use.) Published as ghcr.io/mkyt/qwen3-27b-5090 (.github/workflows/image.yml); built here by
 # `docker compose up -d --build serve`.
 
 FROM ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 AS uv
@@ -19,7 +21,11 @@ RUN --mount=type=cache,target=/build \
  && cmake --build /build --target q27 ${BUILD_JOBS:+-j $BUILD_JOBS} \
  && install -D /build/libq27.so /opt/q27/libq27.so
 
-FROM nvidia/cuda:13.3.0-base-ubuntu24.04@sha256:bcf7d05f0b13b9bbb86d9a4cd039d331894b8f1145ad009d1af75023bcd1dc5c
+# Python and the packages, without uv itself in the image. --no-deps: requirements.txt lists every package the server
+# imports (tokenizers' huggingface_hub, with httpx, hf_xet and others, is never used: the server reads tokenizer.json).
+# The standalone Python's parts the server does not need go: the embedding library (the interpreter is static),
+# Tcl/Tk, IDLE, ensurepip and pip, headers, manuals.
+FROM ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c AS python
 COPY --from=uv /uv /usr/local/bin/
 ENV UV_PYTHON_INSTALL_DIR=/opt/python \
     UV_LINK_MODE=copy \
@@ -27,8 +33,23 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/python \
 COPY frontend/requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv /opt/venv --python 3.12 \
- && uv pip install --python /opt/venv -r /tmp/requirements.txt
-ENV PATH=/opt/venv/bin:${PATH} \
+ && uv pip install --python /opt/venv --no-deps -r /tmp/requirements.txt \
+ && cd "$(dirname "$(dirname "$(readlink -f /opt/venv/bin/python)")")" \
+ && rm -rf lib/libpython3* lib/libtcl* lib/tcl* lib/tk* lib/itcl* lib/thread* lib/pkgconfig include share \
+           bin/idle3* bin/pip* bin/2to3* bin/pydoc3* bin/python3*-config \
+           lib/python3.12/idlelib lib/python3.12/tkinter lib/python3.12/turtledemo lib/python3.12/ensurepip \
+           lib/python3.12/lib2to3 lib/python3.12/pydoc_data lib/python3.12/site-packages/pip* \
+           lib/python3.12/lib-dynload/_tkinter* lib/python3.12/config-3.12*
+
+FROM ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c
+COPY --from=python /opt/python /opt/python
+COPY --from=python /opt/venv /opt/venv
+COPY --from=build /usr/local/cuda/lib64/libcudart.so.13* /opt/q27/
+# (what the nvidia/cuda images set for the container runtime: all GPUs, the compute and nvidia-smi libraries)
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    LD_LIBRARY_PATH=/opt/q27 \
+    PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     Q27_LIB=/opt/q27/libq27.so \
     HF_HOME=/hf \
     HF_HUB_OFFLINE=1 \
