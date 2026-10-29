@@ -40,7 +40,7 @@ sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 
 import worker  # noqa: E402
-from launch import Launch  # noqa: E402
+from launch import Launch, model_dir  # noqa: E402
 from stats import HUB, request_meta  # noqa: E402
 from chat import (STOP_REASON, AnthropicError, OutputParser, _partial_suffix, anthropic_messages,  # noqa: E402,F401
                   anthropic_template_kwargs, new_id, normalize_messages, openai_call, parse_output,
@@ -500,6 +500,18 @@ class Server:
     def encode(self, text):
         with self.tok_lock:
             return self.tok.encode(text)
+
+    def use_template_of(self, weights):
+        """Renders prompts with the chat template of `weights` from here on (an engine start on them; their tokenizer
+        has the server's ids, Launch.weights_choices). The tokenizer itself stays the server's."""
+        from tokenizer import Tokenizer
+
+        path = model_dir(weights)
+        if path == self.tok.template_path:
+            return
+        tok = Tokenizer(self.tok.path, template=path)
+        with self.tok_lock:
+            self.tok = tok
 
     def render(self, messages, tools, kwargs):
         """Prompt ids (images expanded) and the images, of chat messages."""
@@ -1065,6 +1077,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, str(e)) from e
             # (the admission settings of /admin/concurrency stay; the target number of requests with the same MAX_SEQS)
             keep = ("admit_kv", "kv_reserve", "min_seq_tps") + (("target_seqs",) if s["max_seqs"] == eng.cfg["max_seqs"] else ())
+            self.srv.use_template_of(s["weights"])
             launch.settings, eng.cfg = s, dict(cfg, **{k: eng.cfg[k] for k in keep if k in eng.cfg})
             note = " with " + ", ".join(f"{k}={v}" for k, v in s.items())
         HUB.add_log("admin", None, f"engine {action} requested{note}", level="warn" if action != "start" else "info")
@@ -1208,7 +1221,6 @@ def main():
                     help="1: requests in decode step together (batched speculative steps); 0: they take turns")
     args = ap.parse_args()
 
-    from launch import model_dir
     from tokenizer import Tokenizer, fingerprint
 
     path = model_dir(args.weights)  # (the tokenizer: other weights must have the same, Launch.weights_choices)

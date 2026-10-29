@@ -197,7 +197,8 @@ refused with the tensor at fault rather than after 20 GB. The checks need the en
 Windows package and in the `dev` container (`docker compose --profile dev run --rm dev-cpu python
 scripts/download_weights.py ...`, which writes to `./hf`), and are skipped with a note from a plain host Python. A
 BF16 `lm_head` is quantized to NVFP4 at load. Downloaded checkpoints also appear among the start settings of the
-stats page and `POST /admin/engine`, if their tokenizer (vocabulary and merges) and chat template are the server's.
+stats page and `POST /admin/engine`, if their tokenizer has the server's vocabulary; prompts are then rendered with
+their own chat template.
 
 Swift-1.5 passes the API and image tests. The DFlash2 draft, trained on the original model, keeps its acceptance on
 it (4.13 tokens per verify step against 4.10 with gdnfp4); it decodes 298 / 1,300–1,324 tok/s (one / eight requests)
@@ -205,7 +206,7 @@ against 322 / 1,389 with gdnfp4 on the same server, as its GDN projections are F
 is the fine-tune's own: it is not compared with a reference here.
 
 [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) is a quantization of the model itself
-(its own chat template: start the server with `WEIGHTS` set to it). On the golden prompts its KL to the BF16 model is
+with its own chat template. On the golden prompts its KL to the BF16 model is
 0.0258 (top-1 agreement 90.95%), against 0.0381 for NVIDIA's checkpoint and 0.0454 for gdnfp4, at 21.65 GB of
 weights (KV pool 393,920 tokens) and 289–291 / 1,299–1,310 tok/s (one / eight requests; gdnfp4 322 / 1,383–1,396 on
 the same build).

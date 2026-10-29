@@ -45,36 +45,33 @@ _fingerprints = {}
 
 
 def fingerprint(path):
-    """What the server's text handling takes from a model directory (the ids of the tokenizer, the chat template, the
-    special tokens) as a digest: the server keeps the tokenizer it started with, so it starts an engine on other
-    weights (launch.py) only if theirs is the same."""
-    path = pathlib.Path(path)
-    files = [path / f for f in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")]
-    key = (str(path), tuple(f.stat().st_mtime_ns if f.is_file() else 0 for f in files))
+    """What gives a model directory's token ids their meaning (vocabulary, merges and added tokens of tokenizer.json)
+    as a digest: the server keeps the tokenizer it started with, so it starts an engine on other weights (launch.py)
+    only if theirs is the same. A fine-tune's tokenizer.json rewritten by another transformers differs in the rest
+    (e.g. Huihui's abliterated checkpoint: merges as "a b" strings, a pre-tokenizer pattern without \p{M}, ByteLevel
+    decoder flags): the server's own splitting is kept for those. The chat template is not part of it: prompts are
+    rendered with that of the weights the engine runs (Tokenizer(path, template=...))."""
+    path = pathlib.Path(path) / "tokenizer.json"
+    key = (str(path), path.stat().st_mtime_ns)
     if key not in _fingerprints:
-        config = json.loads(files[1].read_text())
-        template = files[2].read_text() if files[2].is_file() else config.get("chat_template", "")
-        # (the special tokens the template can see: those it names; tokenizer_config.json files of the same tokenizer
-        # differ in the others, e.g. audio tokens a fine-tune's older transformers did not write)
-        special = sorted((k, v) for k, v in config.items() if k.endswith("_token") and isinstance(v, str) and k in template)
-        # (what gives the ids their meaning: vocabulary, merges and added tokens. A fine-tune's tokenizer.json rewritten
-        # by another transformers differs in the rest, e.g. Huihui's abliterated checkpoint: merges as "a b" strings, a
-        # pre-tokenizer pattern without \p{M}, ByteLevel decoder flags. The server's own splitting is kept for those.)
-        tok = json.loads(files[0].read_text())
+        tok = json.loads(path.read_text())
         model = tok["model"]
         merges = [m if isinstance(m, str) else " ".join(m) for m in model.get("merges", ())]
         ids = [model.get("type"), model.get("vocab"), merges, tok.get("added_tokens")]
-        h = hashlib.sha256(json.dumps([ids, template, special], sort_keys=True).encode())
-        _fingerprints[key] = h.hexdigest()
+        _fingerprints[key] = hashlib.sha256(json.dumps(ids, sort_keys=True).encode()).hexdigest()
     return _fingerprints[key]
 
 
 class Tokenizer:
-    """Encode / decode / render of a model directory (tokenizer.json, tokenizer_config.json, chat_template.jinja)."""
+    """Encode / decode / render of a model directory (tokenizer.json, tokenizer_config.json, chat_template.jinja).
+    template: another model directory to take the chat template and its special tokens from (weights with the same
+    fingerprint that the engine runs)."""
 
-    def __init__(self, path):
+    def __init__(self, path, template=None):
         path = pathlib.Path(path)
+        self.path, self.template_path = path, pathlib.Path(template or path)
         self.tok = RustTokenizer.from_file(str(path / "tokenizer.json"))
+        path = self.template_path
         config = json.loads((path / "tokenizer_config.json").read_text())
         template = path / "chat_template.jinja"
         source = template.read_text() if template.is_file() else config["chat_template"]

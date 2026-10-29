@@ -150,10 +150,12 @@ fault. `scripts/download_weights.py` runs the engine's checks on the safetensors
 (it needs the engine library, `Q27_LIB`).
 
 The stats page lists the downloaded checkpoints of the model under the start settings. The server keeps the tokenizer
-and chat template of the weights it started with, so it starts an engine only on weights with the same ones; for a
-checkpoint with its own, start the server with `WEIGHTS` set to it. Tokenizers compare by what gives the ids their
-meaning (vocabulary, merges, added tokens): a `tokenizer.json` that another transformers version rewrote (e.g.
-Huihui's abliterated checkpoint: another pre-tokenizer pattern) counts as the same, and the server keeps its own. The DFlash2 draft was trained on the original
+of the weights it started with, so it starts an engine only on weights whose tokenizer has the same ids (vocabulary,
+merges, added tokens); for a checkpoint with another one, start the server with `WEIGHTS` set to it. A
+`tokenizer.json` that another transformers version rewrote (e.g. Huihui's abliterated checkpoint: another
+pre-tokenizer pattern) counts as the same, and the server keeps its own. Prompts are rendered with the chat template
+of the weights the engine runs (e.g. unsloth's, which merges several system messages and takes conversations without
+a user message), switched with the engine. The DFlash2 draft was trained on the original
 model: it stays correct on a fine-tune (the target model checks every token), but accepts fewer tokens the further
 the fine-tune drifts.
 

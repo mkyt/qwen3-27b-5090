@@ -76,7 +76,7 @@ class Launch:
                 path = model_dir(w)
                 out[w] = None
                 if self.tokenizer and fingerprint(path) != self.tokenizer:
-                    out[w] = f"{w}: another tokenizer or chat template than the server's (start the server with WEIGHTS={w})"
+                    out[w] = f"{w}: another tokenizer (vocabulary) than the server's (start the server with WEIGHTS={w})"
             except (FileNotFoundError, KeyError, ValueError) as e:
                 out[w] = str(e)
         return out

@@ -95,19 +95,38 @@ def test_plan_errors():
 
 def test_tokenizer_fingerprint(tmp_path):
     # The ids decide: a tokenizer.json rewritten by another transformers (merges as strings, another pre-tokenizer
-    # pattern, decoder flags; Huihui's abliterated checkpoint) is the same tokenizer; another vocabulary is not.
+    # pattern, decoder flags; Huihui's abliterated checkpoint) is the same tokenizer, and so is one with another chat
+    # template (unsloth's: prompts are then rendered with it); another vocabulary is not.
     from tokenizer import fingerprint
 
-    def write(name, merges, pattern, vocab=None):
+    def write(name, merges, pattern, vocab=None, template="{{ eos_token }}"):
         d = tmp_path / name
         d.mkdir()
         tok = {"model": {"type": "BPE", "vocab": vocab or {"a": 0, "b": 1, "ab": 2}, "merges": merges},
                "added_tokens": [{"id": 3, "content": "<|im_start|>", "special": True}],
                "pre_tokenizer": {"type": "Split", "pattern": {"Regex": pattern}}, "decoder": {"type": "ByteLevel"}}
         (d / "tokenizer.json").write_text(json.dumps(tok))
-        (d / "tokenizer_config.json").write_text(json.dumps({"chat_template": "{{ eos_token }}", "eos_token": "<|im_end|>"}))
+        (d / "tokenizer_config.json").write_text(json.dumps({"chat_template": template, "eos_token": "<|im_end|>"}))
         return d
 
     base = fingerprint(write("base", [["a", "b"]], r"\p{L}\p{M}+"))
     assert fingerprint(write("rewritten", ["a b"], r"\p{L}+")) == base
+    assert fingerprint(write("template", [["a", "b"]], r"\p{L}\p{M}+", template="{{ bos_token }}")) == base
     assert fingerprint(write("other", [["a", "b"]], r"\p{L}\p{M}+", {"a": 0, "b": 1, "ab": 5})) != base
+
+
+def test_tokenizer_template_of_other_weights():
+    # The server's tokenizer with the chat template of the weights the engine runs (Server.use_template_of).
+    from tokenizer import Tokenizer
+
+    try:
+        own, other = launch.model_dir("gdnfp4"), launch.model_dir("unsloth/Qwen3.8-27B-NVFP4")
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        pytest.skip(str(e))
+    msgs = [{"role": "system", "content": "a"}, {"role": "system", "content": "b"}, {"role": "user", "content": "c"}]
+    mixed, theirs = Tokenizer(own, template=other), Tokenizer(other)
+    assert mixed.path == own and mixed.template_path == other
+    assert mixed.render(msgs) == theirs.render(msgs)  # (unsloth's template merges the system messages)
+    with pytest.raises(Exception, match="System message must be at the beginning"):
+        Tokenizer(own).render(msgs)
+    assert mixed.encode("日本語 text") == Tokenizer(own).encode("日本語 text")
