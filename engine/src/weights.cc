@@ -1,5 +1,6 @@
 #include "weights.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -11,6 +12,30 @@ namespace q27 {
 namespace {
 
 const std::string kLM = "model.language_model";
+
+// The input (activation) scale of a layer quantized at load, which has no calibrated one. NVFP4 activations keep
+// blocks up to 2688 * scale (e4m3 448 * e2m1 6) unclipped; calibrated lm_head scales are 0.021 (NVIDIA's) and 0.027
+// (a fine-tune of the same model). 256 / 2688 leaves room for 3.6 times the larger, and the e4m3 block scales stay in
+// their normal range (3 mantissa bits) for blocks down to an amax of 6 * scale * 2^-6 = 0.009.
+constexpr float kBf16InScale = 256.f / 2688.f;
+
+// The largest |value| of a BF16 tensor, read in chunks (the global scale of fp4_from_bf16).
+float bf16_amax(const SafeTensors& ckpt, const std::string& name) {
+  const auto& info = ckpt.info(name);
+  constexpr int64_t kChunk = 64 << 20;
+  std::vector<uint16_t> buf(size_t(std::min<int64_t>(kChunk, info.nbytes)) / 2);
+  uint16_t top = 0;
+  for (int64_t off = 0; off < info.nbytes; off += kChunk) {
+    const int64_t len = std::min<int64_t>(kChunk, info.nbytes - off);
+    ckpt.read_range(name, off, len, buf.data());
+    for (int64_t i = 0; i < len / 2; i++) top = std::max<uint16_t>(top, buf[size_t(i)] & 0x7fff);
+  }
+  Q27_CHECK(top < 0x7f80, name + ": not finite");  // (exponent all ones: inf / nan)
+  const uint32_t bits = uint32_t(top) << 16;
+  float v;
+  std::memcpy(&v, &bits, 4);
+  return v;
+}
 
 float e4m3_value(uint8_t v) {
   const int e = (v >> 3) & 15, m = v & 7;
@@ -29,14 +54,20 @@ void Weights::tensor(const SafeTensors& ckpt, const std::string& name, Pool& poo
   ptrs_.push_back({dst, {&pool, off}});
 }
 
+void Weights::scalar(const SafeTensors& ckpt, const std::string& name, float* dst, bool inv) {
+  const auto& info = ckpt.info(name);  // (here, so that a plan finds a checkpoint without it, e.g. weight-only)
+  Q27_CHECK(info.dtype == "F32" && info.nbytes == 4, name + ": expected an f32 scalar");
+  scalars_.push_back({&ckpt, name, dst, inv});
+}
+
 void Weights::fp8(const SafeTensors& ckpt, const std::string& p, Pool& dev, LinearFp8& l) {
   const auto& info = ckpt.info(p + ".weight");
   Q27_CHECK(info.dtype == "F8_E4M3", p + ": expected an FP8 weight");
   l.out = int(info.shape[0]);
   l.in = int(info.shape[1]);
   tensor(ckpt, p + ".weight", dev, reinterpret_cast<const void**>(&l.w));
-  scalars_.push_back({&ckpt, p + ".weight_scale", &l.w_scale});
-  scalars_.push_back({&ckpt, p + ".input_scale", &l.in_scale});
+  scalar(ckpt, p + ".weight_scale", &l.w_scale);
+  scalar(ckpt, p + ".input_scale", &l.in_scale);
 }
 
 void Weights::fp4(const SafeTensors& ckpt, const std::vector<std::pair<std::string, LinearFp4*>>& group, Pool& dev) {
@@ -48,11 +79,27 @@ void Weights::fp4(const SafeTensors& ckpt, const std::vector<std::pair<std::stri
     l->out = int(info.shape[0]);
     l->in = int(info.shape[1]) * 2;
     tensor(ckpt, wn, dev, reinterpret_cast<const void**>(&l->w));
-    scalars_.push_back({&ckpt, p + (ct ? ".weight_global_scale" : ".weight_scale_2"), &l->w_scale2, ct});
-    scalars_.push_back({&ckpt, p + (ct ? ".input_global_scale" : ".input_scale"), &l->in_scale, ct});
+    scalar(ckpt, p + (ct ? ".weight_global_scale" : ".weight_scale_2"), &l->w_scale2, ct);
+    scalar(ckpt, p + (ct ? ".input_global_scale" : ".input_scale"), &l->in_scale, ct);
   }
   for (auto& [p, l] : group)
     tensor(ckpt, p + ".weight_scale", dev, reinterpret_cast<const void**>(&l->sf), l->out, l->in / 16);
+}
+
+void Weights::fp4_from_bf16(const SafeTensors& ckpt, const std::string& p, Pool& dev, LinearFp4& l) {
+  const auto& info = ckpt.info(p + ".weight");
+  Q27_CHECK(info.dtype == "BF16" && info.shape.size() == 2, p + ": expected a BF16 matrix");
+  l.out = int(info.shape[0]);
+  l.in = int(info.shape[1]);
+  Q27_CHECK(l.out % 128 == 0 && l.in % 64 == 0, p + ": unexpected shape for NVFP4");
+  const size_t off = dev.add(p + ".weight (NVFP4 at load)", size_t(l.out) * l.in / 2);
+  const size_t soff = dev.add(p + ".weight_scale (NVFP4 at load)", size_t(sf_bytes(l.out, l.in / 16)));
+  jobs_.push_back({&ckpt, p + ".weight", &dev, off});
+  jobs_.back().q4 = &l;
+  jobs_.back().q8_scale = soff;
+  ptrs_.push_back({reinterpret_cast<const void**>(&l.w), {&dev, off}});
+  ptrs_.push_back({reinterpret_cast<const void**>(&l.sf), {&dev, soff}});
+  l.in_scale = kBf16InScale;  // (w_scale2: load, from the amax)
 }
 
 void Weights::fp4_glu(const SafeTensors& ckpt, const std::string& gate, const std::string& up, LinearFp4& g,
@@ -84,6 +131,8 @@ void Weights::bf16_weight(const SafeTensors& ckpt, const std::string& p, Pool& d
     return;
   }
   const auto& info = ckpt.info(p + ".weight_packed");
+  Q27_CHECK(ckpt.info(p + ".weight_scale").nbytes == info.nbytes / 8 && ckpt.info(p + ".weight_global_scale").nbytes == 4,
+            p + ": unexpected NVFP4 scales");
   const size_t off = dev.add(p + ".weight", size_t(info.shape[0]) * info.shape[1] * 2 * sizeof(bf16));
   jobs_.push_back({&ckpt, p + ".weight_packed", &dev, off, 0, 0, p});
   ptrs_.push_back({reinterpret_cast<const void**>(dst), {&dev, off}});
@@ -223,11 +272,15 @@ void Weights::plan(const SafeTensors& ckpt, const SafeTensors* lm_ckpt, Pool& de
     fp4(ckpt, {{p + ".mlp.down_proj", &L.down}}, dev);
   }
   bf(kLM + ".norm.weight", &final_norm);
-  // lm_head: NVFP4. A BF16 one (QUASAR keeps the original) comes from lm_ckpt (the nvidia checkpoint
-  // quantized the same original lm_head).
-  const bool lm_bf16 = ckpt.info("lm_head.weight").dtype == "BF16";
-  Q27_CHECK(!lm_bf16 || lm_ckpt, "lm_head is BF16: set Q27_LM_HEAD_CKPT to a checkpoint with an NVFP4 lm_head");
-  fp4(lm_bf16 ? *lm_ckpt : ckpt, {{"lm_head", &lm_head}}, dev);
+  // lm_head: NVFP4. A BF16 one (QUASAR and its fine-tunes keep it) comes from lm_ckpt if given (QUASAR: the nvidia
+  // checkpoint quantized the same original lm_head), else it is quantized here.
+  const bool lm_bf16 = ckpt.has("lm_head.weight") && ckpt.info("lm_head.weight").dtype == "BF16";
+  if (lm_bf16 && !lm_ckpt) {
+    fp4_from_bf16(ckpt, "lm_head", dev, lm_head);
+    log("lm_head: BF16 in the checkpoint, quantized to NVFP4 at load");
+  } else {
+    fp4(lm_bf16 ? *lm_ckpt : ckpt, {{"lm_head", &lm_head}}, dev);
+  }
   tensor(ckpt, kLM + ".embed_tokens.weight", host, reinterpret_cast<const void**>(&embed));
 }
 
@@ -295,7 +348,7 @@ void Weights::load(cudaStream_t s) {
   }
   for (auto& j : jobs_) {
     const auto& info = j.src->info(j.name);
-    if (!j.dq.empty() || j.q8_rows || (j.sf_rows && !Prefetcher::fits(info.nbytes))) continue;
+    if (!j.dq.empty() || j.q8_rows || j.q4 || (j.sf_rows && !Prefetcher::fits(info.nbytes))) continue;
     if (j.sf_rows) {
       plan.push_back({j.src, j.name, 0, info.nbytes, nullptr});
       continue;
@@ -310,6 +363,12 @@ void Weights::load(cudaStream_t s) {
     pf.get(ri++, sj.name, 0);
     if (sj.inv) *sj.dst = 1.f / *sj.dst;
   }
+  for (auto& j : jobs_)
+    if (j.q4) {
+      const float amax = bf16_amax(*j.src, j.name);
+      Q27_CHECK(amax > 0.f, j.name + ": all zero");
+      j.q4->w_scale2 = amax / (6.f * 448.f);
+    }
   fuse();
   // Two pinned staging buffers for the direct reads: the next chunk is read while the previous one is copied.
   constexpr size_t kStage = 128 << 20;
@@ -354,6 +413,32 @@ void Weights::load(cudaStream_t s) {
       Q27_CUDA(cudaMemcpyAsync(dst, out, size_t(rows) * cols * sizeof(bf16), cudaMemcpyHostToDevice, s));
       Q27_CUDA(cudaEventRecord(done[cur], s));
       cur ^= 1;
+      continue;
+    }
+    if (j.q4) {  // BF16 rows -> a device temporary (chunks of 128-row multiples) -> NVFP4 + swizzled scales
+      const int rows = int(info.shape[0]), cols = int(info.shape[1]);
+      const int chunk = std::max(128, int((32 << 20) / (size_t(cols) * 2)) / 128 * 128);
+      const size_t chunk_bytes = size_t(chunk) * cols * 2;
+      Q27_CHECK(chunk_bytes <= kStage, j.name + ": rows larger than the staging buffer");
+      if (chunk_bytes > q8_tmp_bytes) {
+        Q27_CUDA(cudaStreamSynchronize(s));
+        if (q8_tmp) Q27_CUDA(cudaFree(q8_tmp));
+        q8_tmp_bytes = chunk_bytes;
+        Q27_CUDA(cudaMalloc(&q8_tmp, q8_tmp_bytes));
+      }
+      staging();
+      for (int r0 = 0; r0 < rows; r0 += chunk) {
+        const int n = std::min(chunk, rows - r0);
+        const int64_t len = int64_t(n) * cols * 2;
+        Q27_CUDA(cudaEventSynchronize(done[cur]));
+        ckpt.read_range(j.name, int64_t(r0) * cols * 2, len, stage[cur]);
+        Q27_CUDA(cudaMemcpyAsync(q8_tmp, stage[cur], size_t(len), cudaMemcpyHostToDevice, s));
+        quant_fp4_weight(static_cast<const bf16*>(q8_tmp), n, cols, j.q4->w_scale2,
+                  reinterpret_cast<uint8_t*>(dst) + size_t(r0) * cols / 2,
+                  j.pool->at<uint8_t>(j.q8_scale) + sf_bytes(r0, cols / 16), s);
+        Q27_CUDA(cudaEventRecord(done[cur], s));
+        cur ^= 1;
+      }
       continue;
     }
     if (j.q8_rows) {  // BF16 -> a device temporary (in chunks) -> e4m3 + row scales

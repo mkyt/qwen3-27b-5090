@@ -61,7 +61,8 @@ class Weights {
   // Reserves device and host regions for every tensor (no I/O yet). NVFP4 layers may be in the modelopt
   // layout (weight, weight_scale, weight_scale_2, input_scale) or the compressed-tensors one
   // (weight_packed, weight_scale, weight_global_scale = 1 / weight_scale_2, input_global_scale =
-  // 1 / input_scale). lm_ckpt (may be null): where lm_head comes from when the model's is BF16.
+  // 1 / input_scale). A BF16 lm_head comes from lm_ckpt if given (Q27_LM_HEAD_CKPT: the NVFP4 one of the
+  // model it was quantized from), else it is quantized to NVFP4 at load (fp4_from_bf16).
   void plan(const SafeTensors& ckpt, const SafeTensors* lm_ckpt, Pool& dev, Pool& host);
   // The vision tower (BF16, `model.visual.*`; P4-12; call after plan, before the pools commit). Weight
   // matrices: BF16 in dev (kDevice), BF16 in host (kHost), or e4m3 + row scales in dev quantized at load
@@ -86,8 +87,9 @@ class Weights {
     int sf_rows = 0, sf_kblocks = 0;  // > 0: swizzle as NVFP4 scale factors
     std::string dq;  // non-empty: an NVFP4 layer (this prefix, compressed-tensors) dequantized to BF16
     int q8_rows = 0;      // > 0: a BF16 matrix quantized to e4m3 with row scales (vision_quant_fp8)
-    size_t q8_scale = 0;  // the scales' offset in pool
+    size_t q8_scale = 0;  // the scales' offset in pool (q8_rows, q4)
     int glu = 0;          // 1 / 2: the MLP's gate / up, stored interleaved from offset (glu_row, fp4_glu)
+    LinearFp4* q4 = nullptr;  // non-null: a BF16 matrix quantized to NVFP4 at load into this layer (fp4_from_bf16)
   };
   std::vector<Job> jobs_;
   struct ScalarJob {
@@ -102,9 +104,13 @@ class Weights {
 
   void tensor(const SafeTensors& ckpt, const std::string& name, Pool& pool, const void** dst, int sf_rows = 0,
               int sf_kblocks = 0);
+  void scalar(const SafeTensors& ckpt, const std::string& name, float* dst, bool inv = false);
   void fp8(const SafeTensors& ckpt, const std::string& prefix, Pool& dev, LinearFp8& l);
   // NVFP4 layers planned as a group: all weights adjacent, then all scale factors adjacent.
   void fp4(const SafeTensors& ckpt, const std::vector<std::pair<std::string, LinearFp4*>>& group, Pool& dev);
+  // A BF16 layer (`prefix.weight`) quantized to NVFP4 at load: the weights' global scale from their amax, the
+  // input scale kBf16InScale.
+  void fp4_from_bf16(const SafeTensors& ckpt, const std::string& prefix, Pool& dev, LinearFp4& l);
   // The MLP's gate and up as one interleaved [2 I][K] gate | up (kernels.h glu_row): gate.w / gate.sf are its
   // start; fuse() makes it gate_up and clears the parts' pointers.
   void fp4_glu(const SafeTensors& ckpt, const std::string& gate, const std::string& up, LinearFp4& g, LinearFp4& u,

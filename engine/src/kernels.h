@@ -51,6 +51,10 @@ void rmsnorm(const float* x, const bf16* w, int T, int D, float eps, bool zero_c
 // Dynamic NVFP4 quantization (modelopt / FlashInfer numerics, see reference/qwen27b/quant.py):
 // q [M][K/2] packed e2m1 (low nibble = even column), sf in the CUTLASS SM1xx swizzled layout.
 void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s);
+// A BF16 weight matrix [M][K] to NVFP4 (Weights::fp4_from_bf16), global = its weight_scale_2 (amax / 2688), the
+// block scales searched for the smallest error. The scale factors of rows m0.. of a larger matrix start at
+// sf + sf_bytes(m0, K / 16) when m0 is a multiple of 128.
+void quant_fp4_weight(const bf16* w, int M, int K, float global, uint8_t* q, uint8_t* sf, cudaStream_t s);
 // Zero-centered RMSNorm over the hidden size (5120) per token, writing the fp32 result to `out` (may be
 // null) and the quantized activation (same numerics as rmsnorm + quant_fp4 / quant_fp8).
 // cap (optional): a BF16 copy of the input rows x (the residual stream), rows cap_ld elements apart.

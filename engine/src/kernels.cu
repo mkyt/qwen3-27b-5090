@@ -133,6 +133,53 @@ __global__ void quant_fp4_kernel(const float* x, int M, int K, float input_scale
   quant_block16(v, input_scale, m, kb, K, q, sf);
 }
 
+__device__ __forceinline__ float e4m3_float(__nv_fp8_storage_t c) {
+  return float(__half(__nv_cvt_fp8_to_halfraw(c, __NV_E4M3)));
+}
+
+__constant__ float kE2m1Values[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+// One thread per 16-element block of a BF16 weight matrix: NVFP4 with the block's e4m3 scale searched, of the
+// codes from 4 below to 8 above the rounded amax / 6, for the smallest squared error (as scripts/quantize_proj.py
+// --method mse, which tries 3 below to 1 above). On Qwen3.8's lm_head (first 16K rows) the relative error is 8.1%,
+// against 8.6% for that range, 9.5% for plain amax / 6 (quant_block16) and 8.45% for NVIDIA's NVFP4 lm_head, whose
+// scales are often 3 to 5 codes above amax / 6. The value is global * block scale * e2m1.
+__global__ void quant_fp4_weight_kernel(const bf16* w, int M, int K, float global, uint8_t* q, uint8_t* sf) {
+  const int kblocks = K / 16;
+  const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= int64_t(M) * kblocks) return;
+  const int m = int(idx / kblocks), kb = int(idx % kblocks);
+  float v[16];
+  load16(w + int64_t(m) * K + kb * 16, v);
+  float amax = 0.f;
+#pragma unroll
+  for (int j = 0; j < 16; j++) amax = fmaxf(amax, fabsf(v[j]));
+  const int c0 = __nv_cvt_float_to_fp8(amax / 6.f / global, __NV_SATFINITE, __NV_E4M3);
+  int best = c0;
+  if (amax > 0.f) {
+    float best_err = INFINITY;
+#pragma unroll
+    for (int t = 0; t < 13; t++) {  // 0, -1 .. -4, +1 .. +8 (rtn first: it stays on a tie)
+      const int c = min(max(c0 + (t <= 4 ? -t : t - 4), 1), 126);
+      const float s = e4m3_float(__nv_fp8_storage_t(c)) * global, inv = 1.f / s;
+      float err = 0.f;
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        const uint8_t p = cvt_e2m1x2(v[2 * j] * inv, v[2 * j + 1] * inv);
+        const float a = v[2 * j] - kE2m1Values[p & 15] * s, b = v[2 * j + 1] - kE2m1Values[p >> 4] * s;
+        err += a * a + b * b;
+      }
+      if (err < best_err) best_err = err, best = c;
+    }
+  }
+  const float sff = e4m3_float(__nv_fp8_storage_t(best)), inv = sff != 0.f ? 1.f / (sff * global) : 0.f;
+  uint32_t packed[2] = {0, 0};
+#pragma unroll
+  for (int j = 0; j < 8; j++) packed[j / 4] |= uint32_t(cvt_e2m1x2(v[2 * j] * inv, v[2 * j + 1] * inv)) << (8 * (j % 4));
+  *reinterpret_cast<uint2*>(q + int64_t(m) * (K / 2) + kb * 8) = make_uint2(packed[0], packed[1]);
+  sf[sf_offset(m, kb, kblocks)] = __nv_fp8_storage_t(best);
+}
+
 // Block per token, one thread per 16 elements of the hidden state: zero-centered RMSNorm, then
 // optionally the fp32 result and the quantized activation for the next GEMM.
 __global__ void rmsnorm_quant_kernel(const float* x, const bf16* w, float eps, float* out, QuantOut qo, bf16* cap,
@@ -419,6 +466,13 @@ void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint
   Q27_CHECK(K % 64 == 0, "quant_fp4: K must be a multiple of 64");
   if (M == 0) return;
   quant_fp4_kernel<<<blocks(int64_t(M) * (K / 16)), kThreads, 0, s>>>(x, M, K, input_scale, q, sf);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void quant_fp4_weight(const bf16* w, int M, int K, float global, uint8_t* q, uint8_t* sf, cudaStream_t s) {
+  Q27_CHECK(K % 64 == 0, "quant_fp4_weight: K must be a multiple of 64");
+  if (M == 0) return;
+  quant_fp4_weight_kernel<<<blocks(int64_t(M) * (K / 16)), kThreads, 0, s>>>(w, M, K, global, q, sf);
   Q27_CUDA(cudaGetLastError());
 }
 
