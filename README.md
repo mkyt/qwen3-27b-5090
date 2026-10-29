@@ -83,11 +83,14 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 ## Requirements
 
 - An RTX 5090 (other GPUs are not supported: the kernels use SM120 block-scaled MMAs and are tuned for its 32 GB).
-- Linux or WSL2 with a recent NVIDIA driver, Docker with the NVIDIA Container Toolkit.
-- About 25 GB of disk for the weights and 350 MB for the serving image (the development image, for the tests and
-  benchmarks, is 20 GB). At least 16 GB of host RAM: the engine pins about 8 GB (the embedding table, the prefix
-  cache, the vision tower).
-- [uv](https://docs.astral.sh/uv/) on the host to download the weights.
+- A recent NVIDIA driver for CUDA 13 (tested with 617.42), and one of:
+  - **Linux or WSL2** with Docker and the NVIDIA Container Toolkit, or
+  - **Windows** (64-bit, native): nothing else, the [Windows package](#windows-native) brings its own Python.
+- About 25 GB of disk for the weights; 350 MB for the serving image or 44 MB for the Windows package (the development
+  image, for the tests and benchmarks, is 20 GB). At least 16 GB of host RAM: the engine pins about 8 GB (the
+  embedding table, the prefix cache, the vision tower).
+- To download the weights on Linux: [uv](https://docs.astral.sh/uv/) for `scripts/download-weights.sh`, or any
+  Python 3.10+ for `scripts/download_weights.py` (standard library only).
 
 ## Quick start
 
@@ -121,6 +124,24 @@ or in `shell:startup` (`serve.cmd idle` there, to start with the logon without t
 container in the WSL distro the checkout is in, opens the stats page, and keeps the distro running while the
 container runs (WSL shuts an idle distro down, and Docker with it).
 
+### Windows (native)
+
+The same engine and server also run on Windows itself, without WSL2 or Docker, and as fast: decode measured
+326.6 / 1,393 tok/s (one / eight requests) natively against 325.4 / 1,386 under WSL2 on the same day, and the output
+is bit-identical to Linux on the golden set. The package, `qwen3-27b-5090-windows-x64.zip` (44 MB, attached to the
+[releases](https://github.com/mkyt/qwen3-27b-5090/releases) from the first versioned one; `scripts/windows/package.ps1`
+builds it from a checkout), holds `q27.dll`, the embeddable Python from python.org with the server's packages, and
+`start.cmd`. It needs no VC++ redistributable, CUDA toolkit or administrator rights.
+
+Unzip it anywhere and run `start.cmd`. The first start downloads the weights (23 GB, into
+`%USERPROFILE%\.cache\huggingface` or `HF_HOME`; an interrupted download resumes), then the server listens on
+http://127.0.0.1:8000 and the browser opens its stats page. Set `HOST=0.0.0.0` to serve the network (Windows Firewall
+asks), `PORT`, `OPEN_UI=0` (no browser, e.g. a start at logon) or `WEIGHTS` before running it
+([docs/configuration.md](docs/configuration.md#windows-package)). Reading the weights from a Windows disk is also
+faster natively (about 5.8 GB/s against 2.6–2.8 GB/s from WSL2's `/mnt`).
+
+### Stats page
+
 http://127.0.0.1:8000/ui shows the server live: GPU utilization and power, VRAM by owner (weights, KV cache, state,
 activations, CUDA runtime), each running request's context and prefill / decode speed, and a log of the requests
 with their prefix-cache hits. The page also stops the engine to free the VRAM (the server stays up) and starts or
@@ -152,11 +173,35 @@ The `serve` service reads its settings from the environment (or `.env`); the mos
 | `MAX_TOKENS` | 262144 | Context limit of one request |
 | `MAX_SEQS` | 8 | Requests that can run at once (1–8); how many actually run is decided while running, from the free KV cache |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16` |
-| `WEIGHTS` | `gdnfp4` | `gdnfp4`, `nvidia` (NVIDIA's checkpoint as is), `quasar`, or a model directory |
+| `WEIGHTS` | `gdnfp4` | `gdnfp4`, `nvidia` (NVIDIA's checkpoint as is), `quasar`, another checkpoint of the model on the Hugging Face Hub (`ORG/NAME[@REVISION]`, [below](#other-checkpoints)), or a model directory |
 | `SPEC` | `dflash2` | `dflash2` or `none` |
 | `VISION` | `host` | `host`, `fp8`, `bf16` (vision tower placement) or `off` |
 
 [docs/configuration.md](docs/configuration.md) lists every setting.
+
+### Other checkpoints
+
+Fine-tunes of Qwen3.8-27B published in NVFP4 load as well, when they are quantized like NVIDIA's checkpoint
+(modelopt) or QUASAR (compressed-tensors) with 4-bit activations, for example
+[ukisai/Swift-1.5-Qwen3.8-27b-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-NVFP4):
+
+```bash
+python3 scripts/download_weights.py --weights ukisai/Swift-1.5-Qwen3.8-27b-NVFP4   # (HF_HOME=hf for the compose services)
+WEIGHTS=ukisai/Swift-1.5-Qwen3.8-27b-NVFP4 docker compose up -d serve
+```
+
+Before downloading, the script runs the engine's own checks on the checkpoint's safetensors headers (a few hundred
+KB), so a checkpoint it cannot serve (weight-only NVFP4A16, mixed precisions, GGUF, other engines' formats) is
+refused with the tensor at fault rather than after 20 GB. The checks need the engine library: they run in the
+Windows package and in the `dev` container (`docker compose --profile dev run --rm dev-cpu python
+scripts/download_weights.py ...`, which writes to `./hf`), and are skipped with a note from a plain host Python. A
+BF16 `lm_head` is quantized to NVFP4 at load. Downloaded checkpoints also appear among the start settings of the
+stats page and `POST /admin/engine`, if their tokenizer and chat template are the server's.
+
+Swift-1.5 passes the API and image tests. The DFlash2 draft, trained on the original model, keeps its acceptance on
+it (4.13 tokens per verify step against 4.10 with gdnfp4); it decodes 298 / 1,300–1,324 tok/s (one / eight requests)
+against 322 / 1,389 with gdnfp4 on the same server, as its GDN projections are FP8 like NVIDIA's checkpoint. Quality
+is the fine-tune's own: it is not compared with a reference here.
 
 ## Correctness and quality
 
@@ -208,7 +253,8 @@ The integration tests under `scripts/` (`decode_consistency.py`, `multiseq_test.
 engine/       the engine: CUDA kernels, model runner, speculative decoding, prefix cache, vision tower, C API
 frontend/     the HTTP server (OpenAI / Anthropic APIs, chat template, tool-call parsing, scheduler)
 reference/    PyTorch reference model, golden recordings
-scripts/      weight download, end-to-end tests, benchmarks, quality evaluations, building gdnfp4
+scripts/      weight download, end-to-end tests, benchmarks, quality evaluations, building gdnfp4;
+              windows/: the Windows package (package.ps1, start.cmd) and serve.cmd for WSL2
 tools/        memory plan / roofline calculator, draft vocabulary builder
 micro/        microbenchmarks of the GPU (bandwidth, MMA peaks, PCIe)
 Dockerfile    the serving image (libq27.so, the server and four Python packages; 350 MB, ghcr.io/mkyt/qwen3-27b-5090)
@@ -221,5 +267,6 @@ docs/         architecture, decisions, configuration, benchmarks
 
 MIT ([LICENSE](LICENSE)). The
 model weights (Qwen3.8-27B, NVIDIA's NVFP4 checkpoint, DFlash2, the gdnfp4 build) are Apache-2.0 and are downloaded,
-not distributed here. The golden prompt texts are public domain or from this repository
+not distributed here; other checkpoints carry their own licenses. The Windows package also contains Python and its
+packages under their own licenses (in the package). The golden prompt texts are public domain or from this repository
 ([bench/golden/sources/README.md](bench/golden/sources/README.md)).
