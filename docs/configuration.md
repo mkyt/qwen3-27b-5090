@@ -132,6 +132,20 @@ the deepest match. The log line `[api] prompt N tokens, cached C of R reusable` 
 `q27:reusable_tokens_total` metrics show how well it hits. Clients must send the previous turns' reasoning back, since
 the chat template renders it.
 
+## Windows package
+
+`start.cmd` of the Windows package (`scripts/windows/package.ps1`) runs `scripts/download_weights.py`, then the
+server with the defaults above. It reads these besides the serving variables (set them before running it, e.g.
+`set PORT=8001` in a command prompt, or in the user's environment variables):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HOST` | 127.0.0.1 | Address the server listens on (`0.0.0.0`: the network, which Windows Firewall asks about) |
+| `PORT` | 8000 | Port of the API and the web UI (also read by `frontend/server.py`) |
+| `OPEN_UI` | 1 | 1: open the web UI in the browser at the start; 0: do not (e.g. a start at logon) |
+| `HF_HOME` | `%USERPROFILE%\.cache\huggingface` | Hugging Face cache the weights are downloaded to and loaded from (23 GB) |
+| `HF_TOKEN` | (none) | Sent with the downloads if set (the repositories are not gated; it only raises the rate limit) |
+
 ## Development switches
 
 All default to the faster setting. Except those marked static, they can be switched within one process with
