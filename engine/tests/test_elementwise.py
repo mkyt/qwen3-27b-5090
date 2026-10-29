@@ -168,3 +168,66 @@ def test_silu_mul_quant_fp4_bf16_matches_fp32_on_bf16_values():
     call("q27t_silu_mul_quant_fp4_bf16", g, u, I, T, I, s, q, sf)
     call("q27t_silu_mul_quant_fp4", g.float(), u.float(), I, T, I, s, q2, sf2)
     assert torch.equal(q, q2) and torch.equal(sf, sf2)
+
+
+def quant_rows_ref(x):
+    """Dynamic per-row FP8 (QuantOut::kFp8Row): scale = amax / 448 (1 for a zero row), the dequantized rows."""
+    amax = x.abs().amax(-1, keepdim=True)
+    s = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))
+    return quant_act_fp8(x, s), s.squeeze(-1)
+
+
+@pytest.mark.parametrize("K", [5120, 6144, 17408])
+def test_quant_fp8_rows_matches_reference(K):
+    T = 5
+    x = torch.randn(T, K + 64, device=dev) * torch.logspace(-3, 3, T, device=dev)[:, None]
+    x[2] = 0.0  # an all-zero row keeps scale 1
+    q = torch.empty(T, K, dtype=torch.uint8, device=dev)
+    s = torch.empty(T, device=dev)
+    call("q27t_quant_fp8_rows", x, K + 64, T, K, q, s)  # (rows K + 64 floats apart)
+    ref, sref = quant_rows_ref(x[:, :K].cpu())
+    torch.testing.assert_close(s.cpu(), sref, rtol=0, atol=0)
+    deq = q.cpu().view(torch.float8_e4m3fn).float() * s.cpu()[:, None]
+    torch.testing.assert_close(deq, ref, rtol=0, atol=0)
+
+
+def test_rmsnorm_quant_rows():
+    T, D = 7, 5120
+    x = torch.randn(T, D, device=dev) * 3
+    w = (torch.randn(D, device=dev) * 0.1).bfloat16()
+    out = torch.empty(T, D, device=dev)
+    q = torch.empty(T, D, dtype=torch.uint8, device=dev)
+    s = torch.empty(T, device=dev)
+    call("q27t_rmsnorm_quant_rows", x, w, T, 1e-6, out, q, s)
+    torch.testing.assert_close(out, rms_norm(x, w, 1e-6), rtol=1e-5, atol=1e-5)
+    # The quantized copy is exactly the per-row quantization of the fp32 output.
+    ref, sref = quant_rows_ref(out.cpu())
+    torch.testing.assert_close(s.cpu(), sref, rtol=0, atol=0)
+    torch.testing.assert_close(q.cpu().view(torch.float8_e4m3fn).float() * s.cpu()[:, None], ref, rtol=0, atol=0)
+
+
+def test_silu_mul_quant_fp8_rows():
+    """silu(gate) * up from the [T][2 I] gate | up rows, quantized per row: the separate silu_mul + quant_fp8_rows
+    (the same fp32 silu)."""
+    T, I = 6, 17408
+    gu = torch.randn(T, 2 * I, device=dev) * 4
+    q = torch.empty(T, I, dtype=torch.uint8, device=dev)
+    s = torch.empty(T, device=dev)
+    call("q27t_silu_mul_quant_fp8_rows", gu, gu[:, I:], 2 * I, T, I, q, s)
+    h = torch.empty(T, I, device=dev)
+    call("q27t_silu_mul", gu[:, :I].contiguous(), gu[:, I:].contiguous(), T * I, h)
+    q2, s2 = torch.empty_like(q), torch.empty_like(s)
+    call("q27t_quant_fp8_rows", h, I, T, I, q2, s2)
+    assert torch.equal(s, s2) and torch.equal(q, q2)
+    ref = F.silu(gu[:, :I]) * gu[:, I:]
+    deq = q.view(torch.float8_e4m3fn).float() * s[:, None]
+    assert ((deq - ref).norm() / ref.norm()).item() < 0.03  # (e4m3: about 2% relative per value)
+
+
+def test_dequant_fp8_rows():
+    rows, K = 300, 5120
+    w = (torch.randn(rows, K) * 100).to(torch.float8_e4m3fn)
+    s = torch.rand(rows) * 1e-3
+    out = torch.empty(rows, K, dtype=torch.bfloat16, device=dev)
+    call("q27t_dequant_fp8_rows", w.view(torch.uint8).to(dev), s.to(dev), rows, K, out)
+    assert torch.equal(out.cpu(), (w.float() * s[:, None]).bfloat16())

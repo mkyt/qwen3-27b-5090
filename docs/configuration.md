@@ -138,14 +138,22 @@ the chat template renders it.
 takes the layouts it already reads: the modelopt one of NVIDIA's checkpoint (projections in FP8 or NVFP4) and the
 compressed-tensors one of QUASAR, with NVFP4 activations (W4A4) and the model's dimensions. A BF16 `lm_head` (kept by
 QUASAR and its fine-tunes) is quantized to NVFP4 at load, with the block scales chosen for the smallest error (on
-QUASAR: KL to the BF16 model 0.0473, against 0.0471 with NVIDIA's NVFP4 `lm_head`). Weight-only checkpoints
+QUASAR: KL to the BF16 model 0.0473, against 0.0471 with NVIDIA's NVFP4 `lm_head`). The compressed-tensors
+"mixed-precision" layout of unsloth's and Red Hat's checkpoints loads as well: FP8 weights with per-output-channel
+scales (the GDN and attention projections, the last eight MLPs, unsloth's `lm_head`) run as they are, with the
+activations quantized per token at run time as the checkpoint specifies (`gemm_fp8_scaled`, `skinny_fp8_scaled`);
+an FP8 `lm_head` gives the logits itself, and the DFlash2 draft reads an NVFP4 copy of it made at load (with the
+draft vocabulary, only to build its own head: the copy then lives in the KV pool during the load and takes no VRAM
+afterwards). Weight-only checkpoints
 (NVFP4A16), GGUF files, other engines' formats and checkpoints that mix in other types are refused with the tensor at
 fault. `scripts/download_weights.py` runs the engine's checks on the safetensors headers before it downloads anything
 (it needs the engine library, `Q27_LIB`).
 
 The stats page lists the downloaded checkpoints of the model under the start settings. The server keeps the tokenizer
 and chat template of the weights it started with, so it starts an engine only on weights with the same ones; for a
-checkpoint with its own, start the server with `WEIGHTS` set to it. The DFlash2 draft was trained on the original
+checkpoint with its own, start the server with `WEIGHTS` set to it. Tokenizers compare by what gives the ids their
+meaning (vocabulary, merges, added tokens): a `tokenizer.json` that another transformers version rewrote (e.g.
+Huihui's abliterated checkpoint: another pre-tokenizer pattern) counts as the same, and the server keeps its own. The DFlash2 draft was trained on the original
 model: it stays correct on a fine-tune (the target model checks every token), but accepts fewer tokens the further
 the fine-tune drifts.
 

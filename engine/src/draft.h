@@ -93,6 +93,7 @@ class Draft {
   // With a draft vocabulary (Q27_DRAFT_VOCAB): the compact candidate head from the target's lm_head
   // (after the target weights are loaded).
   void build_vocab_head(const uint8_t* lm_w, const uint8_t* lm_sf, cudaStream_t s);
+  bool has_vocab() const { return !vocab_.empty(); }  // (then the target's lm_head is read only by build_vocab_head)
 
   // Draft block at positions *pos .. *pos + 7: block_ids [8] = anchor, mask x 7 (device). Writes the 7
   // drafted tokens to ids_out[1..7] and the selector's choice. embed: target embedding (UVA), lm_head:

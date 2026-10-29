@@ -51,7 +51,8 @@ constexpr int kSfBytes = 2 * 512;              // two scale atoms per operand
 // is 64 gate rows and the same 64 up rows, with one scale atom as any tile; the epilogue writes silu(gate) * up
 // NVFP4-quantized (the next GEMM's activations). (With gate and up stored apart, the tile took half of a gate
 // and half of an up atom: 50% more B-scale bytes per stage, ~3% of the GEMM time.)
-enum { kOutF32, kOutBf16, kOutGlu };
+// kOutF32S: fp32 with per-row (activation) and per-column (weight) scales in place of alpha (gemm_fp8_scaled).
+enum { kOutF32, kOutBf16, kOutGlu, kOutF32S };
 template <int kIn>
 constexpr int kStageBytes = 2 * kTileBytes + (kIn == kInFp4 ? 2 * kSfBytes : 0);
 
@@ -70,6 +71,8 @@ struct MmaParams {
   uint8_t* q;
   uint8_t* sf;
   int gm;  // tile order: groups of gm M tiles, M fastest within a group (tile_mn)
+  const float* ascale;  // kOutF32S: [M]
+  const float* wscale;  // kOutF32S: [N]
 };
 enum { kEpiStore, kEpiAdd, kEpiLoadC };
 
@@ -418,15 +421,27 @@ __device__ __forceinline__ void consumer(const MmaParams& p, const TmaDesc& map_
     } else {
       // Four boxes (m16 tiles) of 16 rows x 32 columns of fp32 in turn: 128-byte rows, 16-byte piece c of row r at
       // c ^ (r % 8).
+      constexpr bool kScaled = kOut == kOutF32S;
+      float2 ws[4];  // (kScaled: the weight scales of this thread's columns)
+      if constexpr (kScaled)
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++) ws[nt] = *reinterpret_cast<const float2*>(p.wscale + n0 + wn + nt * 8 + 2 * t);
 #pragma unroll
       for (int mt = 0; mt < 4; mt++) {
         epi_wait();
 #pragma unroll
         for (int h = 0; h < 2; h++) {
           const int r = g + 8 * h, row = m0 + wm + mt * 32 + r;
+          float as = 0.f;
+          if constexpr (kScaled) as = row < p.M ? p.ascale[row] : 0.f;
 #pragma unroll
           for (int nt = 0; nt < 4; nt++) {
-            float x = p.alpha * acc[mt][nt][2 * h], y = p.alpha * acc[mt][nt][2 * h + 1];
+            float x, y;
+            if constexpr (kScaled) {  // (the roundings of skinny.cu's epilogue: acc * (wscale * ascale))
+              x = acc[mt][nt][2 * h] * __fmul_rn(ws[nt].x, as), y = acc[mt][nt][2 * h + 1] * __fmul_rn(ws[nt].y, as);
+            } else {
+              x = p.alpha * acc[mt][nt][2 * h], y = p.alpha * acc[mt][nt][2 * h + 1];
+            }
             if (p.epi == kEpiLoadC && row < p.M) {
               const float2 c = *reinterpret_cast<const float2*>(p.c + int64_t(row) * p.N + n0 + wn + nt * 8 + 2 * t);
               x += p.beta * c.x, y += p.beta * c.y;
@@ -610,6 +625,13 @@ void gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, c
 void gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
               float* d, cudaStream_t s) {
   run<kOutF32, kInFp8>(a, b, {M, N, K, nullptr, nullptr, alpha, beta, c, d, nullptr}, s);
+}
+
+void gemm_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* b, const float* wscale,
+                     const float* c, float beta, float* d, cudaStream_t s) {
+  MmaParams p{M, N, K, nullptr, nullptr, 1.f, beta, c, d, nullptr};
+  p.ascale = ascale, p.wscale = wscale;
+  run<kOutF32S, kInFp8>(a, b, p, s);
 }
 
 void gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,

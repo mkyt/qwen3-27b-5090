@@ -556,6 +556,12 @@ void skinny_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascal
                     ascale);
 }
 
+void skinny_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* w, const float* wscale,
+                       const float* c, float beta, float* d, void* ws, size_t ws_bytes, cudaStream_t s) {
+  launch<Fmt::kFp8>(M, N, K, a, nullptr, w, nullptr, AlphaSegments::one(1.f), c, beta, d, ws, ws_bytes, s, wscale,
+                    ascale);
+}
+
 void skinny_fp4_scaled(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const float* ascale, const uint8_t* w,
                        const uint8_t* w_sf, const float* wscale, float* d, void* ws, size_t ws_bytes, cudaStream_t s) {
   launch<Fmt::kFp4>(M, N, K, a, a_sf, w, w_sf, AlphaSegments::one(1.f), nullptr, 0.f, d, ws, ws_bytes, s, wscale,

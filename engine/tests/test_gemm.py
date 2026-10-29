@@ -144,3 +144,27 @@ def test_gemm_bf16(M, N, K):
     d0 = torch.full((M, N), float("nan"), device=dev)
     call("q27t_gemm_bf16_ex", M, N, K, a, w, 0.5, None, 0.0, d0)
     assert rel_err(d0.double(), prod) < 1e-5
+
+
+@pytest.mark.parametrize("M", [1, 77, 300, 2048])
+@pytest.mark.parametrize("N,K", [(10240, 5120), (5120, 6144), (34816, 5120), (5120, 17408), (248320, 5120)])
+def test_gemm_fp8_scaled(M, N, K):
+    """FP8 with per-row activation and per-column weight scales: plain, residual in place, C apart from D."""
+    if N * M > 300 * 248320:
+        pytest.skip("(the lm_head shape only up to 300 rows)")
+    a = (torch.randn(M, K) * 30).to(torch.float8_e4m3fn)
+    b = (torch.randn(N, K) * 30).to(torch.float8_e4m3fn)
+    asc, wsc = torch.rand(M) * 0.02 + 1e-3, torch.rand(N) * 1e-3 + 1e-5
+    prod = (a.double() @ b.double().T) * wsc.double()[None, :] * asc.double()[:, None]
+    a8, b8 = a.view(torch.uint8).to(dev), b.view(torch.uint8).to(dev)
+    asd, wsd = asc.to(dev), wsc.to(dev)
+    d = torch.empty(M, N, device=dev)
+    call("q27t_gemm_fp8_scaled", M, N, K, a8, asd, b8, wsd, None, 0.0, d)
+    assert rel_err(d.cpu().double(), prod) < 1e-5
+    c = torch.randn(M, N, device=dev) * prod.abs().mean().item()
+    d.copy_(c)
+    call("q27t_gemm_fp8_scaled", M, N, K, a8, asd, b8, wsd, d, 1.0, d)
+    assert rel_err(d.cpu().double(), prod + c.cpu().double()) < 1e-5
+    d2 = torch.empty_like(d)
+    call("q27t_gemm_fp8_scaled", M, N, K, a8, asd, b8, wsd, c, 0.5, d2)
+    assert rel_err(d2.cpu().double(), prod + 0.5 * c.cpu().double()) < 1e-5

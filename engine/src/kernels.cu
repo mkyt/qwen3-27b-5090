@@ -30,6 +30,22 @@ __device__ float block_sum(float v) {
   return v;
 }
 
+__device__ float block_max(float v) {
+  __shared__ float red[32];
+  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  __syncthreads();  // red may still be read by a previous call
+  if (lane == 0) red[warp] = v;
+  __syncthreads();
+  int nw = blockDim.x / 32;
+  v = lane < nw ? red[lane] : 0.f;
+  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  return v;
+}
+
+// The scale of a row of the dynamic per-token FP8 quantization (QuantOut::kFp8Row) from its absolute maximum.
+__device__ __forceinline__ float fp8_row_scale(float amax) { return amax > 0.f ? amax / 448.f : 1.f; }
+
 __global__ void embed_gather_kernel(const bf16* table, const int32_t* ids, int D, float* out, const bf16* mm,
                                     int vocab) {
   pdl_trigger();
@@ -122,6 +138,14 @@ __device__ __forceinline__ uint8_t to_fp8(float x, float s) {
   return __nv_cvt_float_to_fp8(x / s, __NV_SATFINITE, __NV_E4M3);
 }
 
+// 16 values as e4m3(v / s) into 16 bytes at q (16-byte aligned).
+__device__ __forceinline__ void store_fp8x16(const float* v, float s, uint8_t* q) {
+  uint32_t packed[4] = {0, 0, 0, 0};
+#pragma unroll
+  for (int j = 0; j < 16; j++) packed[j / 4] |= uint32_t(to_fp8(v[j], s)) << (8 * (j % 4));
+  *reinterpret_cast<uint4*>(q) = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+}
+
 // One thread per 16-element block.
 __global__ void quant_fp4_kernel(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf) {
   int kblocks = K / 16;
@@ -181,7 +205,9 @@ __global__ void quant_fp4_weight_kernel(const bf16* w, int M, int K, float globa
 }
 
 // Block per token, one thread per 16 elements of the hidden state: zero-centered RMSNorm, then
-// optionally the fp32 result and the quantized activation for the next GEMM.
+// optionally the fp32 result and the quantized activation for the next GEMM. kRows: QuantOut::kFp8Row (its own
+// instantiation: the block-wide maximum stays out of the other kinds' code).
+template <bool kRows>
 __global__ void rmsnorm_quant_kernel(const float* x, const bf16* w, float eps, float* out, QuantOut qo, bf16* cap,
                                      int cap_ld) {
   pdl_trigger();
@@ -216,7 +242,14 @@ __global__ void rmsnorm_quant_kernel(const float* x, const bf16* w, float eps, f
 #pragma unroll
     for (int j = 0; j < 4; j++) o[j] = make_float4(v[4 * j], v[4 * j + 1], v[4 * j + 2], v[4 * j + 3]);
   }
-  if (qo.kind == QuantOut::kFp4) {
+  if constexpr (kRows) {
+    float am = 0.f;
+#pragma unroll
+    for (int j = 0; j < 16; j++) am = fmaxf(am, fabsf(v[j]));
+    const float rs = fp8_row_scale(block_max(am));
+    if (kb == 0) qo.scale[t] = rs;
+    store_fp8x16(v, rs, qo.q + int64_t(t) * D + kb * 16);
+  } else if (qo.kind == QuantOut::kFp4) {
     quant_block16(v, qo.in_scale, t, kb, D, qo.q, qo.sf);
   } else if (qo.kind == QuantOut::kFp8) {
     uint32_t packed[4] = {0, 0, 0, 0};
@@ -224,6 +257,58 @@ __global__ void rmsnorm_quant_kernel(const float* x, const bf16* w, float eps, f
     for (int j = 0; j < 16; j++) packed[j / 4] |= uint32_t(to_fp8(v[j], qo.in_scale)) << (8 * (j % 4));
     *reinterpret_cast<uint4*>(qo.q + int64_t(t) * D + kb * 16) = make_uint4(packed[0], packed[1], packed[2], packed[3]);
   }
+}
+
+// Dynamic per-row FP8 of x (kSilu: of silu(x) * up): block per row, the row's maximum first (the second pass
+// re-reads the row from L1 / L2).
+template <bool kSilu>
+__global__ void __launch_bounds__(256) quant_fp8_rows_kernel(const float* x, const float* up, int64_t ld, int K,
+                                                             uint8_t* q, float* scale) {
+  pdl_trigger();
+  pdl_wait();
+  const int row = blockIdx.x, groups = K / 16;
+  auto load = [&](int g, float* v) {
+    load16(x + row * ld + g * 16, v);
+    if constexpr (kSilu) {
+      float u[16];
+      load16(up + row * ld + g * 16, u);
+#pragma unroll
+      for (int j = 0; j < 16; j++) v[j] = v[j] / (1.f + expf(-v[j])) * u[j];
+    }
+  };
+  float am = 0.f;
+  for (int g = threadIdx.x; g < groups; g += blockDim.x) {
+    float v[16];
+    load(g, v);
+#pragma unroll
+    for (int j = 0; j < 16; j++) am = fmaxf(am, fabsf(v[j]));
+  }
+  const float rs = fp8_row_scale(block_max(am));
+  if (threadIdx.x == 0) scale[row] = rs;
+  for (int g = threadIdx.x; g < groups; g += blockDim.x) {
+    float v[16];
+    load(g, v);
+    store_fp8x16(v, rs, q + int64_t(row) * K + g * 16);
+  }
+}
+
+// One thread per 16 elements: e4m3 * the row's scale, rounded to BF16.
+__global__ void dequant_fp8_rows_kernel(const uint8_t* w, const float* scale, int rows, int K, bf16* out) {
+  const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= int64_t(rows) * (K / 16)) return;
+  const int64_t r = idx / (K / 16), c = idx % (K / 16) * 16;
+  const uint4 raw = *reinterpret_cast<const uint4*>(w + r * K + c);
+  const uint8_t* b = reinterpret_cast<const uint8_t*>(&raw);
+  const float sc = scale[r];
+  uint32_t packed[8];
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    const __nv_bfloat162 b2 = __floats2bfloat162_rn(e4m3_float(b[2 * j]) * sc, e4m3_float(b[2 * j + 1]) * sc);
+    packed[j] = *reinterpret_cast<const uint32_t*>(&b2);
+  }
+  uint4* o = reinterpret_cast<uint4*>(out + r * K + c);
+  o[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+  o[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
 }
 
 // silu(gate) * up, NVFP4-quantized; one thread per 16-element block. gate / up rows are ld apart.
@@ -482,6 +567,29 @@ void quant_fp8(const float* x, int64_t n, float input_scale, uint8_t* q, cudaStr
   Q27_CUDA(cudaGetLastError());
 }
 
+void quant_fp8_rows(const float* x, int64_t ld, int T, int K, uint8_t* q, float* scale, cudaStream_t s) {
+  Q27_CHECK(K % 16 == 0 && ld % 4 == 0, "quant_fp8_rows: K must be a multiple of 16");
+  if (T == 0) return;
+  launch_pdl(quant_fp8_rows_kernel<false>, dim3(T), dim3(256), 0, s, x, static_cast<const float*>(nullptr), ld, K, q,
+             scale);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void silu_mul_quant_fp8_rows(const float* gate, const float* up, int64_t ld, int T, int I, uint8_t* q, float* scale,
+                             cudaStream_t s) {
+  Q27_CHECK(I % 16 == 0 && ld % 4 == 0, "silu_mul_quant_fp8_rows: I must be a multiple of 16");
+  if (T == 0) return;
+  launch_pdl(quant_fp8_rows_kernel<true>, dim3(T), dim3(256), 0, s, gate, up, ld, I, q, scale);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void dequant_fp8_rows(const uint8_t* w, const float* scale, int rows, int K, bf16* out, cudaStream_t s) {
+  Q27_CHECK(K % 16 == 0, "dequant_fp8_rows: K must be a multiple of 16");
+  if (rows == 0) return;
+  dequant_fp8_rows_kernel<<<blocks(int64_t(rows) * (K / 16)), kThreads, 0, s>>>(w, scale, rows, K, out);
+  Q27_CUDA(cudaGetLastError());
+}
+
 void silu_mul(const float* gate, const float* up, int64_t n, float* out, cudaStream_t s) {
   if (n == 0) return;
   silu_mul_kernel<<<blocks(n), kThreads, 0, s>>>(gate, up, n, out);
@@ -497,7 +605,10 @@ void linear_bf16(const float* x, const bf16* w, int T, int N, int K, float* out,
 void rmsnorm_quant(const float* x, const bf16* w, int T, float eps, float* out, QuantOut q, cudaStream_t s, bf16* cap,
                    int cap_ld) {
   if (T == 0) return;
-  launch_pdl(rmsnorm_quant_kernel, dim3(T), dim3(dims::kHidden / 16), 0, s, x, w, eps, out, q, cap, cap_ld);
+  if (q.kind == QuantOut::kFp8Row)
+    launch_pdl(rmsnorm_quant_kernel<true>, dim3(T), dim3(dims::kHidden / 16), 0, s, x, w, eps, out, q, cap, cap_ld);
+  else
+    launch_pdl(rmsnorm_quant_kernel<false>, dim3(T), dim3(dims::kHidden / 16), 0, s, x, w, eps, out, q, cap, cap_ld);
   Q27_CUDA(cudaGetLastError());
 }
 

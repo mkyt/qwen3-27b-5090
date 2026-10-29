@@ -1,6 +1,7 @@
 """Start settings of the engine (launch.py) and the device memory their plans assume (stats.Hub.plan_device). The
 plans themselves need libq27 and the weights' headers (no GPU); without them those tests are skipped."""
 
+import json
 import os
 import pathlib
 import sys
@@ -90,3 +91,23 @@ def test_plan_errors():
     lc = planner_or_skip()
     p = lc.plan_many([dict(DEFAULTS, vram_budget_gib=4.0)], DEVICE)[0]
     assert "error" in p and "VRAM budget" in p["error"]
+
+
+def test_tokenizer_fingerprint(tmp_path):
+    # The ids decide: a tokenizer.json rewritten by another transformers (merges as strings, another pre-tokenizer
+    # pattern, decoder flags; Huihui's abliterated checkpoint) is the same tokenizer; another vocabulary is not.
+    from tokenizer import fingerprint
+
+    def write(name, merges, pattern, vocab=None):
+        d = tmp_path / name
+        d.mkdir()
+        tok = {"model": {"type": "BPE", "vocab": vocab or {"a": 0, "b": 1, "ab": 2}, "merges": merges},
+               "added_tokens": [{"id": 3, "content": "<|im_start|>", "special": True}],
+               "pre_tokenizer": {"type": "Split", "pattern": {"Regex": pattern}}, "decoder": {"type": "ByteLevel"}}
+        (d / "tokenizer.json").write_text(json.dumps(tok))
+        (d / "tokenizer_config.json").write_text(json.dumps({"chat_template": "{{ eos_token }}", "eos_token": "<|im_end|>"}))
+        return d
+
+    base = fingerprint(write("base", [["a", "b"]], r"\p{L}\p{M}+"))
+    assert fingerprint(write("rewritten", ["a b"], r"\p{L}+")) == base
+    assert fingerprint(write("other", [["a", "b"]], r"\p{L}\p{M}+", {"a": 0, "b": 1, "ab": 5})) != base

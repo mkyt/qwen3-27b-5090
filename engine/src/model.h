@@ -195,10 +195,12 @@ class Model {
   }
   QuantOut q8(float in_scale) const;  // quantize into aq_
   QuantOut q4(float in_scale) const;  // quantize into aq_ / asf_
-  QuantOut qin(const LinearQ& l) const { return l.fp4 ? q4(l.in_scale()) : q8(l.in_scale()); }
+  QuantOut q8row() const;             // quantize into aq_ per token, the row scales into ascale_
+  QuantOut qin(const LinearQ& l) const { return l.fp4 ? q4(l.in_scale()) : l.dyn ? q8row() : q8(l.in_scale()); }
   // The input of a projection from its fp32 rows x [T][K] (FP8 projections: the producing kernel already
   // wrote aq_; NVFP4 ones quantize here).
   void quant_in(const LinearQ& l, const float* x, int T, int K);
+  void mlp_fp8(const LayerWeights& L, int T);
   void mark(const char* label);  // start of an op (profiling only)
   void profile_collect(bool graph = false);  // after a step (graph: the replayed marks)
 
@@ -219,6 +221,9 @@ class Model {
   Budget vram_;                      // the VRAM budget (make_budget), for device_memory
   Pool dev_weights_{"weights"}, host_weights_{"embedding", true}, kv_{"kv"}, state_{"state"}, act_{"activations"},
       host_cache_{"state cache", true}, host_mm_{"image embeddings", true};
+  // Load-time scratch placed in the KV pool (unused until the first request): the NVFP4 copy of an FP8 lm_head that
+  // the draft model only gathers its vocabulary head from.
+  Pool load_tmp_{"load-time scratch"};
   Weights w_;
   cudaStream_t s_ = nullptr;
   int pos_ = 0;
@@ -351,6 +356,7 @@ class Model {
   float *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *o_ = nullptr, *n_ = nullptr;
   float *a_ = nullptr, *b_ = nullptr, *g_ = nullptr, *beta_ = nullptr;
   uint8_t *aq_ = nullptr, *asf_ = nullptr;
+  float* ascale_ = nullptr;  // per-token scales of aq_ (FP8 layers with per-channel scales: Weights::dyn8)
   int32_t* ids_ = nullptr;
   float* logits_ = nullptr;
   int32_t* topk_ids_ = nullptr;

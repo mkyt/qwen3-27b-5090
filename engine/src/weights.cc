@@ -37,6 +37,31 @@ float bf16_amax(const SafeTensors& ckpt, const std::string& name) {
   return v;
 }
 
+float bf16_value(uint16_t v) {
+  const uint32_t bits = uint32_t(v) << 16;
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
+// Per-channel scales (BF16 or F32) as floats.
+std::vector<float> read_scales(const SafeTensors& ckpt, const std::string& name) {
+  const auto& info = ckpt.info(name);
+  std::vector<uint8_t> raw(size_t(info.nbytes));
+  ckpt.read(name, raw.data());
+  std::vector<float> out(info.dtype == "F32" ? raw.size() / 4 : raw.size() / 2);
+  for (size_t i = 0; i < out.size(); i++) {
+    if (info.dtype == "F32") {
+      std::memcpy(&out[i], raw.data() + 4 * i, 4);
+    } else {
+      uint16_t v;
+      std::memcpy(&v, raw.data() + 2 * i, 2);
+      out[i] = bf16_value(v);
+    }
+  }
+  return out;
+}
+
 float e4m3_value(uint8_t v) {
   const int e = (v >> 3) & 15, m = v & 7;
   const float f = e == 0 ? std::ldexp(m / 8.f, -6) : std::ldexp(1.f + m / 8.f, e - 7);
@@ -56,18 +81,43 @@ void Weights::tensor(const SafeTensors& ckpt, const std::string& name, Pool& poo
 
 void Weights::scalar(const SafeTensors& ckpt, const std::string& name, float* dst, bool inv) {
   const auto& info = ckpt.info(name);  // (here, so that a plan finds a checkpoint without it, e.g. weight-only)
-  Q27_CHECK(info.dtype == "F32" && info.nbytes == 4, name + ": expected an f32 scalar");
+  // (BF16 scalars: Red Hat's NVFP4 weight_global_scale)
+  Q27_CHECK((info.dtype == "F32" && info.nbytes == 4) || (info.dtype == "BF16" && info.nbytes == 2),
+            name + ": expected an f32 scalar");
   scalars_.push_back({&ckpt, name, dst, inv});
 }
 
-void Weights::fp8(const SafeTensors& ckpt, const std::string& p, Pool& dev, LinearFp8& l) {
-  const auto& info = ckpt.info(p + ".weight");
-  Q27_CHECK(info.dtype == "F8_E4M3", p + ": expected an FP8 weight");
-  l.out = int(info.shape[0]);
-  l.in = int(info.shape[1]);
-  tensor(ckpt, p + ".weight", dev, reinterpret_cast<const void**>(&l.w));
-  scalar(ckpt, p + ".weight_scale", &l.w_scale);
-  scalar(ckpt, p + ".input_scale", &l.in_scale);
+bool Weights::fp8(const SafeTensors& ckpt, const std::vector<std::pair<std::string, LinearFp8*>>& group, Pool& dev) {
+  for (auto& [p, l] : group) {
+    const auto& info = ckpt.info(p + ".weight");
+    Q27_CHECK(info.dtype == "F8_E4M3", p + ": expected an FP8 weight");
+    l->out = int(info.shape[0]);
+    l->in = int(info.shape[1]);
+    tensor(ckpt, p + ".weight", dev, reinterpret_cast<const void**>(&l->w));
+  }
+  int channel = 0;
+  for (auto& [p, l] : group) {
+    const auto& si = ckpt.info(p + ".weight_scale");
+    if (si.nbytes <= 4) {  // one scale, with the calibrated input scale (modelopt, the nvidia checkpoint)
+      scalar(ckpt, p + ".weight_scale", &l->w_scale);
+      scalar(ckpt, p + ".input_scale", &l->in_scale);
+      continue;
+    }
+    // One per output channel ([out] or [out][1], BF16 or F32), the input quantized per token at run time.
+    Q27_CHECK((si.dtype == "BF16" || si.dtype == "F32") &&
+                  si.nbytes == int64_t(l->out) * (si.dtype == "F32" ? 4 : 2),
+              p + ".weight_scale: expected one scale or one per output channel");
+    Q27_CHECK(!ckpt.has(p + ".input_scale") && !ckpt.has(p + ".input_global_scale"),
+              p + ": FP8 weights with per-channel scales and a static input scale are not supported");
+    const size_t off = dev.add(p + ".weight_scale (f32)", size_t(l->out) * 4);
+    jobs_.push_back({&ckpt, p + ".weight_scale", &dev, off});
+    jobs_.back().f32 = true;
+    ptrs_.push_back({reinterpret_cast<const void**>(&l->w_scales), {&dev, off}});
+    channel++;
+  }
+  Q27_CHECK(channel == 0 || channel == int(group.size()), group.front().first + ": mixed FP8 scale layouts");
+  if (channel) dyn8 = true;
+  return channel > 0;
 }
 
 void Weights::fp4(const SafeTensors& ckpt, const std::vector<std::pair<std::string, LinearFp4*>>& group, Pool& dev) {
@@ -102,6 +152,22 @@ void Weights::fp4_from_bf16(const SafeTensors& ckpt, const std::string& p, Pool&
   l.in_scale = kBf16InScale;  // (w_scale2: load, from the amax)
 }
 
+void Weights::fp4_from_fp8(const SafeTensors& ckpt, const std::string& p, const LinearFp8& src, Pool& dev,
+                           LinearFp4& l) {
+  l.out = src.out;
+  l.in = src.in;
+  Q27_CHECK(l.out % 128 == 0 && l.in % 64 == 0, p + ": unexpected shape for NVFP4");
+  const size_t off = dev.add(p + ".weight (NVFP4 copy)", size_t(l.out) * l.in / 2);
+  const size_t soff = dev.add(p + ".weight_scale (NVFP4 copy)", size_t(sf_bytes(l.out, l.in / 16)));
+  jobs_.push_back({&ckpt, p + ".weight", &dev, off});
+  jobs_.back().q4 = &l;
+  jobs_.back().q8_scale = soff;
+  jobs_.back().from8 = &src;
+  ptrs_.push_back({reinterpret_cast<const void**>(&l.w), {&dev, off}});
+  ptrs_.push_back({reinterpret_cast<const void**>(&l.sf), {&dev, soff}});
+  l.in_scale = kBf16InScale;  // (w_scale2: load, from the largest channel scale)
+}
+
 void Weights::fp4_glu(const SafeTensors& ckpt, const std::string& gate, const std::string& up, LinearFp4& g,
                       LinearFp4& u, Pool& dev) {
   fp4(ckpt, {{gate, &g}, {up, &u}}, dev);
@@ -115,7 +181,10 @@ void Weights::fp4_glu(const SafeTensors& ckpt, const std::string& gate, const st
 void Weights::proj(const SafeTensors& ckpt, const std::vector<std::pair<std::string, LinearQ*>>& group, Pool& dev) {
   const std::string& p0 = group.front().first;
   if (ckpt.has(p0 + ".weight") && ckpt.info(p0 + ".weight").dtype == "F8_E4M3") {
-    for (auto& [p, l] : group) fp8(ckpt, p, dev, l->f8);
+    std::vector<std::pair<std::string, LinearFp8*>> g;
+    for (auto& [p, l] : group) g.push_back({p, &l->f8});
+    const bool channel = fp8(ckpt, g, dev);
+    for (auto& [p, l] : group) l->dyn = channel;
     return;
   }
   std::vector<std::pair<std::string, LinearFp4*>> g;
@@ -166,9 +235,11 @@ LinearFp8 fuse8(std::initializer_list<const LinearFp8*> parts) {
   for (const LinearFp8* l : parts) {
     Q27_CHECK(l->w == f.w + size_t(f.out) * f.in && l->in == f.in, "fused FP8 layers are not adjacent");
     Q27_CHECK(l->in_scale == f.in_scale, "fused FP8 layers have different input scales");
+    Q27_CHECK(!f.w_scales == !l->w_scales && (!f.w_scales || l->w_scales == f.w_scales + f.out),
+              "fused FP8 layers' channel scales are not adjacent");
     Q27_CHECK(f.alpha.count < AlphaSegments::kMax, "too many fused layers");
     f.alpha.begin[f.alpha.count] = f.out;
-    f.alpha.alpha[f.alpha.count++] = l->in_scale * l->w_scale;
+    f.alpha.alpha[f.alpha.count++] = l->w_scales ? 1.f : l->in_scale * l->w_scale;
     f.out += l->out;
   }
   return f;
@@ -191,13 +262,13 @@ LinearFp4 fuse4(std::initializer_list<const LinearFp4*> parts) {
 
 LinearQ fuseq(const LinearQ& a, const LinearQ& b) {
   LinearQ f;
-  f.fp4 = a.fp4;
+  f.fp4 = a.fp4, f.dyn = a.dyn;
   if (f.fp4) f.f4 = fuse4({&a.f4, &b.f4}); else f.f8 = fuse8({&a.f8, &b.f8});
   return f;
 }
 LinearQ fuseq(const LinearQ& a, const LinearQ& b, const LinearQ& c) {
   LinearQ f;
-  f.fp4 = a.fp4;
+  f.fp4 = a.fp4, f.dyn = a.dyn;
   if (f.fp4) f.f4 = fuse4({&a.f4, &b.f4, &c.f4}); else f.f8 = fuse8({&a.f8, &b.f8, &c.f8});
   return f;
 }
@@ -205,7 +276,7 @@ LinearQ fuseq(const LinearQ& a, const LinearQ& b, const LinearQ& c) {
 }  // namespace
 
 void Weights::fuse() {
-  auto one8 = [](LinearFp8& l) { l.alpha = AlphaSegments::one(l.in_scale * l.w_scale); };
+  auto one8 = [](LinearFp8& l) { l.alpha = AlphaSegments::one(l.w_scales ? 1.f : l.in_scale * l.w_scale); };
   auto one4 = [](LinearFp4& l) { l.alpha = AlphaSegments::one(l.in_scale * l.w_scale2); };
   auto oneq = [&](LinearQ& l) { l.fp4 ? one4(l.f4) : one8(l.f8); };
   for (int i = 0; i < dims::kLayers; i++) {
@@ -216,6 +287,11 @@ void Weights::fuse() {
     } else {
       for (auto* l : {&L.gdn.qkv, &L.gdn.z, &L.gdn.out}) oneq(*l);
       L.gdn.qkvz = fuseq(L.gdn.qkv, L.gdn.z);
+    }
+    if (L.mlp8) {
+      for (auto* l : {&L.gate8, &L.up8, &L.down8}) one8(*l);
+      L.gate_up8 = fuse8({&L.gate8, &L.up8});
+      continue;
     }
     for (auto* l : {&L.gate, &L.up, &L.down}) one4(*l);
     // (interleaved: fp4_glu. The GEMMs run with alpha 1, the silu step applies the gate's and the up's.)
@@ -228,9 +304,11 @@ void Weights::fuse() {
     for (auto* l : {&L.gate, &L.up}) l->w = nullptr, l->sf = nullptr;
   }
   one4(lm_head);
+  if (lm_head8.w) one8(lm_head8);
 }
 
-void Weights::plan(const SafeTensors& ckpt, const SafeTensors* lm_ckpt, Pool& dev, Pool& host) {
+void Weights::plan(const SafeTensors& ckpt, const SafeTensors* lm_ckpt, Pool& dev, Pool& host, bool fp4_head,
+                   Pool* head_pool) {
   using namespace dims;
   const Json& cfg = ckpt.config().has("text_config") ? ckpt.config()["text_config"] : ckpt.config();
   Q27_CHECK(cfg["hidden_size"].as_int() == kHidden && cfg["num_hidden_layers"].as_int() == kLayers &&
@@ -268,14 +346,32 @@ void Weights::plan(const SafeTensors& ckpt, const SafeTensors* lm_ckpt, Pool& de
       bf(g + ".conv1d.weight", &L.gdn.conv);
       bf(g + ".norm.weight", &L.gdn.norm);
     }
-    fp4_glu(ckpt, p + ".mlp.gate_proj", p + ".mlp.up_proj", L.gate, L.up, dev);
-    fp4(ckpt, {{p + ".mlp.down_proj", &L.down}}, dev);
+    const std::string m = p + ".mlp";
+    if (ckpt.has(m + ".gate_proj.weight") && ckpt.info(m + ".gate_proj.weight").dtype == "F8_E4M3") {
+      // (FP8 MLPs: per-channel scales only, the down GEMM's input is quantized per token)
+      L.mlp8 = mlp8 = true;
+      Q27_CHECK(fp8(ckpt, {{m + ".gate_proj", &L.gate8}, {m + ".up_proj", &L.up8}}, dev) &&
+                    fp8(ckpt, {{m + ".down_proj", &L.down8}}, dev),
+                m + ": FP8 MLPs need per-channel scales");
+      Q27_CHECK(L.gate8.out == kInter && L.up8.out == kInter && L.down8.in == kInter, m + ": unexpected shape");
+      continue;
+    }
+    fp4_glu(ckpt, m + ".gate_proj", m + ".up_proj", L.gate, L.up, dev);
+    fp4(ckpt, {{m + ".down_proj", &L.down}}, dev);
   }
   bf(kLM + ".norm.weight", &final_norm);
   // lm_head: NVFP4. A BF16 one (QUASAR and its fine-tunes keep it) comes from lm_ckpt if given (QUASAR: the nvidia
   // checkpoint quantized the same original lm_head), else it is quantized here.
   const bool lm_bf16 = ckpt.has("lm_head.weight") && ckpt.info("lm_head.weight").dtype == "BF16";
-  if (lm_bf16 && !lm_ckpt) {
+  if (ckpt.has("lm_head.weight") && ckpt.info("lm_head.weight").dtype == "F8_E4M3") {
+    // FP8 with per-channel scales (unsloth's checkpoint): the target's logits from it as it is; the draft model
+    // reads an NVFP4 lm_head, quantized from it at load.
+    Q27_CHECK(fp8(ckpt, {{"lm_head", &lm_head8}}, dev), "lm_head: an FP8 lm_head needs per-channel scales");
+    if (fp4_head) fp4_from_fp8(ckpt, "lm_head", lm_head8, head_pool ? *head_pool : dev, lm_head);
+    log("lm_head: FP8 with per-channel scales%s",
+        !fp4_head ? "" : head_pool ? " (an NVFP4 copy at load for the draft's vocabulary head)"
+                                   : " (and an NVFP4 copy for the draft model)");
+  } else if (lm_bf16 && !lm_ckpt) {
     fp4_from_bf16(ckpt, "lm_head", dev, lm_head);
     log("lm_head: BF16 in the checkpoint, quantized to NVFP4 at load");
   } else {
@@ -342,13 +438,12 @@ void Weights::load(cudaStream_t s) {
   constexpr int64_t kChunk = Prefetcher::kSlotBytes;
   std::vector<Prefetcher::Read> plan;
   for (auto& sj : scalars_) {
-    const auto& info = sj.src->info(sj.name);
-    Q27_CHECK(info.dtype == "F32" && info.nbytes == 4, sj.name + ": expected an f32 scalar");
-    plan.push_back({sj.src, sj.name, 0, 4, sj.dst});
+    const auto& info = sj.src->info(sj.name);  // (F32, or BF16: read into the low bytes, converted below)
+    plan.push_back({sj.src, sj.name, 0, info.nbytes, sj.dst});
   }
   for (auto& j : jobs_) {
     const auto& info = j.src->info(j.name);
-    if (!j.dq.empty() || j.q8_rows || j.q4 || (j.sf_rows && !Prefetcher::fits(info.nbytes))) continue;
+    if (!j.dq.empty() || j.q8_rows || j.q4 || j.f32 || (j.sf_rows && !Prefetcher::fits(info.nbytes))) continue;
     if (j.sf_rows) {
       plan.push_back({j.src, j.name, 0, info.nbytes, nullptr});
       continue;
@@ -361,11 +456,23 @@ void Weights::load(cudaStream_t s) {
   size_t ri = 0;
   for (auto& sj : scalars_) {
     pf.get(ri++, sj.name, 0);
+    if (sj.src->info(sj.name).dtype == "BF16") {
+      uint16_t v;
+      std::memcpy(&v, sj.dst, 2);
+      *sj.dst = bf16_value(v);
+    }
     if (sj.inv) *sj.dst = 1.f / *sj.dst;
   }
   for (auto& j : jobs_)
     if (j.q4) {
-      const float amax = bf16_amax(*j.src, j.name);
+      // (an FP8 source: its rows' largest values are 448 times their scales)
+      float amax = 0.f;
+      if (j.from8) {
+        const std::string sname = j.name.substr(0, j.name.size() - 7) + ".weight_scale";  // (j.name: <prefix>.weight)
+        for (float v : read_scales(*j.src, sname)) amax = std::max(amax, 448.f * std::fabs(v));
+      } else {
+        amax = bf16_amax(*j.src, j.name);
+      }
       Q27_CHECK(amax > 0.f, j.name + ": all zero");
       j.q4->w_scale2 = amax / (6.f * 448.f);
     }
@@ -389,8 +496,19 @@ void Weights::load(cudaStream_t s) {
   for (auto& j : jobs_) {
     const SafeTensors& ckpt = *j.src;
     const auto& info = ckpt.info(j.name);
-    total += size_t(info.nbytes);
+    if (!j.from8) total += size_t(info.nbytes);  // (an NVFP4 copy reads nothing)
     char* dst = j.pool->at<char>(j.offset);
+    if (j.f32) {  // per-channel scales -> f32
+      const std::vector<float> v = read_scales(ckpt, j.name);
+      Q27_CHECK(v.size() * 4 <= kStage, j.name + ": larger than the staging buffer");
+      staging();
+      Q27_CUDA(cudaEventSynchronize(done[cur]));
+      std::memcpy(stage[cur], v.data(), v.size() * 4);
+      Q27_CUDA(cudaMemcpyAsync(dst, stage[cur], v.size() * 4, cudaMemcpyHostToDevice, s));
+      Q27_CUDA(cudaEventRecord(done[cur], s));
+      cur ^= 1;
+      continue;
+    }
     if (!j.dq.empty()) {  // small NVFP4 layer -> BF16 (e2m1 * scale / global, compressed-tensors)
       const int rows = int(info.shape[0]), cols = int(info.shape[1]) * 2;
       std::vector<uint8_t> packed(size_t(info.nbytes)), sf(size_t(rows) * cols / 16);
@@ -431,8 +549,13 @@ void Weights::load(cudaStream_t s) {
         const int n = std::min(chunk, rows - r0);
         const int64_t len = int64_t(n) * cols * 2;
         Q27_CUDA(cudaEventSynchronize(done[cur]));
-        ckpt.read_range(j.name, int64_t(r0) * cols * 2, len, stage[cur]);
-        Q27_CUDA(cudaMemcpyAsync(q8_tmp, stage[cur], size_t(len), cudaMemcpyHostToDevice, s));
+        if (j.from8) {  // (the FP8 layer is on the device already: its jobs came first, on the same stream)
+          dequant_fp8_rows(j.from8->w + size_t(r0) * cols, j.from8->w_scales + r0, n, cols,
+                           static_cast<bf16*>(q8_tmp), s);
+        } else {
+          ckpt.read_range(j.name, int64_t(r0) * cols * 2, len, stage[cur]);
+          Q27_CUDA(cudaMemcpyAsync(q8_tmp, stage[cur], size_t(len), cudaMemcpyHostToDevice, s));
+        }
         quant_fp4_weight(static_cast<const bf16*>(q8_tmp), n, cols, j.q4->w_scale2,
                   reinterpret_cast<uint8_t*>(dst) + size_t(r0) * cols / 2,
                   j.pool->at<uint8_t>(j.q8_scale) + sf_bytes(r0, cols / 16), s);

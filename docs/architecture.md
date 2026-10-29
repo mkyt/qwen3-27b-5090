@@ -224,7 +224,10 @@ Prefill runs in chunks of 2,048 tokens through the same weights.
   ring of shared-memory stages filled by a producer warp, 8 MMA warps and TMA stores (or TMA reduce-adds for the
   residual) in the epilogue. NVFP4 reads the swizzled block scales in place; E4M3 runs the block-scaled MXFP8 MMA
   with unit scales (P5-11: bit-identical to the plain FP8 MMA and twice as fast on this GPU); BF16 (draft context,
-  vision) any N and K. The MLP's gate | up GEMM writes silu(gate) * up NVFP4-quantized from its epilogue. Results
+  vision) any N and K. The MLP's gate | up GEMM writes silu(gate) * up NVFP4-quantized from its epilogue. FP8
+  layers with per-output-channel weight scales and per-token activation scales (unsloth's and Red Hat's
+  checkpoints) take their own instantiation of the fp32 epilogue (acc * weight scale * activation scale), so the
+  other instantiations compile to the same code as before. Results
   are bit-identical to those of CUTLASS's SM120 kernels, which they replaced: at 400 W they were 2.5-7% faster on
   most prefill shapes (gdn z 1.8-2.7% and BF16 0.5-1% slower) and the prefill 0.6% / 0.0% faster at 19K / 73K. The K
   loop keeps its stage arithmetic on the uniform datapath, the producer warp issues its loads from one elected lane

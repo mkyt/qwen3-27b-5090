@@ -45,9 +45,9 @@ _fingerprints = {}
 
 
 def fingerprint(path):
-    """What the server's text handling takes from a model directory (tokenizer.json, the chat template, the special
-    tokens) as a digest: the server keeps the tokenizer it started with, so it starts an engine on other weights
-    (launch.py) only if theirs is the same."""
+    """What the server's text handling takes from a model directory (the ids of the tokenizer, the chat template, the
+    special tokens) as a digest: the server keeps the tokenizer it started with, so it starts an engine on other
+    weights (launch.py) only if theirs is the same."""
     path = pathlib.Path(path)
     files = [path / f for f in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")]
     key = (str(path), tuple(f.stat().st_mtime_ns if f.is_file() else 0 for f in files))
@@ -57,8 +57,14 @@ def fingerprint(path):
         # (the special tokens the template can see: those it names; tokenizer_config.json files of the same tokenizer
         # differ in the others, e.g. audio tokens a fine-tune's older transformers did not write)
         special = sorted((k, v) for k, v in config.items() if k.endswith("_token") and isinstance(v, str) and k in template)
-        h = hashlib.sha256(files[0].read_bytes())
-        h.update(json.dumps([template, special]).encode())
+        # (what gives the ids their meaning: vocabulary, merges and added tokens. A fine-tune's tokenizer.json rewritten
+        # by another transformers differs in the rest, e.g. Huihui's abliterated checkpoint: merges as "a b" strings, a
+        # pre-tokenizer pattern without \p{M}, ByteLevel decoder flags. The server's own splitting is kept for those.)
+        tok = json.loads(files[0].read_text())
+        model = tok["model"]
+        merges = [m if isinstance(m, str) else " ".join(m) for m in model.get("merges", ())]
+        ids = [model.get("type"), model.get("vocab"), merges, tok.get("added_tokens")]
+        h = hashlib.sha256(json.dumps([ids, template, special], sort_keys=True).encode())
         _fingerprints[key] = h.hexdigest()
     return _fingerprints[key]
 

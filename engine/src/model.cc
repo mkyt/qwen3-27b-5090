@@ -50,8 +50,17 @@ Model::Model(const Options& opt) : opt_(opt) {
   }
   if (const std::string lm = env_path("Q27_LM_HEAD_CKPT"); !lm.empty() && ckpt_->info("lm_head.weight").dtype == "BF16")
     lm_ckpt_ = std::make_unique<SafeTensors>(lm);
-  w_.plan(*ckpt_, lm_ckpt_.get(), dev_weights_, host_weights_);
+  // (With a draft vocabulary the draft model reads the target's lm_head only to build its own head at load.)
+  const bool draft_vocab = !opt.draft_dir.empty() && !env_path("Q27_DRAFT_VOCAB").empty();
+  w_.plan(*ckpt_, lm_ckpt_.get(), dev_weights_, host_weights_, !opt.draft_dir.empty(),
+          draft_vocab ? &load_tmp_ : nullptr);
   if (w_.fp4_proj) log("GDN / attention projections: NVFP4");
+  if (w_.dyn8) {
+    int n = 0;
+    for (const auto& L : w_.layers) n += L.mlp8;
+    log("FP8 layers with per-channel scales, activations quantized per token (%s%d FP8 MLPs)",
+        n == kLayers ? "all " : "", n);
+  }
   if (opt.vision) {
     Q27_CHECK(ckpt_->config()["image_token_id"].as_int() == kImagePad, "unexpected image_token_id");
     Q27_CHECK(opt.image_tokens > 0 && opt.image_max_pixels >= 4 * 256, "image_tokens / image_max_pixels");
@@ -117,8 +126,10 @@ Model::Model(const Options& opt) : opt_(opt) {
   size_t o_n = f32("n", Tc * kVHeads * kVDim);
   size_t o_a = f32("a", Tc * kVHeads), o_bb = f32("b", Tc * kVHeads), o_g = f32("g", Tc * kVHeads),
          o_beta = f32("beta", Tc * kVHeads);
-  size_t o_aq = act_.add("act quant", size_t(Tp) * std::max(kInter / 2, kHeads * kHeadDim));
+  // (an FP8 MLP's down GEMM takes [T][I] bytes)
+  size_t o_aq = act_.add("act quant", size_t(Tp) * (w_.mlp8 ? kInter : std::max(kInter / 2, kHeads * kHeadDim)));
   size_t o_asf = act_.add("act sf", size_t(sf_bytes(Tp, kInter / 16)));
+  size_t o_asc = w_.dyn8 ? f32("act row scales", Tp) : 0;
   size_t o_ids = act_.add("ids", Tc * 4);
   size_t o_mpos = act_.add("mrope positions", Tc * 3 * 4);
   size_t o_logits = f32("logits", L * kVocab);
@@ -210,6 +221,10 @@ Model::Model(const Options& opt) : opt_(opt) {
   auto t_commit = std::chrono::steady_clock::now();
   for (Pool* p : {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_mm_}) p->commit();
   log("pools allocated in %.2f s", since(t_commit));
+  if (load_tmp_.size()) {
+    Q27_CHECK(load_tmp_.size() <= kv_.size(), "the KV pool is smaller than the load-time scratch");
+    load_tmp_.commit_at(kv_.base());
+  }
   log("kv pool: %d pages (%d tokens), max_tokens %d%s", pool_pages, pool_pages * kPageTokens, opt_.max_tokens,
       cache_on_ ? "" : " (prefix cache off)");
   if (cache_on_) {
@@ -251,6 +266,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   n_ = act_.at<float>(o_n), a_ = act_.at<float>(o_a), b_ = act_.at<float>(o_bb), g_ = act_.at<float>(o_g);
   beta_ = act_.at<float>(o_beta);
   aq_ = act_.at<uint8_t>(o_aq), asf_ = act_.at<uint8_t>(o_asf);
+  if (w_.dyn8) ascale_ = act_.at<float>(o_asc);
   ids_ = act_.at<int32_t>(o_ids);
   mpos_ = act_.at<int32_t>(o_mpos);
   if (opt.vision) {
@@ -312,11 +328,16 @@ Model::Model(const Options& opt) : opt_(opt) {
 
   Q27_CUDA(cudaMemset(page_table_, 0, size_t(max_pages_) * 4));  // all unmapped (pages come from pool_)
   Q27_CUDA(cudaMemset(asf_, 0, sf_bytes(Tp, kInter / 16)));
+  if (ascale_) Q27_CUDA(cudaMemset(ascale_, 0, size_t(Tp) * 4));
 
   w_.load(s_);
   if (draft_) {
     draft_->load(s_);
     draft_->build_vocab_head(w_.lm_head.w, w_.lm_head.sf, s_);
+    if (load_tmp_.size()) {  // (the copy was in the KV pool: nothing reads it from here on)
+      Q27_CHECK(draft_->has_vocab(), "the draft vocabulary was not loaded");
+      w_.lm_head.w = nullptr, w_.lm_head.sf = nullptr;
+    }
   }
   reset();
 
@@ -740,8 +761,16 @@ bool Model::skip(const char* kind) const {
 
 QuantOut Model::q8(float in_scale) const { return {QuantOut::kFp8, in_scale, aq_, nullptr}; }
 QuantOut Model::q4(float in_scale) const { return {QuantOut::kFp4, in_scale, aq_, asf_}; }
+QuantOut Model::q8row() const { return {QuantOut::kFp8Row, 1.f, aq_, nullptr, ascale_}; }
 
+// The input of an NVFP4 or per-token FP8 projection from fp32 rows (an FP8 one with a calibrated input scale was
+// quantized by the op that wrote x).
 void Model::quant_in(const LinearQ& l, const float* x, int T, int K) {
+  if (l.dyn) {
+    mark("quant fp8 rows");
+    quant_fp8_rows(x, K, T, K, aq_, ascale_, s_);
+    return;
+  }
   if (!l.fp4) return;
   mark("quant fp4");
   quant_fp4(x, T, K, l.in_scale(), aq_, asf_, s_);
@@ -754,6 +783,22 @@ void Model::gemm_q(const char* what, const LinearFp8& l, int T, float* out, bool
   if (skip("gemm") || skip("gemm8")) return;
   const float* c = residual ? out : nullptr;
   const float beta = residual ? 1.f : 0.f;
+  if (l.w_scales) {  // per-channel weight scales, per-token activation scales (ascale_)
+    if (T <= kSkinnyMaxM && skinny_) {
+      auto run = [&] {
+        skinny_fp8_scaled(T, l.out, l.in, aq_, ascale_, l.w, l.w_scales, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_);
+      };
+      if (skinny_check_)
+        check_skinny(what, T, l.out, out, residual, s_, [&](const float* cc, float* d) {
+          gemm_fp8_scaled(T, l.out, l.in, aq_, ascale_, l.w, l.w_scales, cc, cc ? 1.f : 0.f, d, s_);
+        }, run);
+      else
+        run();
+      return;
+    }
+    gemm_fp8_scaled(T, l.out, l.in, aq_, ascale_, l.w, l.w_scales, c, beta, out, s_);
+    return;
+  }
   if (T <= kSkinnyMaxM && skinny_) {
     auto run = [&] { skinny_fp8(T, l.out, l.in, aq_, l.w, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_); };
     if (skinny_check_ && l.alpha.count == 1)
@@ -852,7 +897,7 @@ void Model::gdn(int i, int T) {
     if (!skip("gdn")) gdn_verify_prep(qkv, ld, Tv, conv, G.conv, h_, G.a, G.b, q_, sp, s_);
     mark("gdn recurrent+norm");
     if (!skip("gdn"))
-      gdn_verify(q_, Tv, G.A_log, G.dt_bias, ssm, z, ldz, G.norm, kEps, n_, G.out.fp4 ? nullptr : aq_,
+      gdn_verify(q_, Tv, G.A_log, G.dt_bias, ssm, z, ldz, G.norm, kEps, n_, G.out.static8() ? aq_ : nullptr,
                  G.out.in_scale(), sp, s_);
     quant_in(G.out, n_, T, kVHeads * kVDim);
     gemm_q("gdn out", G.out, T, x_, true);
@@ -863,7 +908,7 @@ void Model::gdn(int i, int T) {
     if (!skip("gdn")) gdn_decode_prep(qkv, conv, G.conv, h_, G.a, G.b, q_, k_, v_, a_, b_, s_);
     mark("gdn recurrent+norm");
     if (!skip("gdn"))
-      gdn_decode(q_, k_, v_, a_, b_, G.A_log, G.dt_bias, ssm, z, G.norm, kEps, n_, G.out.fp4 ? nullptr : aq_,
+      gdn_decode(q_, k_, v_, a_, b_, G.A_log, G.dt_bias, ssm, z, G.norm, kEps, n_, G.out.static8() ? aq_ : nullptr,
                  G.out.in_scale(), s_);
     quant_in(G.out, n_, T, kVHeads * kVDim);
     gemm_q("gdn out", G.out, T, x_, true);
@@ -881,7 +926,7 @@ void Model::gdn(int i, int T) {
   else
     gdn_recurrent(q_, k_, v_, g_, beta_, T, ssm, o_, s_);
   mark("gdn gated norm");
-  if (G.out.fp4) {  // fp32 in place, then NVFP4
+  if (!G.out.static8()) {  // fp32 in place, then NVFP4 / FP8 per token
     gdn_gated_norm(o_, z, ldz, G.norm, T, kEps, o_, s_);
     quant_in(G.out, o_, T, kVHeads * kVDim);
   } else {
@@ -916,7 +961,7 @@ void Model::attn(int i, int T) {
     mark("attn core");
     if (!skip("attn"))
       attention_decode_lanes(v_, qg, ldq, bsl_, kv, opt_.kv_type, o_, attn_ws_, kAttnDecodeWsBytes, s_,
-                             A.o.fp4 ? nullptr : aq_, A.o.in_scale());
+                             A.o.static8() ? aq_ : nullptr, A.o.in_scale());
     quant_in(A.o, o_, T, kHeads * kHeadDim);
     gemm_q("attn o", A.o, T, x_, true);
     return;
@@ -930,7 +975,7 @@ void Model::attn(int i, int T) {
   if (skip("attn")) {
   } else if (T <= kDecodeMaxT) {
     attention_decode(v_, qg, ldq, T, pos_dev_, kv, opt_.kv_type, page_table_, o_, attn_ws_, kAttnDecodeWsBytes, s_,
-                     A.o.fp4 ? nullptr : aq_, A.o.in_scale(), tree);
+                     A.o.static8() ? aq_ : nullptr, A.o.in_scale(), tree);
     quant_in(A.o, o_, T, kHeads * kHeadDim);
   } else {
     Q27_CHECK(ldq == kHeads * 2 * kHeadDim, "attention: unexpected q stride");
@@ -938,7 +983,7 @@ void Model::attn(int i, int T) {
     attention(v_, qg, T, pos_, kv, opt_.kv_type, page_table_, o_, big2_, size_t(opt_.prefill_chunk) * kInter * 4, s_,
               fa_stage_, fa_stage_bytes_);
     mark("quant fp8");
-    if (A.o.fp4)
+    if (!A.o.static8())
       quant_in(A.o, o_, T, kHeads * kHeadDim);
     else
       quant_fp8(o_, int64_t(T) * kHeads * kHeadDim, A.o.in_scale(), aq_, s_);
@@ -948,6 +993,10 @@ void Model::attn(int i, int T) {
 
 void Model::mlp(int i, int T) {
   const auto& L = w_.layers[i];
+  if (L.mlp8) {
+    mlp_fp8(L, T);
+    return;
+  }
   mark("norm+quant");
   if (!skip("norm")) rmsnorm_quant(x_, L.post_norm, T, kEps, nullptr, q4(L.gate.in_scale), s_);
   // gate_up is the interleaved gate | up with alpha 1 (Weights::fp4_glu): the silu step reads it as such and
@@ -984,6 +1033,28 @@ void Model::mlp(int i, int T) {
     if (!skip("silu")) silu_mul_quant_fp4_glu(big1_, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
   }
   gemm_q("mlp down", L.down, T, x_, true);
+}
+
+// An FP8 MLP (per-channel weight scales, activations quantized per token): gate | up as one GEMM on the skinny path
+// (fp32 [T][2 I] in big1_, as the NVFP4 MLP's), gate and up apart into big1_ / big2_ otherwise; silu(gate) * up
+// quantized per token for the down GEMM.
+void Model::mlp_fp8(const LayerWeights& L, int T) {
+  mark("norm+quant");
+  if (!skip("norm")) rmsnorm_quant(x_, L.post_norm, T, kEps, nullptr, q8row(), s_);
+  const float *gate = big1_, *up = big2_;
+  int64_t ld = kInter;
+  if (T <= kSkinnyMaxM && skinny_) {
+    Q27_CHECK(2 * T <= opt_.prefill_chunk || big2_ == big1_ + size_t(opt_.prefill_chunk) * kInter,
+              "MLP: big1_ / big2_ not adjacent");
+    gemm_q("mlp gate_up", L.gate_up8, T, big1_, false);
+    up = big1_ + kInter, ld = 2 * kInter;
+  } else {
+    gemm_q("mlp gate", L.gate8, T, big1_, false);
+    gemm_q("mlp up", L.up8, T, big2_, false);
+  }
+  mark("mlp silu+quant");
+  if (!skip("silu")) silu_mul_quant_fp8_rows(gate, up, ld, T, kInter, aq_, ascale_, s_);
+  gemm_q("mlp down", L.down8, T, x_, true);
 }
 
 void Model::chunk(const int32_t* ids_dev, int T, bool advance) {
@@ -1088,6 +1159,11 @@ void Model::copy_hist(int32_t* dst, const int32_t* ids, int n) {
 
 void Model::logits(const float* x_rows, int rows) {
   mark("norm+quant");
+  if (w_.lm_head8.w) {  // (an FP8 lm_head: lm_head is the draft model's NVFP4 copy)
+    rmsnorm_quant(x_rows, w_.final_norm, rows, kEps, nullptr, q8row(), s_);
+    gemm_q("lm_head", w_.lm_head8, rows, logits_, false);
+    return;
+  }
   rmsnorm_quant(x_rows, w_.final_norm, rows, kEps, nullptr, q4(w_.lm_head.in_scale), s_);
   gemm_q("lm_head", w_.lm_head, rows, logits_, false);
 }

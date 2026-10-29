@@ -19,6 +19,9 @@ class Pool {
   // Planning: reserve `bytes` (256-byte aligned) and return the offset of the region.
   size_t add(const std::string& what, size_t bytes);
   void commit();
+  // Places the planned regions at `base` instead: memory of another committed pool that is unused while these are
+  // (not owned; e.g. load-time scratch in the KV pool before the first request).
+  void commit_at(void* base);
   void* base() const { return base_; }
   template <class T>
   T* at(size_t offset) const {
@@ -37,6 +40,7 @@ class Pool {
   bool host_;
   size_t size_ = 0;
   void* base_ = nullptr;
+  bool owned_ = true;
   std::vector<std::pair<std::string, size_t>> items_;
 };
 

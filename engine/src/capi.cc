@@ -403,6 +403,26 @@ int q27t_gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float
                   float* d) {
   return kernel([&] { gemm_fp8(M, N, K, a, b, alpha, c, beta, d, ts()); });
 }
+int q27t_gemm_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* b,
+                         const float* wscale, const float* c, float beta, float* d) {
+  return kernel([&] { gemm_fp8_scaled(M, N, K, a, ascale, b, wscale, c, beta, d, ts()); });
+}
+int q27t_skinny_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* w,
+                           const float* wscale, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
+  return kernel([&] { skinny_fp8_scaled(M, N, K, a, ascale, w, wscale, c, beta, d, ws, ws_bytes, ts()); });
+}
+int q27t_quant_fp8_rows(const float* x, int64_t ld, int T, int K, uint8_t* q, float* scale) {
+  return kernel([&] { quant_fp8_rows(x, ld, T, K, q, scale, ts()); });
+}
+int q27t_silu_mul_quant_fp8_rows(const float* g, const float* u, int64_t ld, int T, int I, uint8_t* q, float* scale) {
+  return kernel([&] { silu_mul_quant_fp8_rows(g, u, ld, T, I, q, scale, ts()); });
+}
+int q27t_rmsnorm_quant_rows(const float* x, const bf16* w, int T, float eps, float* out, uint8_t* q, float* scale) {
+  return kernel([&] { rmsnorm_quant(x, w, T, eps, out, {QuantOut::kFp8Row, 1.f, q, nullptr, scale}, ts()); });
+}
+int q27t_dequant_fp8_rows(const uint8_t* w, const float* scale, int rows, int K, bf16* out) {
+  return kernel([&] { dequant_fp8_rows(w, scale, rows, K, out, ts()); });
+}
 int q27t_skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                     float alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
   return kernel([&] { skinny_fp4(M, N, K, a, a_sf, w, w_sf, AlphaSegments::one(alpha), c, beta, d, ws, ws_bytes, ts()); });

@@ -9,7 +9,7 @@ namespace q27 {
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
 Pool::~Pool() {
-  if (!base_) return;
+  if (!base_ || !owned_) return;
   if (host_)
     cudaFreeHost(base_);
   else
@@ -30,6 +30,11 @@ void Pool::commit() {
     Q27_CUDA(cudaHostAlloc(&base_, size_, cudaHostAllocMapped | cudaHostAllocPortable));
   else
     Q27_CUDA(cudaMalloc(&base_, size_));
+}
+
+void Pool::commit_at(void* base) {
+  Q27_CHECK(!base_ && base, "pool " + name_ + ": commit_at");
+  base_ = base, owned_ = false;
 }
 
 Budget make_budget() {
