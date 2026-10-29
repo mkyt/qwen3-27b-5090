@@ -1173,6 +1173,11 @@ class ResponsesOut:
 
 
 START_TIME = time.time()
+# Engine settings whose library default (q27lib.Engine, for the tests and scripts) is not the server's, set when
+# unset: the server starts the same with or without compose.yaml, which lists them too (tests/test_parsing.py).
+# MAX_TOKENS is an upper bound the engine lowers to what the VRAM budget fits (e.g. with MAX_SEQS=8); the prefix
+# cache keeps 4 GiB of pinned state checkpoints.
+ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "4"}
 
 
 def main():
@@ -1208,8 +1213,8 @@ def main():
 
     path = model_dir(args.weights)  # (the profiles share the tokenizer)
     tok = Tokenizer(path)
-    # MAX_TOKENS is an upper bound: the engine lowers it to what the VRAM budget fits (e.g. with MAX_SEQS=8).
-    os.environ.setdefault("MAX_TOKENS_FIT", "1")
+    for k, v in ENGINE_ENV_DEFAULTS.items():
+        os.environ.setdefault(k, v)
     vocab = ROOT / "bench/draft-vocab/vocab-128k.txt"
     if "Q27_DRAFT_VOCAB" not in os.environ and vocab.exists():
         os.environ["Q27_DRAFT_VOCAB"] = str(vocab)

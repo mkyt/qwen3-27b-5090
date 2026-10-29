@@ -6,7 +6,8 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from server import _partial_suffix, normalize_messages, parse_tool_calls, split_reasoning  # noqa: E402
+from server import (ENGINE_ENV_DEFAULTS, _partial_suffix, normalize_messages, parse_tool_calls,  # noqa: E402
+                    split_reasoning)
 
 TOOLS = [{"type": "function", "function": {"name": "read_file", "parameters": {
     "type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}}}}]
@@ -183,3 +184,13 @@ def test_responses_input():
     assert [m["role"] for m in out[3:]] == ["tool", "tool"]
     assert [t["function"]["name"] for t in tools] == ["exec_command", "spawn_agent", "apply_patch"]
     assert ns == {"spawn_agent": "multi_agent_v1"} and custom == {"apply_patch"}
+
+
+def test_engine_env_defaults_match_compose():
+    """The server's own engine defaults are those of the serve service in compose.yaml (a start without compose,
+    e.g. on Windows, runs the same engine)."""
+    import re
+    compose = (pathlib.Path(__file__).resolve().parents[2] / "compose.yaml").read_text()
+    for k, v in ENGINE_ENV_DEFAULTS.items():
+        m = re.search(rf"^\s+{k}: \$\{{{k}:-([^}}]*)\}}", compose, re.M)
+        assert m and m.group(1) == v, (k, m and m.group(1), v)
