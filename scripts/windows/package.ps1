@@ -61,6 +61,8 @@ Copy-Item scripts\windows\start.cmd (Join-Path $dst "start.cmd")
 
 $zip = Join-Path $Out "$name.zip"
 if (Test-Path $zip) { Remove-Item $zip }
-tar.exe -a -c -f $zip -C $Out $name  # (Windows' bsdtar: a zip with forward slashes, unlike Compress-Archive in 5.1)
+# (Windows' bsdtar, by its path: Git's GNU tar may come first in PATH and makes no zip. A zip with forward
+# slashes, unlike Compress-Archive in PowerShell 5.1.)
+& "$env:SystemRoot\System32\tar.exe" -a -c -f $zip -C $Out $name
 if ($LASTEXITCODE) { throw "zip failed" }
 Write-Host ("{0}: {1:N1} MB" -f $zip, ((Get-Item $zip).Length / 1MB))

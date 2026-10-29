@@ -1,0 +1,86 @@
+# Builds the Windows package (scripts/windows/package.ps1): qwen3-27b-5090-windows-x64.zip, a workflow artifact from
+# main when the code in it changes, and an asset of the GitHub Release of a v* tag (with its SHA-256). The runner has no
+# GPU: the engine compiles, the GPU tests are run before tagging.
+name: windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - engine/**
+      - frontend/**
+      - reference/qwen27b/**
+      - bench/draft-vocab/**
+      - scripts/download_weights.py
+      - scripts/windows/**
+      - .github/workflows/windows.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write  # (the Release of a tag)
+
+env:
+  CUDA_VERSION: 13.3.1
+  CUDA_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3
+
+jobs:
+  package:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      # (pip downloads the package's wheels; it does not need to be the package's Python)
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      # The CUDA toolkit's compiler parts only (the network installer, 10 MB, fetches them), cached between runs.
+      - id: cuda-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.CUDA_DIR }}
+          key: cuda-${{ env.CUDA_VERSION }}-nvcc-nvvm-cudart-crt-thrust
+      - name: Install the CUDA compiler
+        if: steps.cuda-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\cuda_network.exe"
+          Invoke-WebRequest "https://developer.download.nvidia.com/compute/cuda/$env:CUDA_VERSION/network_installers/cuda_${env:CUDA_VERSION}_windows_network.exe" -OutFile $exe
+          $v = ($env:CUDA_VERSION -split "\.")[0..1] -join "."
+          $p = Start-Process $exe -Wait -PassThru -ArgumentList "-s", "nvcc_$v", "nvvm_$v", "cudart_$v", "crt_$v", "thrust_$v"
+          if ($p.ExitCode) { throw "CUDA installer exit code $($p.ExitCode)" }
+          & "$env:CUDA_DIR\bin\nvcc.exe" --version
+      # MSVC from the runner's Visual Studio (vcvars64.bat), CMake and Ninja from its PATH.
+      - name: Build the package
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          set "CUDA_PATH=%CUDA_DIR%"
+          set "CUDACXX=%CUDA_DIR%\bin\nvcc.exe"
+          set "PATH=%CUDA_DIR%\bin;%PATH%"
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\package.ps1 -Python python || exit /b 1
+      # The package loads: q27.dll through ctypes in its own Python, with the C API all there (no GPU needed).
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $py = "dist\qwen3-27b-5090-windows-x64\python\python.exe"
+          $app = "dist\qwen3-27b-5090-windows-x64\app"
+          & $py -c "import sys; sys.path.insert(0, r'$app\engine\python'); import q27lib; l = q27lib.lib(); assert l.q27t_sf_bytes(2048, 320) == 655360; import numpy, PIL, tokenizers, jinja2; print('ok', sys.version)"
+          if ($LASTEXITCODE) { throw "smoke test failed" }
+          (Get-FileHash -Algorithm SHA256 dist\qwen3-27b-5090-windows-x64.zip).Hash.ToLower() + "  qwen3-27b-5090-windows-x64.zip" | Set-Content -Encoding ascii dist\qwen3-27b-5090-windows-x64.zip.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: qwen3-27b-5090-windows-x64
+          path: |
+            dist/qwen3-27b-5090-windows-x64.zip
+            dist/qwen3-27b-5090-windows-x64.zip.sha256
+          retention-days: 30
+      - name: Release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view $env:GITHUB_REF_NAME 2>$null
+          if ($LASTEXITCODE) { gh release create $env:GITHUB_REF_NAME --verify-tag --generate-notes }
+          gh release upload $env:GITHUB_REF_NAME dist\qwen3-27b-5090-windows-x64.zip dist\qwen3-27b-5090-windows-x64.zip.sha256 --clobber
