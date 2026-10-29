@@ -2,8 +2,10 @@
 the Windows package runs it before the server (no huggingface_hub, uv or symlinks), and it works on Linux as well.
 
     python scripts/download_weights.py [--weights gdnfp4|nvidia|quasar|ORG/NAME[@REVISION]] [--no-draft] [--jobs 4]
+                                       [--also nvidia|quasar|bf16|ORG/NAME[@REVISION]]...
 
---weights defaults to $WEIGHTS, else gdnfp4; the DFlash2 draft comes too unless --no-draft or SPEC=none. A profile's
+--weights defaults to $WEIGHTS, else gdnfp4; the DFlash2 draft comes too unless --no-draft or SPEC=none. --also adds
+more checkpoints (bf16: the BF16 original; scripts/download-weights.sh uses it for --dev, --bf16, --quasar). A profile's
 revision is pinned (reference/qwen27b/paths.py); a repository's branch or tag (default main) is resolved to its
 commit, recorded under refs/ as huggingface_hub does. Before downloading a repository, its safetensors headers (a few
 hundred KB) go through the engine's own checks (q27_plan, no GPU), so an unsupported checkpoint stops here rather than
@@ -172,14 +174,19 @@ def main():
                     help="without the DFlash2 draft (speculative decoding off: SPEC=none)")
     ap.add_argument("--no-check", action="store_true", help="download a repository without the engine's check")
     ap.add_argument("--jobs", type=int, default=4, help="files downloaded at once")
+    ap.add_argument("--also", action="append", default=[], metavar="WEIGHTS",
+                    help="another checkpoint to download: nvidia, quasar, bf16 or ORG/NAME[@REVISION] (repeatable)")
     args = ap.parse_args()
 
-    if args.weights in PROFILE_PINS:
-        pins = [(repo, rev, None) for repo, rev in PROFILE_PINS[args.weights]]
-    elif repo := paths.hf_repo(args.weights):
-        pins = [(repo[0], repo[1] or "main", "check")]
-    else:
-        sys.exit(f"--weights: a profile ({', '.join(PROFILE_PINS)}) or ORG/NAME[@REVISION], not {args.weights!r}")
+    pins = []
+    for opt, w in [("--weights", args.weights)] + [("--also", a) for a in args.also]:
+        if w in PROFILE_PINS or w == "bf16":
+            new = [(repo, rev, None) for repo, rev in PROFILE_PINS.get(w, [paths.BF16])]
+        elif repo := paths.hf_repo(w):
+            new = [(repo[0], repo[1] or "main", "check")]
+        else:
+            sys.exit(f"{opt}: a profile ({', '.join(PROFILE_PINS)}) or ORG/NAME[@REVISION], not {w!r}")
+        pins += [p for p in new if p not in pins]
     if not args.no_draft:
         pins.append((*paths.DFLASH2, None))
 

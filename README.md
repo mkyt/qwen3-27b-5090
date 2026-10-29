@@ -89,8 +89,8 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 - About 25 GB of disk for the weights; 350 MB for the serving image or 44 MB for the Windows package (the development
   image, for the tests and benchmarks, is 20 GB). At least 16 GB of host RAM: the engine pins about 8 GB (the
   embedding table, the prefix cache, the vision tower).
-- To download the weights on Linux: [uv](https://docs.astral.sh/uv/) for `scripts/download-weights.sh`, or any
-  Python 3.10+ for `scripts/download_weights.py` (standard library only).
+- To download the weights on Linux: Python 3.10+ (standard library only) or [uv](https://docs.astral.sh/uv/) for
+  `scripts/download-weights.sh`. An interrupted download resumes when the command is run again.
 
 ## Quick start
 
