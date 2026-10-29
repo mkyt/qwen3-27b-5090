@@ -129,4 +129,4 @@ def test_tokenizer_template_of_other_weights():
     assert mixed.render(msgs) == theirs.render(msgs)  # (unsloth's template merges the system messages)
     with pytest.raises(Exception, match="System message must be at the beginning"):
         Tokenizer(own).render(msgs)
-    assert mixed.encode("日本語 text") == Tokenizer(own).encode("日本語 text")
+    assert mixed.encode("na\u0308ive text") == Tokenizer(own).encode("na\u0308ive text")  # (a combining mark)
