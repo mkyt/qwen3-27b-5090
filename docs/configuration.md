@@ -160,4 +160,4 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_LOOKUP=1` | Lookup drafting (off: no gain with the 8-row chain) |
 | `Q27_SPEC_PIPELINE=0` | Enqueue a speculative step after reading the previous result (default 1: before) |
 | `Q27_SKINNY_WAVES` / `Q27_SKINNY_FIT` / `Q27_SKINNY_L2_CHUNKS` / `Q27_ATTN_WAVES` / `Q27_ATTN_MIN_KEYS` / `Q27_ATTN_PREFETCH` / `Q27_ATTN_TC_SPLITS` | Tuning |
-| `Q27_LIB` / `Q27_TRACE` | Another build of `libq27.so` (e.g. for tracing) / where a `-DQ27_TRACE` build writes its timeline |
+| `Q27_LIB` / `Q27_TRACE` | Another build of `libq27.so` (e.g. for tracing; the default is `/build/engine/libq27.so`, on Windows `engine/build/q27.dll`) / where a `-DQ27_TRACE` build writes its timeline |

@@ -1,10 +1,13 @@
-"""ctypes binding of libq27.so: the engine (Engine) and the kernel wrappers used by the tests (call)."""
+"""ctypes binding of libq27.so (q27.dll on Windows): the engine (Engine) and the kernel wrappers used by the tests (call)."""
 
 import array
 import ctypes
 import os
 
-LIB_PATH = os.environ.get("Q27_LIB", "/build/engine/libq27.so")
+# Windows: the CMake build in engine/build (cmake -S engine -B engine/build); Linux: the dev image's /build.
+_DEFAULT_LIB = (os.path.join(os.path.dirname(__file__), "../build/q27.dll") if os.name == "nt"
+                else "/build/engine/libq27.so")
+LIB_PATH = os.environ.get("Q27_LIB", _DEFAULT_LIB)
 # Draft vocabulary of the DFlash2 candidates (tools/draft_vocab.py); Q27_DRAFT_VOCAB=none: the full vocabulary.
 DRAFT_VOCAB = os.path.join(os.path.dirname(__file__), "../../bench/draft-vocab/vocab-128k.txt")
 

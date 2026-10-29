@@ -3,8 +3,8 @@ snapshots (worker.py "memory" / "stats"), and a log of the requests and engine e
 
 The hub keeps the last STATS_HISTORY_S seconds of samples and the last LOG_SIZE log entries in memory; GET
 /ui/stream sends them as server-sent events (an "init" event, then a "tick" every second and the new log entries).
-NVML is read through ctypes (libnvidia-ml.so.1, mounted by the NVIDIA container runtime); without it the GPU
-fields are null.
+NVML is read through ctypes (libnvidia-ml.so.1, mounted by the NVIDIA container runtime; nvml.dll, installed with the
+driver on Windows); without it the GPU fields are null.
 """
 
 import collections
@@ -31,7 +31,7 @@ class Nvml:
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
     def __init__(self):
-        self.lib = ctypes.CDLL("libnvidia-ml.so.1")
+        self.lib = ctypes.CDLL("nvml.dll" if os.name == "nt" else "libnvidia-ml.so.1")
         if self.lib.nvmlInit_v2() != 0:
             raise OSError("nvmlInit failed")
         self.h = ctypes.c_void_p()

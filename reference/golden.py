@@ -89,7 +89,7 @@ def cmd_engine(args):
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "engine/python"))
     from q27lib import Engine
 
-    from qwen27b.weights import engine_target
+    from qwen27b.paths import engine_target  # (no PyTorch: runs with the serving packages)
 
     prompts = [p for p in read_jsonl(args.prompts) if not args.max_len or len(p["ids"]) <= args.max_len]
     eng = Engine(engine_target(args.model), max_tokens=max(len(p["ids"]) for p in prompts),

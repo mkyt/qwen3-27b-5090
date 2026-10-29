@@ -2,6 +2,7 @@
 /hf
 # Build outputs, scratch files and local weight copies
 /cache/
+/engine/build/
 __pycache__/
 .pytest_cache/
 # Golden recordings (scripts/download-golden.sh, GitHub Releases) and downloaded evaluation data
