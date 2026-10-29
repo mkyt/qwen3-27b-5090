@@ -74,9 +74,10 @@ def test_plans_match_the_engine():
     os.environ.setdefault("STATE_HOST_CACHE", "4")
     out = lc.plans(lc.settings, DEVICE)
     p = out["plan"]
-    # The serve default's startup log on this device: kv pool 9461 pages (605504 tokens), device 28.378 GiB.
+    # The serve default's startup log on this device: kv pool 9461 pages (605504 tokens), device 28.370 GiB
+    # (28.378 until the own GEMMs replaced CUTLASS and its 7.8 MiB workspace).
     assert (p["max_tokens"], p["kv_tokens"], p["fits"]) == (262144, 605504, True)
-    assert abs(p["device"] / GiB - 28.378) < 0.001 and abs(p["budget"] / GiB - 28.68) < 0.01
+    assert abs(p["device"] / GiB - 28.370) < 0.001 and abs(p["budget"] / GiB - 28.68) < 0.01
     kv = {v["value"]: v["plan"] for v in out["variants"]["kv_dtype"]}
     assert kv["nvfp4"] == p and kv["fp8"]["kv_tokens"] < kv["nvfp4"]["kv_tokens"]
     small = {v["value"]: v["plan"] for v in out["variants"]["vram_budget_gib"]}[20.0]
