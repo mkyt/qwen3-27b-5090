@@ -16,12 +16,13 @@
 #include <sstream>
 
 #include "common.h"
+#include "fs.h"
 
 namespace q27 {
 namespace {
 
 std::string slurp(const std::string& path) {
-  std::ifstream f(path, std::ios::binary);
+  std::ifstream f(fs_path(path), std::ios::binary);
   if (!f) fail("cannot open " + path);
   std::stringstream ss;
   ss << f.rdbuf();
@@ -39,7 +40,9 @@ int64_t pread_once(int fd, char* p, int64_t len, int64_t off) {
   if (!ReadFile(HANDLE(_get_osfhandle(fd)), p, DWORD(len), &n, &ov)) return -1;
   return int64_t(n);
 }
-int open_ro(const std::string& path) { return ::_open(path.c_str(), _O_RDONLY | _O_BINARY | _O_NOINHERIT); }
+int open_ro(const std::string& path) {
+  return ::_wopen(fs_path(path).c_str(), _O_RDONLY | _O_BINARY | _O_NOINHERIT);
+}
 void close_fd(int fd) { ::_close(fd); }
 #else
 int64_t pread_once(int fd, char* p, int64_t len, int64_t off) { return ::pread(fd, p, size_t(len), off); }
@@ -70,7 +73,7 @@ int64_t TensorInfo::numel() const {
 SafeTensors::SafeTensors(const std::string& dir) : dir_(dir) {
   config_ = Json::parse(slurp(dir + "/config.json"));
   std::vector<std::string> shards;
-  std::ifstream idx(dir + "/model.safetensors.index.json");
+  std::ifstream idx(fs_path(dir + "/model.safetensors.index.json"));
   if (idx) {
     std::set<std::string> uniq;
     Json index = Json::parse(slurp(dir + "/model.safetensors.index.json"));

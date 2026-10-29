@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common.h"
+#include "fs.h"
 #include "json.h"
 
 namespace q27 {
@@ -37,7 +38,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   if (!opt.plan_only) Q27_CUDA(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking));
   ckpt_ = std::make_unique<SafeTensors>(opt.model_dir);
   // End-of-sequence ids (speculative steps end at an accepted one).
-  if (std::ifstream f(opt.model_dir + "/generation_config.json"); f) {
+  if (std::ifstream f(fs_path(opt.model_dir + "/generation_config.json")); f) {
     const Json gc = Json::parse(std::string(std::istreambuf_iterator<char>(f), {}));
     if (gc.has("eos_token_id")) {
       const Json& e = gc["eos_token_id"];
@@ -47,7 +48,7 @@ Model::Model(const Options& opt) : opt_(opt) {
         stop_[0] = int32_t(e.as_int());
     }
   }
-  if (const char* lm = getenv("Q27_LM_HEAD_CKPT"); lm && *lm && ckpt_->info("lm_head.weight").dtype == "BF16")
+  if (const std::string lm = env_path("Q27_LM_HEAD_CKPT"); !lm.empty() && ckpt_->info("lm_head.weight").dtype == "BF16")
     lm_ckpt_ = std::make_unique<SafeTensors>(lm);
   w_.plan(*ckpt_, lm_ckpt_.get(), dev_weights_, host_weights_);
   if (w_.fp4_proj) log("GDN / attention projections: NVFP4");

@@ -6,6 +6,7 @@
 #include <fstream>
 
 #include "common.h"
+#include "fs.h"
 #include "prefetch.h"
 
 namespace q27 {
@@ -104,8 +105,8 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, int max_ctx_rows,
   tensor("candidate_selector.predecessor_codebook", &pred_cb_, -1, kSelRank);
   tensor("candidate_selector.successor_codebook", &succ_cb_, -1, kSelRank);
 
-  if (const char* vf = getenv("Q27_DRAFT_VOCAB"); vf && *vf) {
-    std::ifstream in(vf);
+  if (const std::string vf = env_path("Q27_DRAFT_VOCAB"); !vf.empty()) {
+    std::ifstream in(fs_path(vf));
     Q27_CHECK(in.good(), std::string("cannot read the draft vocabulary ") + vf);
     for (int64_t id; in >> id;) {
       Q27_CHECK(id >= 0 && id < dims::kVocab, "draft vocabulary: id out of range");
@@ -118,7 +119,7 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, int max_ctx_rows,
     vocab_ids_off_ = wpool_.add("draft vocabulary ids", size_t(n) * 4);
     vocab_w_off_ = wpool_.add("draft vocabulary head", size_t(n) * kHidden / 2);
     vocab_sf_off_ = wpool_.add("draft vocabulary head scales", size_t(sf_bytes(n, kHidden / 16)));
-    log("draft vocabulary: %d ids (%s)", n, vf);
+    log("draft vocabulary: %d ids (%s)", n, vf.c_str());
   }
 
   const int R = max_ctx_rows_;

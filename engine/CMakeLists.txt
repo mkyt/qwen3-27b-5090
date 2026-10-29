@@ -18,6 +18,11 @@ if(MSVC)
   add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${Q27_MSVC_FLAGS_CSV}>")
   # The C ABI in capi.cc carries no export annotations; export everything from q27.dll.
   set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+  # Hybrid CRT: the C++ runtime (vcruntime, msvcp) linked statically and the Universal CRT from the system's
+  # ucrtbase.dll, so q27.dll needs no VC++ redistributable and shares the heap and the environment with Python
+  # (a static UCRT would keep its own copy of the environment, blind to os.environ set after the load).
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  set(Q27_UCRT "ucrt$<$<CONFIG:Debug>:d>.lib")
 endif()
 
 find_package(CUDAToolkit REQUIRED)
@@ -43,3 +48,6 @@ add_library(q27 SHARED
 )
 target_include_directories(q27 PRIVATE src)
 target_link_libraries(q27 PRIVATE CUDA::cudart)
+if(MSVC)
+  target_link_options(q27 PRIVATE "/NODEFAULTLIB:lib${Q27_UCRT}" "/DEFAULTLIB:${Q27_UCRT}")
+endif()
