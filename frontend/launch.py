@@ -13,9 +13,9 @@ import multiprocessing as mp
 import os
 import threading
 
-from qwen27b.paths import DFLASH2, TARGET, engine_target, snapshot
+from qwen27b.paths import DFLASH2, PROFILES, TARGET, downloaded_repos, engine_target, snapshot
+from tokenizer import fingerprint
 
-PROFILES = ("gdnfp4", "nvidia", "quasar")
 CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
 MAX_SEQS = 8                # (the engine's lanes of a batched step)
 MAX_CONTEXT = 262144        # max_position_embeddings of the checkpoint
@@ -51,8 +51,9 @@ class Launch:
 
     KEYS = ("weights", "kv_dtype", "spec", "vision", "max_seqs", "max_tokens", "vram_budget_gib")
 
-    def __init__(self, base, settings):
+    def __init__(self, base, settings, tokenizer=None):
         self.base = base            # the rest of the engine's configuration (prefill chunk, scheduling, ...)
+        self.tokenizer = tokenizer  # fingerprint() of the server's tokenizer: weights with another one are refused
         self.lock = threading.Lock()
         self.plans_cache = {}
         self.planner = None
@@ -61,14 +62,22 @@ class Launch:
 
     # ------------------------------------------------------------ settings
 
+    def weights_list(self):
+        """The profiles, the server's own weights, and the checkpoints of the model downloaded from other repositories
+        (paths.downloaded_repos: "org/name" or "org/name@commit")."""
+        listed = PROFILES + self.extra_weights
+        return listed + tuple(w for w in downloaded_repos() if w not in listed)
+
     def weights_choices(self):
-        """{profile: None if it can be loaded, else why not}."""
+        """{weights: None if they can be loaded, else why not}."""
         out = {}
-        for w in PROFILES + self.extra_weights:
+        for w in self.weights_list():
             try:
-                model_dir(w)
+                path = model_dir(w)
                 out[w] = None
-            except FileNotFoundError as e:
+                if self.tokenizer and fingerprint(path) != self.tokenizer:
+                    out[w] = f"{w}: another tokenizer or chat template than the server's (start the server with WEIGHTS={w})"
+            except (FileNotFoundError, KeyError, ValueError) as e:
                 out[w] = str(e)
         return out
 
@@ -78,8 +87,12 @@ class Launch:
         unknown = set(changes) - set(self.KEYS)
         if unknown:
             raise ValueError(f"unknown setting {sorted(unknown)[0]!r} (settings: {', '.join(self.KEYS)})")
-        if s["weights"] not in PROFILES + self.extra_weights:
-            raise ValueError(f"weights: one of {', '.join(PROFILES + self.extra_weights)}")
+        if s["weights"] not in self.weights_list():
+            raise ValueError(f"weights: one of {', '.join(self.weights_list())}")
+        if self.tokenizer and s["weights"] != getattr(self, "settings", s)["weights"]:
+            why = self.weights_choices()[s["weights"]]
+            if why and "tokenizer" in why:
+                raise ValueError(f"weights: {why}")
         for k, values in CHOICES.items():
             if s[k] not in values:
                 raise ValueError(f"{k}: one of {', '.join(values)}")
@@ -144,7 +157,7 @@ class Launch:
 
     def plans(self, s, device):
         """The plan of settings s and, for each setting, the plans with one value changed (the page's choices)."""
-        variants = {"weights": PROFILES + self.extra_weights, **CHOICES, **VARIANTS}
+        variants = {"weights": self.weights_list(), **CHOICES, **VARIANTS}
         listed = [s]
         for k, values in variants.items():
             listed += [dict(s, **{k: v}) for v in values]

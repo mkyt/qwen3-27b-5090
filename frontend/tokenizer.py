@@ -3,6 +3,7 @@ template, set up as transformers 5.18 does (`TokenizersBackend`, `render_jinja_t
 and encodes to the same ids (frontend/tests/test_tokenizer.py compares them where transformers is installed).
 """
 
+import hashlib
 import json
 import pathlib
 from datetime import datetime
@@ -38,6 +39,28 @@ class GenerationTag(jinja2.ext.Extension):
 
     def _body(self, caller):
         return caller()
+
+
+_fingerprints = {}
+
+
+def fingerprint(path):
+    """What the server's text handling takes from a model directory (tokenizer.json, the chat template, the special
+    tokens) as a digest: the server keeps the tokenizer it started with, so it starts an engine on other weights
+    (launch.py) only if theirs is the same."""
+    path = pathlib.Path(path)
+    files = [path / f for f in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")]
+    key = (str(path), tuple(f.stat().st_mtime_ns if f.is_file() else 0 for f in files))
+    if key not in _fingerprints:
+        config = json.loads(files[1].read_text())
+        template = files[2].read_text() if files[2].is_file() else config.get("chat_template", "")
+        # (the special tokens the template can see: those it names; tokenizer_config.json files of the same tokenizer
+        # differ in the others, e.g. audio tokens a fine-tune's older transformers did not write)
+        special = sorted((k, v) for k, v in config.items() if k.endswith("_token") and isinstance(v, str) and k in template)
+        h = hashlib.sha256(files[0].read_bytes())
+        h.update(json.dumps([template, special]).encode())
+        _fingerprints[key] = h.hexdigest()
+    return _fingerprints[key]
 
 
 class Tokenizer:

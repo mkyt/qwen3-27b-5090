@@ -1209,9 +1209,9 @@ def main():
     args = ap.parse_args()
 
     from launch import model_dir
-    from tokenizer import Tokenizer
+    from tokenizer import Tokenizer, fingerprint
 
-    path = model_dir(args.weights)  # (the profiles share the tokenizer)
+    path = model_dir(args.weights)  # (the tokenizer: other weights must have the same, Launch.weights_choices)
     tok = Tokenizer(path)
     for k, v in ENGINE_ENV_DEFAULTS.items():
         os.environ.setdefault(k, v)
@@ -1226,7 +1226,8 @@ def main():
     budget = env("VRAM_BUDGET_GIB")
     launch = Launch(base, {"weights": args.weights, "kv_dtype": args.kv_dtype, "spec": args.spec,
                            "vision": env("VISION") or "host", "max_seqs": max(1, min(args.max_seqs, 8)),
-                           "max_tokens": args.max_tokens, "vram_budget_gib": float(budget) if budget else None})
+                           "max_tokens": args.max_tokens, "vram_budget_gib": float(budget) if budget else None},
+                    tokenizer=fingerprint(path))
     HUB.start()
     engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0")
     Handler.srv = Server(engine, tok, args.max_tokens, launch)

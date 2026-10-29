@@ -20,7 +20,7 @@ directly uses the same defaults. The startup log prints the memory plan. Task ID
 | `BATCH_DECODE` | 1 | 1: requests in decode advance together in one batched speculative step (P6-10; about 2.3x aggregate at 4 requests; each request's tokens are the same as alone). 0: requests take turns |
 | `PREFILL_CHUNK` | 2048 | Prefill chunk in tokens (8,192 is only 2.5% faster at 32K and needs 4x the activations, P5-4) |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16`. NVFP4 holds about 1.7x the tokens of FP8 (589,888 against 339,968 at 262K with gdnfp4), prefills as fast or faster (+1 / +6 / +9% at 19K / 73K / 194K, P7-8), and costs a little KL against the BF16 original (0.0470 against 0.0445 with FP8 KV); GSM8K, the Japanese set and needle retrieval are the same. BFCL `parallel` is about 3 points lower than FP8 on short prompts and the same after 32K / 96K of agent context (P4-11, P7-8, P7-9) |
-| `WEIGHTS` | `gdnfp4` | `gdnfp4`: GDN projections in NVFP4, attention projections FP8 ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), pinned revision, `scripts/download-weights.sh`; PQ-14). `nvidia`: NVIDIA's checkpoint as is (GDN / attention projections FP8). `quasar`: the QUASAR-QAT checkpoint, every projection NVFP4, weaker at parallel tool calls (`scripts/download-weights.sh --quasar`; its BF16 `lm_head` is replaced by NVIDIA's NVFP4 one through `Q27_LM_HEAD_CKPT`). Or a model directory inside the container. From Python: `qwen27b.weights.engine_target(...)`; scripts take `--weights` |
+| `WEIGHTS` | `gdnfp4` | `gdnfp4`: GDN projections in NVFP4, attention projections FP8 ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), pinned revision, `scripts/download-weights.sh`; PQ-14). `nvidia`: NVIDIA's checkpoint as is (GDN / attention projections FP8). `quasar`: the QUASAR-QAT checkpoint, every projection NVFP4, weaker at parallel tool calls (`scripts/download-weights.sh --quasar`; its BF16 `lm_head` is replaced by NVIDIA's NVFP4 one through `Q27_LM_HEAD_CKPT`). Or another NVFP4 checkpoint of Qwen3.8-27B on the Hugging Face Hub, e.g. a fine-tune: `ORG/NAME` (its main branch) or `ORG/NAME@REVISION`, downloaded with `scripts/download_weights.py --weights ORG/NAME` (which first checks that the engine takes it) or `scripts/download-weights.sh --repo ORG/NAME` (see [Other checkpoints](#other-checkpoints)). Or a model directory inside the container. From Python: `qwen27b.weights.engine_target(...)`; scripts take `--weights` |
 | `SPEC` | `dflash2` | `dflash2` (speculative decoding with the DFlash2 draft) or `none` |
 | `Q27_DRAFT_QUANT` | `fp4` | Draft linear layers: `fp4`, `fp8` or `bf16` (same acceptance, FP4 is fastest) |
 | `Q27_DRAFT_VOCAB` | `bench/draft-vocab/vocab-128k.txt` | Candidate vocabulary of the draft (`tools/draft_vocab.py`); `none` for the full vocabulary |
@@ -132,6 +132,23 @@ the deepest match. The log line `[api] prompt N tokens, cached C of R reusable` 
 `q27:reusable_tokens_total` metrics show how well it hits. Clients must send the previous turns' reasoning back, since
 the chat template renders it.
 
+## Other checkpoints
+
+`WEIGHTS=ORG/NAME[@REVISION]` serves another NVFP4 checkpoint of Qwen3.8-27B from the Hugging Face cache. The engine
+takes the layouts it already reads: the modelopt one of NVIDIA's checkpoint (projections in FP8 or NVFP4) and the
+compressed-tensors one of QUASAR, with NVFP4 activations (W4A4) and the model's dimensions. A BF16 `lm_head` (kept by
+QUASAR and its fine-tunes) is quantized to NVFP4 at load, with the block scales chosen for the smallest error (on
+QUASAR: KL to the BF16 model 0.0473, against 0.0471 with NVIDIA's NVFP4 `lm_head`). Weight-only checkpoints
+(NVFP4A16), GGUF files, other engines' formats and checkpoints that mix in other types are refused with the tensor at
+fault. `scripts/download_weights.py` runs the engine's checks on the safetensors headers before it downloads anything
+(it needs the engine library, `Q27_LIB`).
+
+The stats page lists the downloaded checkpoints of the model under the start settings. The server keeps the tokenizer
+and chat template of the weights it started with, so it starts an engine only on weights with the same ones; for a
+checkpoint with its own, start the server with `WEIGHTS` set to it. The DFlash2 draft was trained on the original
+model: it stays correct on a fine-tune (the target model checks every token), but accepts fewer tokens the further
+the fine-tune drifts.
+
 ## Windows package
 
 `start.cmd` of the Windows package (`scripts/windows/package.ps1`) runs `scripts/download_weights.py`, then the
@@ -143,8 +160,9 @@ server with the defaults above. It reads these besides the serving variables (se
 | `HOST` | 127.0.0.1 | Address the server listens on (`0.0.0.0`: the network, which Windows Firewall asks about) |
 | `PORT` | 8000 | Port of the API and the web UI (also read by `frontend/server.py`) |
 | `OPEN_UI` | 1 | 1: open the web UI in the browser at the start; 0: do not (e.g. a start at logon) |
+| `WEIGHTS` | gdnfp4 | Weights downloaded before the start and served: a profile or `ORG/NAME[@REVISION]` ([Other checkpoints](#other-checkpoints)) |
 | `HF_HOME` | `%USERPROFILE%\.cache\huggingface` | Hugging Face cache the weights are downloaded to and loaded from (23 GB) |
-| `HF_TOKEN` | (none) | Sent with the downloads if set (the repositories are not gated; it only raises the rate limit) |
+| `HF_TOKEN` | (none) | Sent with the downloads if set (needed for gated repositories; otherwise it only raises the rate limit) |
 
 ## Development switches
 

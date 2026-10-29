@@ -657,13 +657,19 @@ function replan() {
 }
 function setForm(k, v) { L.form = { ...L.form, [k]: v }; replan(); }
 
+// A Hugging Face repository's weights ("org/name" or "org/name@commit"): the name, then the org and the commit.
+function repoName(v) {
+  const [repo, rev] = v.split("@"), [org, name] = repo.split("/");
+  return [name, org + (rev ? " @" + rev.slice(0, 7) : "")];
+}
 function optButton(o, v, p) {
-  let [name, sub] = o.names?.[v] || [fmtVal(o.key, v)];
+  let [name, sub] = o.names?.[v] || (o.key === "weights" && /^[^/]+\/[^/@]+(@.+)?$/.test(v) ? repoName(v) : [fmtVal(o.key, v)]);
   if (o.key === "vram_budget_gib" && v == null && p?.budget) sub = fmtGiB(p.budget);
   const unavailable = o.key === "weights" && L.weights[v];
   const b = el("button", { class: "opt", "aria-pressed": String(L.form[o.key] === v), type: "button" },
     el("b", {}, name), sub ? el("span", { class: "muted", style: "font-size:11px" }, " " + sub) : null,
-    el("span", { class: "n" + (p?.error || unavailable ? " bad" : "") }, unavailable ? "not downloaded" : planNote(p)));
+    el("span", { class: "n" + (p?.error || unavailable ? " bad" : "") },
+      unavailable ? (unavailable.includes("tokenizer") ? "other tokenizer" : "not downloaded") : planNote(p)));
   if (L.running && L.running[o.key] === v) b.append(el("i", { class: "run", title: "the running engine" }));
   if (unavailable) { b.disabled = true; b.title = L.weights[v]; }
   else if (p?.error) b.title = p.error;

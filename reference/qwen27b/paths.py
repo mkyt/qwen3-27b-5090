@@ -1,8 +1,10 @@
 """Where the checkpoints are: the pinned Hugging Face revisions and their local directories (no PyTorch, so the
 API server can use it)."""
 
+import json
 import os
 import pathlib
+import re
 
 HF_HUB = pathlib.Path(os.environ.get("HF_HOME", pathlib.Path.home() / ".cache/huggingface")) / "hub"
 
@@ -36,10 +38,65 @@ def snapshot(repo: str, rev: str) -> pathlib.Path:
     return path
 
 
+PROFILES = ("gdnfp4", "nvidia", "quasar")
+# Another checkpoint of the model on the Hugging Face Hub, e.g. a fine-tune quantized like NVIDIA's (modelopt) or
+# QUASAR (compressed-tensors): "org/name" (its main branch) or "org/name@revision" (a commit, branch or tag).
+HF_REPO = re.compile(r"[\w.-]+/[\w.-]+(@[\w.-]+)?")
+
+
+def hf_repo(weights: str):
+    """(repo, revision or None) if `weights` names a Hugging Face repository (not a profile or an existing path)."""
+    if weights in PROFILES or not HF_REPO.fullmatch(weights) or pathlib.Path(weights).exists():
+        return None
+    repo, _, rev = weights.partition("@")
+    return repo, rev or None
+
+
+def repo_snapshot(repo: str, rev: str | None = None) -> pathlib.Path:
+    """The downloaded snapshot of a repository at a commit, or at a branch or tag (default main) through the cache's
+    refs/, as huggingface_hub and scripts/download_weights.py record them."""
+    rev = rev or "main"
+    if not re.fullmatch(r"[0-9a-f]{40}", rev):
+        ref = HF_HUB / f"models--{repo.replace('/', '--')}" / "refs" / rev
+        if not ref.is_file():
+            raise FileNotFoundError(f"{repo}@{rev} is not in {HF_HUB} (scripts/download_weights.py --weights {repo})")
+        rev = ref.read_text().strip()
+    return snapshot(repo, rev)
+
+
+def downloaded_repos():
+    """{weights value: snapshot} of the checkpoints of this model in the cache besides the profiles' (by config.json:
+    Qwen3.8-27B's dimensions and a quantization config; the engine checks the rest when it plans them)."""
+    pinned = {r for r, _ in (TARGET, QUASAR, GDNFP4, BF16, DFLASH2)}
+    out = {}
+    for base in sorted(HF_HUB.glob("models--*--*")):
+        repo = base.name.removeprefix("models--").replace("--", "/", 1)
+        if repo in pinned:
+            continue
+        refs = {(base / "refs" / r).read_text().strip(): r for r in ("main",) if (base / "refs" / r).is_file()}
+        for snap in sorted(base.glob("snapshots/*")):
+            if is_model(snap):
+                out[repo if refs.get(snap.name) == "main" else f"{repo}@{snap.name}"] = snap
+    return out
+
+
+def is_model(path: pathlib.Path) -> bool:
+    """Whether config.json describes a quantized Qwen3.8-27B (the engine's dims.h)."""
+    try:
+        cfg = json.loads((path / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    text = cfg.get("text_config", cfg)
+    dims = (text.get("hidden_size"), text.get("num_hidden_layers"), text.get("vocab_size"), text.get("intermediate_size"))
+    quantized = "quantization_config" in cfg or (path / "hf_quant_config.json").is_file()
+    return dims == (5120, 64, 248320, 17408) and quantized
+
+
 def engine_target(weights: str = "nvidia") -> pathlib.Path:
-    """The model directory the engine opens for a weight profile (nvidia | gdnfp4 | quasar | a directory, e.g. one from
-    scripts/quantize_proj.py). QUASAR keeps the BF16 original lm_head, so the engine reads TARGET's NVFP4 one
-    (Q27_LM_HEAD_CKPT, set here)."""
+    """The model directory the engine opens for a weight profile (nvidia | gdnfp4 | quasar), a Hugging Face repository
+    (hf_repo: "org/name[@revision]", downloaded) or a directory, e.g. one from scripts/quantize_proj.py. QUASAR keeps
+    the BF16 original lm_head, so the engine reads TARGET's NVFP4 one (Q27_LM_HEAD_CKPT, set here); other BF16
+    lm_heads are quantized at load."""
     if weights == "gdnfp4":  # Phase Q: GDN projections in NVFP4 (GPTQ), attention FP8
         try:
             return snapshot(*GDNFP4)
@@ -50,7 +107,8 @@ def engine_target(weights: str = "nvidia") -> pathlib.Path:
                                         "run scripts/download-weights.sh") from None
             return path
     if weights not in ("nvidia", "quasar"):
-        return pathlib.Path(weights)
+        repo = hf_repo(weights)
+        return repo_snapshot(*repo) if repo else pathlib.Path(weights)
     if weights == "quasar":
         os.environ["Q27_LM_HEAD_CKPT"] = str(snapshot(*TARGET))
         return snapshot(*QUASAR)
