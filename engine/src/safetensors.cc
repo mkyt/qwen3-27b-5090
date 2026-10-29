@@ -1,7 +1,14 @@
 #include "safetensors.h"
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <cstring>
 #include <fstream>
@@ -21,11 +28,30 @@ std::string slurp(const std::string& path) {
   return ss.str();
 }
 
+#ifdef _WIN32
+// pread for a CRT descriptor: a positioned ReadFile on its OS handle (does not move the file pointer
+// for other readers; the handle is not opened for overlapped I/O, so the call is synchronous).
+int64_t pread_once(int fd, char* p, int64_t len, int64_t off) {
+  OVERLAPPED ov{};
+  ov.Offset = DWORD(uint64_t(off));
+  ov.OffsetHigh = DWORD(uint64_t(off) >> 32);
+  DWORD n = 0;
+  if (!ReadFile(HANDLE(_get_osfhandle(fd)), p, DWORD(len), &n, &ov)) return -1;
+  return int64_t(n);
+}
+int open_ro(const std::string& path) { return ::_open(path.c_str(), _O_RDONLY | _O_BINARY | _O_NOINHERIT); }
+void close_fd(int fd) { ::_close(fd); }
+#else
+int64_t pread_once(int fd, char* p, int64_t len, int64_t off) { return ::pread(fd, p, size_t(len), off); }
+int open_ro(const std::string& path) { return ::open(path.c_str(), O_RDONLY | O_CLOEXEC); }
+void close_fd(int fd) { ::close(fd); }
+#endif
+
 void pread_all(int fd, void* dst, int64_t len, int64_t off) {
   char* p = static_cast<char*>(dst);
   while (len > 0) {
     // Bounded requests: very large single reads are slow on virtiofs / 9p.
-    ssize_t n = ::pread(fd, p, size_t(std::min<int64_t>(len, 64 << 20)), off);
+    int64_t n = pread_once(fd, p, std::min<int64_t>(len, 64 << 20), off);
     if (n <= 0) fail("pread failed: " + std::string(strerror(errno)));
     p += n;
     off += n;
@@ -55,7 +81,7 @@ SafeTensors::SafeTensors(const std::string& dir) : dir_(dir) {
   }
   for (auto& shard : shards) {
     std::string path = dir + "/" + shard;
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    int fd = open_ro(path);
     if (fd < 0) fail("cannot open " + path);
     fds_.push_back(fd);
     uint64_t hlen = 0;
@@ -78,7 +104,7 @@ SafeTensors::SafeTensors(const std::string& dir) : dir_(dir) {
 }
 
 SafeTensors::~SafeTensors() {
-  for (int fd : fds_) ::close(fd);
+  for (int fd : fds_) close_fd(fd);
 }
 
 const TensorInfo& SafeTensors::info(const std::string& name) const {

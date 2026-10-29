@@ -18,7 +18,11 @@ namespace q27 {
 struct KvFull : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
+#if defined(__GNUC__)
 void log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+#else
+void log(const char* fmt, ...);
+#endif
 
 #define Q27_CUDA(call)                                                                        \
   do {                                                                                        \
