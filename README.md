@@ -108,8 +108,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 
 `./hf` can be a symlink if the weights should live on another disk.
 
-To update: `git pull`, `docker compose pull serve`, `docker compose up -d serve`. Another build than the latest:
-`SERVE_TAG=sha-<commit>` or a release version (the [package](https://github.com/mkyt/qwen3-27b-5090/pkgs/container/qwen3-27b-5090) lists them).
+To get a newer version later, see [Updating](#updating).
 
 The serving image ([Dockerfile](Dockerfile), published by [a workflow](.github/workflows/image.yml)) compiles the
 engine in the CUDA devel image and keeps only the result on plain Ubuntu: the CUDA runtime library (the driver comes
@@ -123,6 +122,48 @@ the engine is started at `/ui`; `up --build`; `update`: pull first; `down`, `sta
 or in `shell:startup` (`serve.cmd idle` there, to start with the logon without taking the GPU). It starts the
 container in the WSL distro the checkout is in, opens the stats page, and keeps the distro running while the
 container runs (WSL shuts an idle distro down, and Docker with it).
+
+### Updating
+
+Docker keeps using the image it already has until you ask for a newer one: `docker compose up -d serve` or
+`docker compose restart serve` alone does not update anything. Run these in the folder of the checkout:
+
+```bash
+git pull                      # the newest compose.yaml and scripts
+docker compose pull serve     # download the newest image (350 MB at most)
+docker compose up -d serve    # replace the running container with one from the new image
+docker compose logs -f serve  # wait for "engine ready", then Ctrl+C (the server keeps running)
+```
+
+`scripts/serve.sh update` does the last three steps in one and returns once the server answers; the engine may still be
+loading then (`/health` turns 200 when it is ready). From Windows, run `serve.cmd update` the same way. Run `git pull`
+first in either case.
+
+- **What to expect:** the weights in `./hf` stay where they are and are not downloaded again. Replacing the container
+  ends the requests in progress and reloads the engine.
+- **Which version is running:** this prints the commit of the image you have, to compare with the
+  [commits](https://github.com/mkyt/qwen3-27b-5090/commits/main). (The output is empty for an image built here with
+  `--build`.)
+
+  ```bash
+  docker image inspect ghcr.io/mkyt/qwen3-27b-5090:latest --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+  ```
+
+- **Going back to another version:** set `SERVE_TAG` to a release version or `sha-<commit>` (the
+  [package](https://github.com/mkyt/qwen3-27b-5090/pkgs/container/qwen3-27b-5090) lists them) on both commands. It only
+  applies to the command it is on, so a later `docker compose up -d serve` without it uses `latest` again.
+
+  ```bash
+  SERVE_TAG=0.1.0 docker compose pull serve
+  SERVE_TAG=0.1.0 docker compose up -d serve
+  ```
+
+- **Freeing disk space:** each update leaves the previous image behind, without a name.
+  `docker image prune` deletes such images, including those of other projects, and asks first.
+
+The [Windows package](#windows-native) has no image: download the zip of the new
+[release](https://github.com/mkyt/qwen3-27b-5090/releases), unzip it and run its `start.cmd`. The weights in the Hugging
+Face cache are used again.
 
 ### Windows (native)
 
