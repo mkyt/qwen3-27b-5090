@@ -979,8 +979,12 @@ void draft_gather_head(const uint8_t* w, const uint8_t* sf, const int32_t* ids, 
 }
 
 void draft_dequant_weight(const DLinear& l, DraftQuant fmt, int row0, int n, bf16* out, cudaStream_t s) {
+  // Blocks of 16 threads: the threads do not interact, and once a GEMM of gemm_mma.cu has run in the process, blocks of
+  // 64 to 256 threads take about 1.5 ms per call at the draft's sizes (0.14-0.6 ms before): 8 calls per prompt, 12 ms
+  // on a short one, a few percent of the throughput at 8 streams of short requests. (32 threads: about 0.3 ms more per
+  // call than 16; 8 and below are slower again. Why the GEMM affects this kernel is not known.)
   const int64_t threads = int64_t(n) * (l.K / 16);
-  dequant_weight_kernel<<<unsigned((threads + 255) / 256), 256, 0, s>>>(l, int(fmt), row0, n, out);
+  dequant_weight_kernel<<<unsigned((threads + 15) / 16), 16, 0, s>>>(l, int(fmt), row0, n, out);
   Q27_CUDA(cudaGetLastError());
 }
 
