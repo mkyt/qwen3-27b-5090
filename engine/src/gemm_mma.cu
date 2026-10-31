@@ -129,6 +129,9 @@ __device__ __forceinline__ void mbar_arrive(uint32_t bar) {
 // tiles and (kScales) the two scale atoms of each. Predicated, not branched: in a lane-0 branch the compiler cannot
 // keep the operands in uniform registers, which the TMA instructions take, and wrapped every copy in a loop over the
 // lanes' values (~120 instructions per stage, 14% of the GEMM's).
+// shared::cta, not shared::cluster: without .multicast::cluster the latter compiles to a driver syscall, and once a
+// kernel with such a syscall has been launched in the process (even one that returns at once), other kernels run
+// slower, for a reason not known: gdn_prep_kernel 22.6 -> 30-45 us per call, dequant_weight_kernel 0.14-0.6 -> 1.5 ms.
 template <bool kScales>
 __device__ __forceinline__ void issue_stage(uint32_t st, uint32_t bar, uint32_t bytes, const TmaDesc* ma, const TmaDesc* mb,
                                             int x, int ya, int yb, const void* sfa, const void* sfb) {
@@ -136,10 +139,10 @@ __device__ __forceinline__ void issue_stage(uint32_t st, uint32_t bar, uint32_t 
     asm volatile(
         "{\n.reg .pred p;\nelect.sync _|p, 0xffffffff;\n"
         "@p mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %2;\n"
-        "@p cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%3, {%5, %6}], [%1];\n"
-        "@p cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%8], [%4, {%5, %7}], [%1];\n"
-        "@p cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%9], [%11], 1024, [%1];\n"
-        "@p cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%10], [%12], 1024, [%1];\n}" ::"r"(st),
+        "@p cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%3, {%5, %6}], [%1];\n"
+        "@p cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%8], [%4, {%5, %7}], [%1];\n"
+        "@p cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%9], [%11], 1024, [%1];\n"
+        "@p cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%10], [%12], 1024, [%1];\n}" ::"r"(st),
         "r"(bar), "r"(bytes), "l"(ma), "l"(mb), "r"(x), "r"(ya), "r"(yb), "r"(st + kTileBytes), "r"(st + 2 * kTileBytes),
         "r"(st + 2 * kTileBytes + kSfBytes), "l"(sfa), "l"(sfb)
         : "memory");
@@ -147,8 +150,8 @@ __device__ __forceinline__ void issue_stage(uint32_t st, uint32_t bar, uint32_t 
     asm volatile(
         "{\n.reg .pred p;\nelect.sync _|p, 0xffffffff;\n"
         "@p mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %2;\n"
-        "@p cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%3, {%5, %6}], [%1];\n"
-        "@p cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%8], [%4, {%5, %7}], [%1];\n}" ::"r"(st),
+        "@p cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%3, {%5, %6}], [%1];\n"
+        "@p cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%8], [%4, {%5, %7}], [%1];\n}" ::"r"(st),
         "r"(bar), "r"(bytes), "l"(ma), "l"(mb), "r"(x), "r"(ya), "r"(yb), "r"(st + kTileBytes)
         : "memory");
 }
