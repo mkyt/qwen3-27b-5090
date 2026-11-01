@@ -1,13 +1,51 @@
 # Configuration
 
-The `serve` service (`compose.yaml`) passes these environment variables to `frontend/server.py`; running the server
-directly uses the same defaults. The startup log prints the memory plan. Task IDs such as `P7-13` refer to
+All settings are environment variables of `frontend/server.py`, with the same names and defaults however it is started
+(the exceptions are in the first table below). The startup log prints the memory plan. Task IDs such as `P7-13` refer to
 [decisions.md](decisions.md).
+
+## How settings work
+
+**Keep a setting in one file; try one on the stats page.** A value in the file applies from the next start of the
+server. A change on the stats page or through the admin API applies to the running server and is gone when it restarts.
+
+| | Docker (`serve`, `serve.sh`, `serve.cmd`) | Windows package: `start.cmd` | Windows package: tray app |
+| --- | --- | --- | --- |
+| The file | `.env` next to `compose.yaml` | `settings.ini` next to the program | the same `settings.ini` |
+| Changing the file | An editor | An editor | **Settings** in the tray menu ([below](#settings-window)), or an editor |
+| Order | The shell's variables, then `.env`, then the default | `settings.ini`, then the environment, then the default | the same as `start.cmd` |
+| Address and port | `HOST`, `PORT`: the address published on the host | `HOST`, `PORT` | `HOST`, `PORT` |
+| Where the weights are | `./hf` (a symlink moves them; `HF_HOME` is `/hf` in the container) | `HF_HOME`, by default `huggingface\` in the folder | the same as `start.cmd` |
+| Getting the weights | Before the start: `scripts/download-weights.sh` | Downloaded at each start if missing | the same as `start.cmd`, with the progress in the tray |
+| `ENGINE_AUTOSTART` default | 1: loads at the start | 1: loads at the start | **0: loads at the first request** |
+| `ENGINE_IDLE_UNLOAD_S` default | 0: stays loaded | 0: stays loaded | **1800: unloads after 30 minutes** |
+
+What it takes for a setting to change depends on who reads it, and when:
+
+| Takes effect | Settings | Change it for now | Keep it |
+| --- | --- | --- | --- |
+| At once | `ENGINE_IDLE_UNLOAD_S` | Stats page, `POST /admin/engine/idle` | The file |
+| At once | `MIN_SEQ_TPS`, `ADMIT_KV`, `KV_RESERVE_TOKENS` | `POST /admin/concurrency` | The file |
+| At once | `target_seqs` | `POST /admin/concurrency` | Cannot be kept: there is no variable (`MAX_SEQS` is the upper limit that can) |
+| When the engine restarts | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_BUDGET_GIB` | Stats page ([Start settings](#start-settings)), `POST /admin/engine` | The file. The page lists the lines to add, for these and for `ENGINE_IDLE_UNLOAD_S` |
+| When the server restarts | Everything else, such as `HOST`, `PORT`, `HF_HOME`, `ENGINE_AUTOSTART`, `MIN_KV_TOKENS`, `MAX_TOKENS_FIT`, `STATE_HOST_CACHE`, `PREFILL_CHUNK` | Not possible | The file |
+
+- Restarting the engine reloads the weights, fails the requests in flight and empties the prefix cache. Restarting the
+  server does the same if the engine is loaded, and also closes the stats page's connection for a moment.
+- `WEIGHTS` with another tokenizer takes a restart of the server ([Other checkpoints](#other-checkpoints)).
+- With Docker, restart the server with `docker compose up -d serve` (or `scripts/serve.sh up`): it recreates the
+  container when a value changed. `docker compose restart` keeps the old values. With `start.cmd`, close it and run it
+  again. The tray app's settings window does what its changes need when you apply them.
+- Only variables listed in the `serve` service of `compose.yaml` reach the container. That is all of this page except
+  `HOST` and `PORT` (published by compose, above), the Windows package's, and most of
+  [Development switches](#development-switches): add those in `compose.override.yaml`.
 
 ## Serving
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `HOST` | 127.0.0.1 | Address to listen on. `0.0.0.0`: the network; anyone there can then change the engine's settings, as the admin API has no authentication (on Windows, the firewall asks about it). With Docker, the address published on the host: the server in the container always listens on all its addresses (`--host`) |
+| `PORT` | 8000 | Port of the API and the web UI. With Docker, the port published on the host; in the container it stays 8000 |
 | `SERVED_MODEL_NAME` | `qwen3.8-27b` | Name in `/v1/models` (requests may use any model name) |
 | `MAX_TOKENS` | 262144 | Context limit of one request. If the KV pool cannot hold it, `MAX_TOKENS_FIT` lowers it; the value in effect is in the startup log (`max_tokens ... lowered to`) and in `/v1/models` (`max_model_len`) |
 | `MAX_TOKENS_FIT` | 1 | 1: start with `MAX_TOKENS` lowered to what the KV pool holds (a multiple of 1,024). 0: fail to start instead (the service then restarts every 60 s). The engine library (`q27lib.Engine`) defaults to 0 |
@@ -55,7 +93,7 @@ directly uses the same defaults. The startup log prints the memory plan. Task ID
 - New requests wait until the KV pool can take them (`ADMIT_KV`). If the KV cache still runs out, the latest request
   (including the one that ran out) is suspended to a checkpoint and goes back to the head of the queue. When requests
   that arrive together share a prefix, the later one waits until the earlier one has passed it.
-- Admin API (no authentication; the service listens on 127.0.0.1 only): `GET /admin/concurrency` returns the settings
+- Admin API (no authentication; the service listens on 127.0.0.1 unless `HOST` says otherwise): `GET /admin/concurrency` returns the settings
   and the state (running, waiting, why requests wait, measured tok/s per number of running requests);
   `POST /admin/concurrency` changes `target_seqs` (1 to `MAX_SEQS`; lowering it does not stop running requests),
   `min_seq_tps`, `admit_kv` and `kv_reserve`. Changes survive an engine restart, not a service restart.
@@ -168,11 +206,12 @@ the variables again: to keep them, set the variables, which `GET /admin/engine` 
 The same from a script:
 
 - `GET /admin/engine`: the state, `running` (the running engine's settings), `settings` (the next start's),
+  `at_start` (those the service started with), `keep_env`,
   `weights` (null for each profile that can be loaded, else why not) and `device` (the free and total memory the
   plans assume).
 - `POST /admin/engine/plan` with `{"settings": {...}}` (changes to the next start's settings): `plan` (`max_tokens`,
-  `kv_tokens`, `budget`, `device` and `pools` in bytes, `fits`, or `error`) and `variants` (the plans with each
-  setting's other values).
+  `kv_tokens`, `budget`, `device` and `pools` in bytes, `fits`, or `error`), `variants` (the plans with each
+  setting's other values), `weights` and `at_start`. `frontend/plan.py` answers the same without a server.
 - `POST /admin/engine` with `{"action": "start" | "restart", "settings": {...}}`: starts with those changes, if they
   fit (HTTP 400 otherwise; 409 for `start` while the engine runs). With `"action": "save"` (the page's **Save for the
   next load**) they only stay for the next load, while the engine is stopped or unloaded (409 otherwise): it does not
@@ -227,11 +266,13 @@ you can write to, not Program Files. The exception is the start at logon, a valu
 
 ### Settings
 
-Copy `settings.example.ini` to `settings.ini` and set any variable of this page in its `[env]` section. Both the tray
-app and `start.cmd` read it, when the server starts. A value comes from `settings.ini`, then from the environment, then
-from the default; the log says when `settings.ini` overrides the environment. Relative paths are from the folder. The
-package only reads the file: what you change on the stats page lasts until the server restarts, and the page shows the
-lines to add here to keep it.
+Copy `settings.example.ini` to `settings.ini` and set any variable of this page in its `[env]` section ([How settings
+work](#how-settings-work)). Both the tray app and `start.cmd` read it, when the server starts; the log says when
+`settings.ini` overrides the environment. Relative paths are from the folder. The stats page does not write the file:
+what you change there lasts until the server restarts, and the page shows the lines to add here to keep it. Only the
+tray app's settings window writes it, when you click **Apply**, and only the lines of what you chose or typed there, also
+a value equal to the default, which then stays when a later version changes the default (comments and other lines stay,
+and it is saved as UTF-8).
 
 `HF_HOME` is the exception: without it in `settings.ini` the weights are in the folder, whatever the environment says, so
 that a variable of the whole PC does not move them out. To share an existing cache, write it there in full, for
@@ -248,8 +289,6 @@ about 110, or `HF_HOME` elsewhere.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `HOST` | 127.0.0.1 | Address the server listens on (`0.0.0.0`: the network, which Windows Firewall asks about) |
-| `PORT` | 8000 | Port of the API and the web UI (also read by `frontend/server.py`) |
 | `OPEN_UI` | 1 | `start.cmd`: 1 opens the web UI in the browser at the start, 0 does not |
 | `WEIGHTS` | gdnfp4 | Weights downloaded before the start and served: a profile or `ORG/NAME[@REVISION]` ([Other checkpoints](#other-checkpoints)) |
 | `HF_HOME` | `huggingface` in the folder | Hugging Face cache the weights are downloaded to and loaded from (23 GB) |
@@ -267,6 +306,38 @@ start but holds VRAM only between the first request and 30 minutes after the las
 The output goes to the log (the menu's **Show log**, which also works when the server did not start). **Start at
 logon** is the value `qwen3-27b-5090` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; the app corrects its
 path if the folder moved.
+
+### Settings window
+
+**Settings** in the tray menu edits `settings.ini`, without a browser:
+
+| Group | Settings | Apply |
+| --- | --- | --- |
+| Server | `HOST`, `PORT`, `HF_HOME` | Restarts the server, which downloads the weights if the new `HF_HOME` does not have them |
+| Engine | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_BUDGET_GIB` | Reloads the engine if it is loaded (weights with another tokenizer: restarts the server); otherwise the next load uses them |
+| When it holds the VRAM | `ENGINE_IDLE_UNLOAD_S` | Applies at once |
+| When it holds the VRAM | `ENGINE_AUTOSTART`, `MIN_KV_TOKENS` | Restarts the server |
+
+- The window says what **Apply** will do before you click it, and asks first if that fails requests in flight or empties
+  the prefix cache. The values are saved even if the server then refuses them (for example, too little VRAM free now).
+- Each engine choice shows the longest context and the KV pool it would leave, from the same planner as the stats page;
+  the line below the choices sums up the settings as chosen. Without a server for that folder, `frontend/plan.py` gives
+  the same answer (no GPU, nothing allocated).
+- **Browse...** chooses the **Weights folder** in Explorer's dialog: the folder with `hub\` in it (choosing `hub\` itself
+  counts as the folder above). **Weights** lists the checkpoints of the model there, also those of other repositories
+  ([Other checkpoints](#other-checkpoints)), and follows the folder at once, before you apply it, with the estimates of
+  that folder's weights. If the chosen weights or the DFlash2 draft are not there, the window says so (the draft's absence
+  also means no estimate until `SPEC` is `none`) and asks first, as the server would download them.
+- To share one cache with WSL, set `HF_HOME` to it on the Windows drive. `huggingface_hub` or `hf download` under WSL with
+  a 9p mount of the drive leaves links (LX symlinks) that Windows programs cannot read; the window names those
+  checkpoints, and **Fix the links** replaces the links of this model's checkpoints with hard links to the same files
+  (`python\python.exe app\scripts\download_weights.py --fix-links`, with `HF_HOME` set). Both systems then read them as
+  plain files, and nothing is copied or downloaded. It needs the links' files on an NTFS volume. A virtiofs mount
+  (`virtiofs=true` in `.wslconfig`) and `scripts/download_weights.py` leave nothing to fix.
+- All of them can be changed with the server stopped or failed, to repair a wrong port or folder.
+- If the stats page changed something that `settings.ini` does not have, the window lists it, and **Use these** copies it
+  into the window.
+- Any other variable: **Open settings.ini**. The window reads the file when it opens.
 
 ### Updating
 

@@ -757,7 +757,7 @@ function drawLaunch() {
   const changes = launchChanges();
   if (changes.length) sum.append(el("div", {}, el("span", { class: "muted" }, L.running ? "Changes from the running engine: " : "Changes from the saved settings: "), changes.join(" · ")));
   const keep = Object.entries(L.keep || {});
-  if (keep.length) sum.append(el("div", {}, el("div", { class: "muted" }, "Changes here last until the server restarts. To keep them, set these variables (settings.ini in the Windows package):"),
+  if (keep.length) sum.append(el("div", {}, el("div", { class: "muted" }, "Changes here last until the server restarts. To keep them, set these variables (.env with Docker, settings.ini in the Windows package):"),
     el("div", { style: "font-family:monospace;white-space:pre-wrap;user-select:all" }, keep.map(([k, v]) => `${k}=${v}`).join("\n"))));
   drawGo();
 }

@@ -11,6 +11,10 @@ commit, recorded under refs/ as huggingface_hub does. Before downloading a repos
 hundred KB) go through the engine's own checks (q27_plan, no GPU), so an unsupported checkpoint stops here rather than
 after 20 GB; the check needs the engine library (Q27_LIB), and is skipped without it.
 
+huggingface_hub under WSL with a 9p mount of a Windows drive leaves links (LX symlinks) that Windows programs cannot
+read. --fix-links, on Windows, replaces the links of the model's repositories with hard links to the same
+blobs, which both systems read as plain files: nothing is copied or downloaded. It prints {"fixed": n, "failed": [paths]}.
+
 The files go to $HF_HOME/hub/models--<org>--<name>/snapshots/<commit>/ (HF_HOME defaults to ~/.cache/huggingface),
 where paths.py looks for them. Files already there with the right size are kept; a download resumes from its
 .incomplete file (also on network errors, retried), and every LFS file is checked against its SHA-256 before it takes
@@ -166,6 +170,64 @@ def fetch_retrying(repo, rev, path, size, sha, dst, progress):
             time.sleep(wait)
 
 
+IO_REPARSE_TAG_LX_SYMLINK = 0xA000001D
+
+
+def lx_target(path):
+    """The target of an LX symlink, which Windows keeps in the reparse point and does not follow (Windows only)."""
+    import ctypes
+    import ctypes.wintypes as w
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = w.HANDLE
+    kernel32.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE]
+    kernel32.DeviceIoControl.argtypes = [w.HANDLE, w.DWORD, w.LPVOID, w.DWORD, w.LPVOID, w.DWORD, ctypes.POINTER(w.DWORD), w.LPVOID]
+    kernel32.CloseHandle.argtypes = [w.HANDLE]
+    # (OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS; FSCTL_GET_REPARSE_POINT)
+    handle = kernel32.CreateFileW(str(path), 0, 7, None, 3, 0x02200000, None)
+    if handle in (None, w.HANDLE(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_string_buffer(16384)
+    size = w.DWORD()
+    done = kernel32.DeviceIoControl(handle, 0x900A8, None, 0, buffer, len(buffer), ctypes.byref(size), None)
+    kernel32.CloseHandle(handle)
+    if not done:
+        raise ctypes.WinError(ctypes.get_last_error())
+    tag, length = struct.unpack_from("<IH", buffer.raw)
+    if tag != IO_REPARSE_TAG_LX_SYMLINK:
+        raise OSError(f"{path}: not an LX symlink")
+    return buffer.raw[12:8 + length].decode("utf-8")  # (header 8 bytes, version 4 bytes, the path in UTF-8)
+
+
+def link_to_blob(path, target, base):
+    """Replaces the link `path` with a hard link to its target, a file in the repository's directory `base`."""
+    blob = pathlib.Path(os.path.normpath(path.parent / target))
+    if base not in blob.parents or not blob.is_file():
+        raise OSError(f"{path}: the target {target} is not a file of the repository")
+    temporary = path.with_name(path.name + ".link-tmp")
+    os.link(blob, temporary)
+    os.replace(temporary, path)
+
+
+def fix_links():
+    """The LX symlinks of the model's repositories, as hard links to their blobs."""
+    if os.name != "nt":
+        sys.exit("--fix-links is for Windows, which tells the links it cannot read from those it can")
+    fixed, failed = 0, []
+    for base in sorted(paths.HF_HUB.glob("models--*--*")):
+        if "qwen3.8-27b" not in base.name.lower():
+            continue
+        for path in base.glob("snapshots/*/**/*"):
+            if getattr(os.lstat(path), "st_reparse_tag", 0) != IO_REPARSE_TAG_LX_SYMLINK:
+                continue
+            try:
+                link_to_blob(path, lx_target(path), base)
+                fixed += 1
+            except OSError as e:
+                failed.append(f"{path}: {e}")
+    return {"fixed": fixed, "failed": failed}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--weights", default=os.environ.get("WEIGHTS") or "gdnfp4",
@@ -176,7 +238,12 @@ def main():
     ap.add_argument("--jobs", type=int, default=4, help="files downloaded at once")
     ap.add_argument("--also", action="append", default=[], metavar="WEIGHTS",
                     help="another checkpoint to download: nvidia, quasar, bf16 or ORG/NAME[@REVISION] (repeatable)")
+    ap.add_argument("--fix-links", action="store_true", help="on Windows: the model's LX symlinks as hard links to their blobs")
     args = ap.parse_args()
+
+    if args.fix_links:
+        print(json.dumps(fix_links()))
+        return
 
     pins = []
     for opt, w in [("--weights", args.weights)] + [("--also", a) for a in args.also]:

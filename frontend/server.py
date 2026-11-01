@@ -40,7 +40,7 @@ sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 
 import worker  # noqa: E402
-from launch import Launch, model_dir  # noqa: E402
+from launch import ENGINE_ENV_DEFAULTS, Launch, env_settings, model_dir, set_engine_env  # noqa: E402,F401
 from stats import HUB, request_meta  # noqa: E402
 from chat import (STOP_REASON, AnthropicError, OutputParser, _partial_suffix, anthropic_messages,  # noqa: E402,F401
                   anthropic_template_kwargs, new_id, normalize_messages, openai_call, parse_output,
@@ -1119,6 +1119,7 @@ class Handler(BaseHTTPRequestHandler):
         if eng.idle_unload != eng.idle_unload_at_start:
             keep["ENGINE_IDLE_UNLOAD_S"] = f"{eng.idle_unload:g}"
         return {"state": eng.state(), "unloaded": eng.on_demand == "unloaded", "idle_unload_s": eng.idle_unload, "keep_env": keep,
+                "at_start": launch.at_start,
                 "refused": eng.refused[1] if eng.refused else None,
                 "running": running, "settings": launch.settings,
                 "weights": launch.weights_choices(), "device": {"free": device[0], "total": device[1], "source": source}
@@ -1133,9 +1134,7 @@ class Handler(BaseHTTPRequestHandler):
         device, source = HUB.plan_device()
         if device is None:
             raise ApiError(503, "the device's memory is unknown (no NVML and no engine started yet)", "overloaded_error")
-        s = self.srv.launch.validate(settings, device=device, check_budget=False)
-        self._json(200, dict(self.srv.launch.plans(s, device), device={"free": device[0], "total": device[1],
-                                                                        "source": source}))
+        self._json(200, self.srv.launch.plan_answer(settings, device, source))
 
     def engine_idle(self, body):
         """{"idle_unload_s": seconds} (0: off): applies at once, until the server restarts. Needs Content-Type:
@@ -1293,17 +1292,12 @@ class ResponsesOut:
 
 
 START_TIME = time.time()
-# Engine settings whose library default (q27lib.Engine, for the tests and scripts) is not the server's, set when
-# unset: the server starts the same with or without compose.yaml, which lists them too (tests/test_parsing.py).
-# MAX_TOKENS is an upper bound the engine lowers to what the VRAM budget fits (e.g. with MAX_SEQS=8); the prefix
-# cache keeps 4 GiB of pinned state checkpoints.
-ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "4"}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     env = os.environ.get
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default=env("HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(env("PORT", 8000)))
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", 262144)))
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
@@ -1335,20 +1329,14 @@ def main():
 
     path = model_dir(args.weights)  # (the tokenizer: other weights must have the same, Launch.weights_choices)
     tok = Tokenizer(path)
-    for k, v in ENGINE_ENV_DEFAULTS.items():
-        os.environ.setdefault(k, v)
-    vocab = ROOT / "bench/draft-vocab/vocab-128k.txt"
-    if "Q27_DRAFT_VOCAB" not in os.environ and vocab.exists():
-        os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
+    set_engine_env(ROOT)
     base = {"prefill_chunk": args.prefill_chunk, "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv),
             "kv_reserve": args.kv_reserve, "decode_share": args.decode_share, "quantum_ms": args.quantum_ms,
             "batch_decode": bool(args.batch_decode), "im_start": tok.token_id("<|im_start|>"),
             "engine_python": str(ROOT / "engine/python")}
     # Images by default with the vision tower in pinned host memory (no KV pool cost); the library default is off.
-    budget = env("VRAM_BUDGET_GIB")
-    launch = Launch(base, {"weights": args.weights, "kv_dtype": args.kv_dtype, "spec": args.spec,
-                           "vision": env("VISION") or "host", "max_seqs": max(1, min(args.max_seqs, 8)),
-                           "max_tokens": args.max_tokens, "vram_budget_gib": float(budget) if budget else None},
+    launch = Launch(base, dict(env_settings(), weights=args.weights, kv_dtype=args.kv_dtype, spec=args.spec,
+                               max_seqs=max(1, min(args.max_seqs, 8)), max_tokens=args.max_tokens),
                     tokenizer=fingerprint(path))
     HUB.start()
     engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0",

@@ -52,11 +52,18 @@ services:
     gpus: all
     container_name: qwen3-27b-5090
     ports:
-      - "127.0.0.1:8000:8000"
+      # The address on the host; the server in the container always listens on 8000 (HOST=0.0.0.0: the network, and
+      # /admin has no authentication).
+      - "${HOST:-127.0.0.1}:${PORT:-8000}:8000"
     environment:
       SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-qwen3.8-27b}  # same name as the vLLM / SGLang environments
       ENGINE_AUTOSTART: ${ENGINE_AUTOSTART:-1}     # 0: the server starts with the engine stopped (no VRAM; start it at /ui)
       MIN_KV_TOKENS: ${MIN_KV_TOKENS:-0}           # do not start if the KV pool would hold fewer tokens (0: any size)
+      VRAM_BUDGET_GIB: ${VRAM_BUDGET_GIB:-}        # empty: automatic (free memory minus WDDM_MARGIN_GIB); only lowers it
+      WDDM_MARGIN_GIB: ${WDDM_MARGIN_GIB:-0.6}     # VRAM kept free for the display driver
+      Q27_LOAD_THREADS: ${Q27_LOAD_THREADS:-8}     # threads reading the weight files ahead of the uploads
+      STATS_SAMPLE_S: ${STATS_SAMPLE_S:-1}         # seconds between the GPU samples of /ui (0: none)
+      API_DUMP_DIR: ${API_DUMP_DIR:-}              # debugging: write every POST body to this directory in the container
       ENGINE_IDLE_UNLOAD_S: ${ENGINE_IDLE_UNLOAD_S:-0}  # seconds without a request before the engine frees its VRAM (0: off)
       MAX_TOKENS: ${MAX_TOKENS:-262144}
       MAX_TOKENS_FIT: ${MAX_TOKENS_FIT:-1}         # 1: lower MAX_TOKENS to what the VRAM fits (since P7-13 MAX_SEQS=8 fits 262144)

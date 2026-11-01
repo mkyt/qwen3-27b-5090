@@ -175,7 +175,8 @@ builds it from a checkout), holds `q27.dll`, the embeddable Python from python.o
 the tray app `qwen3-27b-tray.exe` and `start.cmd`. It needs no VC++ redistributable, CUDA toolkit or administrator rights.
 
 Unzip it anywhere and run `qwen3-27b-tray.exe`: an icon appears in the notification area, its color and tooltip show
-the state, and its menu starts and stops the server, opens the stats page and the log, and sets the start at logon. The
+the state, and its menu starts and stops the server, changes its settings, opens the stats page and the log, and sets
+the start at logon. The
 server then takes no VRAM until the first request and frees it after 30 minutes without one
 ([docs/configuration.md](docs/configuration.md#tray-app)). The program is not signed, so Windows may warn about it at the
 first start (compare the zip's SHA-256 with the release's).
@@ -216,7 +217,9 @@ Accepted but without effect: `response_format`, the penalties, `min_p`, `tool_ch
 
 ## Configuration
 
-The `serve` service reads its settings from the environment (or `.env`); the most useful ones:
+Settings are variables with the same names everywhere: in `.env` (or the shell) with Docker, in `settings.ini` in the
+Windows package. [How settings work](docs/configuration.md#how-settings-work) says where each one goes and what it takes
+to change it. The most useful ones:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

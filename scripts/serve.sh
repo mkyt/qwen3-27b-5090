@@ -8,11 +8,14 @@
 #   scripts/serve.sh down        # docker compose down
 #   scripts/serve.sh status      # the container's state and /health
 #   scripts/serve.sh keepalive   # block while the container exists: keeps the WSL distro from shutting down when idle
-# The settings are those of compose.yaml and the environment (MAX_SEQS=4 scripts/serve.sh up, ...).
+#   scripts/serve.sh port        # the port on the host (PORT)
+# The settings are those of compose.yaml, .env and the environment (MAX_SEQS=4 scripts/serve.sh up, ...).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PORT=8000
+# PORT as compose.yaml takes it: the environment, then .env, then 8000.
+PORT=${PORT:-$( { sed -n 's/^PORT=//p' .env 2>/dev/null || true; } | tail -n 1 | tr -d "\"'\r")}
+PORT=${PORT:-8000}
 NAME=qwen3-27b-5090
 
 case "${1:-}" in
@@ -59,6 +62,9 @@ case "${1:-}" in
     health=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" || true)
     echo "container $NAME: $state, /health: $health (200 ready or unloaded when idle, 503 engine loading or stopped)"
     ;;
+  port)
+    echo "$PORT"
+    ;;
   keepalive)
     exec 9>"/tmp/$NAME-keepalive.lock"
     flock -n 9 || exit 0  # (one loop is enough)
@@ -67,7 +73,7 @@ case "${1:-}" in
     done
     ;;
   *)
-    echo "usage: $0 up [--idle] [--build] | update [--idle] | down | status | keepalive" >&2
+    echo "usage: $0 up [--idle] [--build] | update [--idle] | down | status | port | keepalive" >&2
     exit 2
     ;;
 esac

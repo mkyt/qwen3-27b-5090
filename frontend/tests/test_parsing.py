@@ -186,6 +186,20 @@ def test_responses_input():
     assert ns == {"spawn_agent": "multi_agent_v1"} and custom == {"apply_patch"}
 
 
+def test_compose_passes_the_documented_settings():
+    """A variable the serve service does not list never reaches the container, silently."""
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    compose = (root / "compose.yaml").read_text()
+    docs = (root / "docs/configuration.md").read_text(encoding="utf-8")
+    serving = docs[docs.index("\n## Serving"):docs.index("\n### Attention numerics")]
+    names = set(re.findall(r"`([A-Z][A-Z0-9_]+)`", "\n".join(re.findall(r"^\| ([^|]+) \|", serving, re.M))))
+    outside = {"HOST", "PORT", "SERVE_TAG", "Q27_DEVICE_FREE_BYTES"}  # (the ports line; the image's tag; the server sets it)
+    assert names > outside
+    assert not {n for n in names - outside if not re.search(rf"^\s+{n}: ", compose, re.M)}
+
+
 def test_engine_env_defaults_match_compose():
     """The server's own engine defaults are those of the serve service in compose.yaml (a start without compose,
     e.g. on Windows, runs the same engine)."""

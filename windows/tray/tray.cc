@@ -1,13 +1,16 @@
 // Tray app of the Windows package: starts the server (scripts/download_weights.py, then frontend/server.py, as
 // start.cmd does) in a job object, so that it never outlives the app, shows its state from /health and its output in a
-// log window. Decisions stay with the server: this app only starts it, stops it and reports. docs/configuration.md.
+// log window, and edits settings.ini in a settings window. Decisions stay with the server: this app starts it, stops it,
+// reports and keeps the file. docs/configuration.md.
 #ifndef UNICODE
 #define UNICODE
 #endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <objbase.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <winhttp.h>
 
 #include <algorithm>
@@ -15,6 +18,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -25,6 +29,7 @@ namespace {
 const wchar_t* const APP_TITLE = L"Qwen3.8-27B";
 const wchar_t* const WINDOW_CLASS = L"qwen3-27b-5090-tray";
 const wchar_t* const LOG_CLASS = L"qwen3-27b-5090-log";
+const wchar_t* const SETTINGS_CLASS = L"qwen3-27b-5090-settings";
 const wchar_t* const MUTEX_NAME = L"Local\\qwen3-27b-5090-tray";
 const wchar_t* const RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const wchar_t* const RUN_VALUE = L"qwen3-27b-5090";
@@ -33,8 +38,9 @@ constexpr UINT WM_APP_TRAY = WM_APP + 1;     // from the notification icon
 constexpr UINT WM_APP_CHANGED = WM_APP + 2;  // the shared state changed
 constexpr UINT WM_APP_EXITED = WM_APP + 3;   // the thread that runs the server ended
 constexpr UINT WM_APP_AGAIN = WM_APP + 4;    // another start of the app
+constexpr UINT WM_APP_SETTINGS = WM_APP + 5; // an answer for the settings window
 
-enum MenuId { ID_STATUS = 1, ID_TOGGLE, ID_UI, ID_LOG, ID_LOGON, ID_QUIT, ID_LOG_FOLDER };
+enum MenuId { ID_STATUS = 1, ID_TOGGLE, ID_UI, ID_LOG, ID_LOGON, ID_QUIT, ID_LOG_FOLDER, ID_SETTINGS };
 
 constexpr DWORD POLL_MS = 2000;
 constexpr DWORD LOG_POLL_MS = 300;
@@ -53,7 +59,7 @@ struct Shared {  // written by the worker threads, read by the window's thread (
 };
 
 struct App {
-    std::wstring root, python, server, download;     // the package's files
+    std::wstring root, python, server, download, plan;  // the package's files
     std::wstring log_dir, log_path, old_log, ini;    // the package keeps what it writes in its own folder
     std::wstring host = L"127.0.0.1";
     int port = 8000;
@@ -77,6 +83,7 @@ struct App {
     std::wstring shown_refused, shown_failure;
     bool download_shown = false;
     bool quitting = false;
+    bool restart_pending = false;  // the server starts again when it has stopped (the settings window)
 };
 
 App app;
@@ -790,6 +797,1207 @@ void set_logon(bool on) {
     RegCloseKey(key);
 }
 
+// ------------------------------------------------------------ JSON (the admin API's answers)
+
+struct Json {
+    enum Type { null, boolean, number, string, array, object } type = null;
+    bool flag = false;
+    double value = 0;
+    std::string text;
+    std::vector<Json> items;
+    std::vector<std::pair<std::string, Json>> fields;
+    const Json& operator[](const std::string& key) const {
+        static const Json none;
+        for (const auto& field : fields)
+            if (field.first == key) return field.second;
+        return none;
+    }
+};
+
+class JsonReader {
+public:
+    explicit JsonReader(const std::string& source) : s_(source) {}
+    bool read(Json* out) { return value(out, 0); }
+
+private:
+    void space() {
+        while (at_ < s_.size() && strchr(" \t\r\n", s_[at_])) at_++;
+    }
+    bool literal(const char* word) {
+        size_t n = strlen(word);
+        if (s_.compare(at_, n, word) != 0) return false;
+        at_ += n;
+        return true;
+    }
+    unsigned hex4() {
+        unsigned code = 0;
+        for (int i = 0; i < 4 && at_ < s_.size(); i++, at_++) {
+            char c = s_[at_];
+            code = code * 16 + (c <= '9' ? c - '0' : (c | 32) - 'a' + 10);
+        }
+        return code;
+    }
+    bool string(std::string* out) {
+        if (at_ >= s_.size() || s_[at_] != '"') return false;
+        for (at_++; at_ < s_.size(); at_++) {
+            char c = s_[at_];
+            if (c == '"') {
+                at_++;
+                return true;
+            }
+            if (c != '\\') {
+                *out += c;
+                continue;
+            }
+            if (++at_ == s_.size()) return false;
+            c = s_[at_];
+            if (c == 'u') {
+                at_++;
+                wchar_t units[2] = {static_cast<wchar_t>(hex4()), 0};
+                if (units[0] >= 0xD800 && units[0] < 0xDC00 && s_.compare(at_, 2, "\\u") == 0) {
+                    at_ += 2;
+                    units[1] = static_cast<wchar_t>(hex4());
+                }
+                at_--;
+                *out += narrow(units);
+            } else {
+                *out += c == 'n' ? '\n' : c == 't' ? '\t' : c == 'r' ? '\r' : c == 'b' ? '\b' : c == 'f' ? '\f' : c;
+            }
+        }
+        return false;
+    }
+    bool value(Json* out, int depth) {
+        space();
+        if (at_ >= s_.size() || depth > 32) return false;
+        char c = s_[at_];
+        if (c == '{' || c == '[') {
+            out->type = c == '{' ? Json::object : Json::array;
+            at_++;
+            for (space(); at_ < s_.size() && s_[at_] != (c == '{' ? '}' : ']'); space()) {
+                std::string key;
+                if (c == '{') {
+                    if (!string(&key)) return false;
+                    space();
+                    if (at_ >= s_.size() || s_[at_++] != ':') return false;
+                }
+                Json item;
+                if (!value(&item, depth + 1)) return false;
+                if (c == '{')
+                    out->fields.emplace_back(std::move(key), std::move(item));
+                else
+                    out->items.push_back(std::move(item));
+                space();
+                if (at_ < s_.size() && s_[at_] == ',') at_++;
+            }
+            return at_++ < s_.size();
+        }
+        if (c == '"') {
+            out->type = Json::string;
+            return string(&out->text);
+        }
+        if (literal("null")) return true;
+        if (literal("true") || literal("false")) {
+            out->type = Json::boolean;
+            out->flag = s_[at_ - 1] == 'e' && s_[at_ - 2] == 'u';
+            return true;
+        }
+        char* end = nullptr;
+        out->type = Json::number;
+        out->value = strtod(s_.c_str() + at_, &end);
+        if (end == s_.c_str() + at_) return false;
+        at_ = end - s_.c_str();
+        return true;
+    }
+    const std::string& s_;
+    size_t at_ = 0;
+};
+
+std::string json_quote(const std::wstring& w) {
+    std::string out = "\"";
+    for (char c : narrow(w)) {
+        if (c == '"' || c == '\\') out += '\\';
+        out += c;
+    }
+    return out + "\"";
+}
+
+// A setting's value as its variable has it ("": null, the automatic budget).
+std::wstring env_text(const Json& v) {
+    wchar_t number[32];
+    switch (v.type) {
+        case Json::string: return widen(v.text);
+        case Json::number: swprintf(number, 32, L"%g", v.value); return number;
+        default: return {};
+    }
+}
+
+// ------------------------------------------------------------ HTTP with a body
+
+struct HttpAnswer {
+    bool answered = false;
+    DWORD status = 0;
+    std::string body;
+};
+
+// A request to the server's port that may take a while (a plan: up to about a second; a restart's checks).
+HttpAnswer http_call(int port, const wchar_t* method, const wchar_t* path, const std::string& body) {
+    HttpAnswer answer;
+    HINTERNET session = http_session();
+    if (session) WinHttpSetTimeouts(session, 2000, 2000, 5000, 30000);
+    HINTERNET connection = session ? WinHttpConnect(session, L"127.0.0.1", static_cast<INTERNET_PORT>(port), 0) : nullptr;
+    HINTERNET request = connection ? WinHttpOpenRequest(connection, method, path, nullptr, WINHTTP_NO_REFERER,
+                                                        WINHTTP_DEFAULT_ACCEPT_TYPES, 0)
+                                   : nullptr;
+    const wchar_t* header = L"Content-Type: application/json\r\n";
+    if (request && WinHttpSendRequest(request, header, static_cast<DWORD>(-1), const_cast<char*>(body.data()),
+                                      static_cast<DWORD>(body.size()), static_cast<DWORD>(body.size()), 0) &&
+        WinHttpReceiveResponse(request, nullptr)) {
+        answer.answered = true;
+        DWORD size = sizeof answer.status;
+        WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                            &answer.status, &size, WINHTTP_NO_HEADER_INDEX);
+        DWORD n = 0;
+        char buffer[8192];
+        while (WinHttpReadData(request, buffer, sizeof buffer, &n) && n) answer.body.append(buffer, n);
+    }
+    if (request) WinHttpCloseHandle(request);
+    if (connection) WinHttpCloseHandle(connection);
+    if (session) WinHttpCloseHandle(session);
+    return answer;
+}
+
+std::wstring api_error(const HttpAnswer& answer) {
+    Json parsed;
+    if (JsonReader(answer.body).read(&parsed)) {
+        const Json& error = parsed["error"];
+        if (error["message"].type == Json::string) return widen(error["message"].text);
+        if (error.type == Json::string) return widen(error.text);
+    }
+    return answer.answered ? L"HTTP " + std::to_wstring(answer.status) : L"the server did not answer";
+}
+
+// ------------------------------------------------------------ the settings window
+
+// An editor of settings.ini: the file is what stays, so Apply writes it and then does what the changed settings need
+// (docs/configuration.md, "How settings work"). The choices and what each leaves for the context come from the server.
+
+enum class Tier { engine, live, server };
+enum class Kind { choice, edit, combo_edit };
+
+struct Row {
+    const wchar_t* label;
+    const wchar_t* var;
+    const char* key;    // of the start settings in the admin API (nullptr: not one)
+    Kind kind;
+    Tier tier;
+    const wchar_t* hint;
+    HWND label_window = nullptr, control = nullptr, hint_window = nullptr;
+    std::vector<std::wstring> values;  // of a choice
+    std::wstring initial;              // what settings.ini gives
+    bool known = true;                 // false: neither the file nor the environment has it; the server's default, once it answers
+    bool in_file = false;              // settings.ini has it
+    bool chosen = false;               // the user chose or typed a value: it goes in the file, even if it equals the default
+};
+
+enum SettingControl { IDC_ROW = 100, IDC_APPLY = 200, IDC_CLOSE, IDC_OPEN_INI, IDC_USE_KEEP, IDC_FIX_LINKS, IDC_BROWSE };
+enum { TIMER_TICK = 1, TIMER_PLAN = 2, TIMER_SCAN = 3 };
+
+constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 9, ROW_LOAD_LAST = 12;
+
+struct SettingsWindow {
+    HWND window = nullptr, state = nullptr, summary = nullptr, load_warning = nullptr, host_warning = nullptr, folder_note = nullptr;
+    HWND browse = nullptr, fix_links = nullptr, keep_text = nullptr, keep_button = nullptr, message = nullptr, apply = nullptr, close = nullptr, open_ini = nullptr;
+    HWND groups[3] = {};
+    HFONT font = nullptr;
+    std::vector<Row> rows;
+    Json engine;                // the last GET /admin/engine
+    bool has_engine = false;
+    bool busy = false;          // a request is out
+    bool plan_wanted = false;
+    bool message_is_error = false, message_is_result = false, filling = false;
+    bool restarting = false;    // Apply restarted the server: say so when it answers
+    // What the weights folder in the window has (frontend/plan.py).
+    bool scanning = false, scanned = false, scan_draft = true, download_needed = false, folder_warning = false;
+    std::wstring scan_folder;
+    std::vector<std::wstring> scan_weights, scan_links;
+    std::map<std::wstring, std::wstring> keep;  // the stats page's changes that the controls do not have
+} settings;
+
+struct SettingsResult {
+    enum What { engine, plan, applied, scan, fixed } what;
+    HttpAnswer answer;
+    std::wstring text;  // applied: what to tell; scan: the folder
+    bool failed = false;
+};
+
+std::vector<Row> make_rows() {
+    using K = Kind;
+    using T = Tier;
+    return {
+        {L"Address", L"HOST", nullptr, K::combo_edit, T::server, nullptr},
+        {L"Port", L"PORT", nullptr, K::edit, T::server, nullptr},
+        {L"Weights folder (HF_HOME)", L"HF_HOME", nullptr, K::edit, T::server, nullptr},
+        {L"Weights", L"WEIGHTS", "weights", K::choice, T::engine, nullptr},
+        {L"KV cache type", L"KV_DTYPE", "kv_dtype", K::choice, T::engine, nullptr},
+        {L"Speculative decoding", L"SPEC", "spec", K::choice, T::engine, nullptr},
+        {L"Images (vision tower)", L"VISION", "vision", K::choice, T::engine, nullptr},
+        {L"Requests at once", L"MAX_SEQS", "max_seqs", K::choice, T::engine, nullptr},
+        {L"Context limit (tokens)", L"MAX_TOKENS", "max_tokens", K::choice, T::engine, nullptr},
+        {L"VRAM budget (GiB)", L"VRAM_BUDGET_GIB", "vram_budget_gib", K::choice, T::engine, nullptr},
+        {L"Load the engine", L"ENGINE_AUTOSTART", nullptr, K::choice, T::server, nullptr},
+        {L"Unload when idle (seconds)", L"ENGINE_IDLE_UNLOAD_S", nullptr, K::edit, T::live, L"0: never"},
+        {L"Smallest KV pool (tokens)", L"MIN_KV_TOKENS", nullptr, K::edit, T::server, L"Below this it does not load. 0: any size"},
+    };
+}
+
+Row* row_of(const std::wstring& var) {
+    for (auto& row : settings.rows)
+        if (var == row.var) return &row;
+    return nullptr;
+}
+
+std::wstring window_text(HWND window) {
+    std::wstring text(GetWindowTextLengthW(window), L'\0');
+    if (!text.empty()) GetWindowTextW(window, text.data(), static_cast<int>(text.size()) + 1);
+    return text;
+}
+
+std::wstring value_of(const Row& row) {
+    if (row.kind != Kind::choice) return trimmed(window_text(row.control));
+    auto at = SendMessageW(row.control, CB_GETCURSEL, 0, 0);
+    return at >= 0 && static_cast<size_t>(at) < row.values.size() ? row.values[at] : row.initial;
+}
+
+// Whether the value is the one the settings give now (a folder: by where it leads).
+bool row_unchanged(const Row& row) {
+    if (wcscmp(row.var, L"HF_HOME")) return value_of(row) == row.initial;
+    wchar_t a[MAX_PATH * 4], b[MAX_PATH * 4];
+    return GetFullPathNameW(value_of(row).c_str(), ARRAYSIZE(a), a, nullptr) && GetFullPathNameW(row.initial.c_str(), ARRAYSIZE(b), b, nullptr) &&
+           _wcsicmp(a, b) == 0;
+}
+
+// Whether Apply writes it: another value, or one chosen that the file does not have yet.
+bool row_changed(const Row& row) { return row.known && (!row_unchanged(row) || (row.chosen && !row.in_file)); }
+
+std::wstring grouped(double number) {
+    std::wstring digits = std::to_wstring(static_cast<long long>(number));
+    for (int at = static_cast<int>(digits.size()) - 3; at > 0; at -= 3) digits.insert(at, L",");
+    return digits;
+}
+
+std::wstring plan_text(const Json& plan) {
+    if (plan.type == Json::object && plan["error"].type == Json::string && plan["error"].text.find("VRAM") == std::string::npos) return L"no estimate";
+    if (plan.type != Json::object || plan["error"].type == Json::string || !plan["fits"].flag) return L"does not fit now";
+    return L"context " + grouped(plan["max_tokens"].value) + L", KV " + grouped(plan["kv_tokens"].value);
+}
+
+std::wstring value_name(const Row& row, const std::wstring& value) {
+    if (value.empty() && !wcscmp(row.var, L"VRAM_BUDGET_GIB")) return L"automatic";
+    return value;
+}
+
+// The list of a choice with its values; `value` stays selected and is added when the list does not have it.
+void fill_choice(Row& row, std::vector<std::pair<std::wstring, std::wstring>> items, const std::wstring& value, bool enabled) {
+    bool found = false;
+    for (const auto& item : items) found = found || item.first == value;
+    if (!found) items.insert(items.begin(), {value, value_name(row, value)});
+    bool outer = settings.filling;  // (show_rows goes on after this)
+    settings.filling = true;
+    SendMessageW(row.control, CB_RESETCONTENT, 0, 0);
+    row.values.clear();
+    for (const auto& item : items) {
+        row.values.push_back(item.first);
+        SendMessageW(row.control, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.second.c_str()));
+        if (item.first == value) SendMessageW(row.control, CB_SETCURSEL, row.values.size() - 1, 0);
+    }
+    EnableWindow(row.control, enabled);
+    settings.filling = outer;
+}
+
+void set_message(const std::wstring& text, bool error, bool result) {
+    settings.message_is_error = error;
+    settings.message_is_result = result;
+    SetWindowTextW(settings.message, text.c_str());
+}
+
+std::wstring engine_running_value(const Row& row) {
+    const Json& running = settings.engine["running"];
+    return env_text((running.type == Json::object ? running : settings.engine["settings"])[row.key]);
+}
+
+// Whether these weights can only come with a new server: another tokenizer, or not in the server's list.
+bool weights_need_server(const std::wstring& value) {
+    if (!settings.has_engine) return false;
+    const Json& why = settings.engine["weights"][narrow(value)];
+    return settings.engine["weights"].fields.empty() || why.type == Json::string ||
+           std::none_of(settings.engine["weights"].fields.begin(), settings.engine["weights"].fields.end(),
+                        [&](const auto& f) { return f.first == narrow(value); });
+}
+
+bool server_is_running(Shared* shared = nullptr) {
+    std::lock_guard lock(app.mutex);
+    if (shared) *shared = app.shared;
+    return app.shared.phase == Phase::running;
+}
+
+bool engine_holds_vram() {
+    std::lock_guard lock(app.mutex);
+    const std::string& h = app.shared.health;
+    return app.shared.phase == Phase::running && !h.empty() && h != "unloaded" && h != "stopped";
+}
+
+struct ApplyPlan {
+    bool any = false, server = false, engine = false, live = false;
+};
+
+ApplyPlan apply_plan() {
+    ApplyPlan plan;
+    for (const auto& row : settings.rows) {
+        if (!row_changed(row)) continue;
+        plan.any = true;
+        if (row_unchanged(row)) continue;  // (only written down: nothing to do)
+        if (row.tier == Tier::server || (row.key && !strcmp(row.key, "weights") && weights_need_server(value_of(row))))
+            plan.server = true;
+        else if (row.tier == Tier::live)
+            plan.live = true;
+        else if (!settings.has_engine || value_of(row) != engine_running_value(row))
+            plan.engine = true;
+    }
+    return plan;
+}
+
+std::wstring effect_text(const ApplyPlan& plan) {
+    if (!plan.any) return L"";
+    std::wstring text = L"Apply saves to settings.ini";
+    bool running = server_is_running(), loaded = engine_holds_vram();
+    const wchar_t* lost = L": requests in flight fail and the prefix cache is lost";
+    if (!running) {
+        bool active;
+        Phase phase;
+        {
+            std::lock_guard lock(app.mutex);
+            active = app.runner_active;
+            phase = app.shared.phase;
+        }
+        if (settings.download_needed) text += L". The server then downloads what the folder does not have (20 GB or more)";
+        return text + (!active && phase == Phase::failed ? L" and starts the server." : L". It is used when the server starts.");
+    }
+    if (plan.server) {
+        text += L" and restarts the server";
+        if (settings.download_needed) text += L", which downloads what the folder does not have (20 GB or more)";
+        return text + (loaded ? lost : L"") + L".";
+    }
+    if (plan.engine) return text + (loaded ? std::wstring(L" and reloads the engine") + lost : std::wstring(L". The engine uses it when it loads")) + L".";
+    return text + (plan.live ? L" and it applies at once." : L".");
+}
+
+bool is_number(const std::wstring& s) { return !s.empty() && std::all_of(s.begin(), s.end(), iswdigit); }
+
+// What is wrong with the values ("": nothing).
+std::wstring check_values() {
+    std::wstring port = value_of(*row_of(L"PORT"));
+    if (!is_number(port) || port.size() > 5 || _wtoi(port.c_str()) < 1 || _wtoi(port.c_str()) > 65535) return L"Port: a number from 1 to 65535.";
+    wchar_t* end = nullptr;
+    std::wstring idle = value_of(*row_of(L"ENGINE_IDLE_UNLOAD_S"));
+    double seconds = wcstod(idle.c_str(), &end);
+    if (idle.empty() || *end || seconds < 0) return L"Unload when idle: seconds, 0 or more.";
+    if (!is_number(value_of(*row_of(L"MIN_KV_TOKENS")))) return L"Smallest KV pool: a number of tokens, 0 or more.";
+    std::wstring host = value_of(*row_of(L"HOST"));
+    if (host.empty() || host.find_first_of(L" \t\"") != std::wstring::npos) return L"Address: an IP address, such as 127.0.0.1.";
+    if (value_of(*row_of(L"HF_HOME")).empty()) return L"Weights folder: a folder.";
+    return {};
+}
+
+std::wstring full_path(const std::wstring& path) {
+    wchar_t full[MAX_PATH * 4];  // (the working directory is the package's folder)
+    return GetFullPathNameW(path.c_str(), ARRAYSIZE(full), full, nullptr) ? std::wstring(full) : path;
+}
+
+bool folder_changed() {
+    const Row& row = *row_of(L"HF_HOME");
+    return _wcsicmp(full_path(value_of(row)).c_str(), full_path(row.initial).c_str()) != 0;
+}
+
+// frontend/plan.py gives the estimates while the server cannot: it is stopped, uses another folder, or does not take
+// the chosen weights (another tokenizer).
+bool weights_from_scan() {
+    const Row& weights = *row_of(L"WEIGHTS");
+    return folder_changed() || !server_is_running() || (weights.known && weights_need_server(value_of(weights)));
+}
+
+// The note on the folder from the last scan.
+void show_scan() {
+    Row& weights = *row_of(L"WEIGHTS");
+    std::wstring links;
+    for (size_t i = 0; i < settings.scan_links.size() && i < 3; i++) links += (i ? L", " : L"") + settings.scan_links[i];
+    if (settings.scan_links.size() > 3) links += L" and " + std::to_wstring(settings.scan_links.size() - 3) + L" more";
+    if (!links.empty()) links = L"\nWindows cannot read these here (links made under WSL): " + links + L".";
+    settings.folder_warning = !links.empty();
+    ShowWindow(settings.fix_links, settings.scanned && !links.empty() ? SW_SHOW : SW_HIDE);
+    if (!weights.known || !settings.scanned || !weights_from_scan()) {
+        settings.download_needed = false;
+        SetWindowTextW(settings.folder_note, settings.scanned && !links.empty() ? links.substr(1).c_str() : L"");
+        return;
+    }
+    std::wstring current = value_of(weights);
+    bool draft_needed = value_of(*row_of(L"SPEC")) != L"none" && !settings.scan_draft;
+    bool found = std::find(settings.scan_weights.begin(), settings.scan_weights.end(), current) != settings.scan_weights.end();
+    settings.download_needed = !found || draft_needed;
+    std::wstring note;
+    if (!exists(settings.scan_folder))
+        note = L"This folder does not exist yet. ";
+    if (!found)
+        note += current + L" is not here: the server would download it.";
+    else if (draft_needed)
+        note += L"The DFlash2 draft is not here: the server would download it (or set Speculative decoding to none).";
+    else
+        note = std::to_wstring(settings.scan_weights.size()) + L" checkpoints of the model here.";
+    settings.folder_warning = settings.folder_warning || settings.download_needed;
+    SetWindowTextW(settings.folder_note, (note + links).c_str());
+}
+
+void update_controls() {
+    if (!settings.window || settings.filling) return;
+    show_scan();
+    bool idle_zero = wcstod(value_of(*row_of(L"ENGINE_IDLE_UNLOAD_S")).c_str(), nullptr) == 0;
+    bool on_demand = value_of(*row_of(L"ENGINE_AUTOSTART")) == L"0";
+    SetWindowTextW(settings.load_warning, on_demand && idle_zero ? L"With both of these, requests get 503 until the engine is started on the stats page." : L"");
+    std::wstring host = value_of(*row_of(L"HOST"));
+    bool loopback = host == L"127.0.0.1" || host == L"localhost" || host == L"::1";
+    SetWindowTextW(settings.host_warning, loopback ? L"" : L"The network: anyone there can use the API and change these settings (no authentication).");
+
+    settings.keep.clear();
+    std::wstring keep;
+    if (settings.has_engine) {
+        for (const auto& field : settings.engine["keep_env"].fields) {
+            std::wstring var = widen(field.first), value = env_text(field.second);
+            Row* row = row_of(var);
+            if (!row || value_of(*row) == value) continue;
+            settings.keep[var] = value;
+            keep += (keep.empty() ? L"" : L", ") + var + L"=" + value_name(*row, value);
+        }
+    }
+    SetWindowTextW(settings.keep_text, keep.empty() ? L"" : (L"Changed on the stats page, not in settings.ini: " + keep).c_str());
+    ShowWindow(settings.keep_button, keep.empty() ? SW_HIDE : SW_SHOW);
+
+    ApplyPlan plan = apply_plan();
+    EnableWindow(settings.apply, plan.any);
+    if (plan.any && !settings.message_is_result) {  // (a result stays until the next edit)
+        std::wstring wrong = check_values();
+        set_message(wrong.empty() ? effect_text(plan) : wrong, !wrong.empty(), false);
+    } else if (!settings.message_is_result) {
+        set_message(L"", false, false);
+    }
+    InvalidateRect(settings.window, nullptr, FALSE);
+}
+
+void load_rows() {
+    std::vector<std::string> notes;
+    auto env = server_env(&notes);
+    auto file = read_settings();
+    for (auto& row : settings.rows) {
+        auto found = env.find(row.var);
+        row.known = found != env.end();
+        row.initial = row.known ? found->second : std::wstring();
+        std::wstring var = row.var;
+        row.in_file = file.count(var) != 0;
+        row.chosen = false;
+        if (var == L"HF_HOME") row.initial = file.count(var) ? file[var] : L"huggingface";
+        if (var == L"ENGINE_AUTOSTART") row.initial = row.initial == L"0" ? L"0" : L"1";
+        if (var == L"MIN_KV_TOKENS" && !row.known) row.known = true, row.initial = L"0";
+        if (row.known && row.key && row.tier == Tier::engine && (var == L"MAX_SEQS" || var == L"MAX_TOKENS" || var == L"VRAM_BUDGET_GIB") && !row.initial.empty()) {
+            wchar_t number[32];
+            swprintf(number, 32, L"%g", wcstod(row.initial.c_str(), nullptr));  // (24.0 and 24 are the same choice)
+            row.initial = number;
+        }
+    }
+}
+
+void show_rows() {
+    settings.filling = true;
+    for (auto& row : settings.rows) {
+        std::wstring var = row.var;
+        if (var == L"ENGINE_AUTOSTART") {
+            fill_choice(row, {{L"0", L"At the first request"}, {L"1", L"When the server starts"}}, row.initial, true);
+        } else if (row.kind == Kind::choice) {
+            fill_choice(row, {{row.initial, row.known ? value_name(row, row.initial) : L"(the default)"}}, row.initial, false);
+        } else {
+            SetWindowTextW(row.control, row.initial.c_str());
+        }
+    }
+    settings.filling = false;
+}
+
+// The output of a script of the package, with HF_HOME set to `folder` ("" if it did not run).
+std::string python_output(const std::wstring& script, const std::wstring& args, const std::wstring& folder, const std::string& request = {}) {
+    std::vector<std::string> notes;
+    auto env = server_env(&notes);
+    env[L"HF_HOME"] = folder;
+    if (!request.empty()) env[L"Q27_PLAN_REQUEST"] = widen(request);
+    std::wstring block = env_block(env);
+    SECURITY_ATTRIBUTES inherit{sizeof inherit, nullptr, TRUE};
+    HANDLE read_end, write_end;
+    if (!CreatePipe(&read_end, &write_end, &inherit, 0)) return {};
+    SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit, OPEN_EXISTING, 0, nullptr);
+    STARTUPINFOW si{sizeof si};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = si.hStdError = nul;
+    si.hStdOutput = write_end;
+    PROCESS_INFORMATION pi{};
+    std::wstring command = L"\"" + app.python + L"\" \"" + script + L"\"" + args;
+    std::vector<wchar_t> line(command.begin(), command.end());
+    line.push_back(L'\0');
+    BOOL started = CreateProcessW(app.python.c_str(), line.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                                  const_cast<wchar_t*>(block.c_str()), app.root.c_str(), &si, &pi);
+    CloseHandle(write_end);
+    CloseHandle(nul);
+    std::string out;
+    if (started) {
+        char buffer[4096];
+        DWORD n;
+        while (ReadFile(read_end, buffer, sizeof buffer, &n, nullptr) && n) out.append(buffer, n);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    CloseHandle(read_end);
+    return out;
+}
+
+void post_result(SettingsResult* result) {
+    if (!settings.window || !PostMessageW(settings.window, WM_APP_SETTINGS, 0, reinterpret_cast<LPARAM>(result))) delete result;
+}
+
+std::string settings_json();
+void on_plan_answer(const Json& parsed);
+
+// What the folder in the window has and the estimates for it, without the server (frontend/plan.py).
+void scan_folder() {
+    std::wstring folder = full_path(value_of(*row_of(L"HF_HOME")));
+    settings.scanning = true;
+    settings.plan_wanted = false;
+    std::string request = "{\"settings\":" + settings_json();
+    const Json& device = settings.engine["device"];
+    if (settings.has_engine && device["free"].type == Json::number)  // (what the server's own plans assume)
+        request += ",\"device\":[" + std::to_string(static_cast<long long>(device["free"].value)) + "," +
+                   std::to_string(static_cast<long long>(device["total"].value)) + "]";
+    request += "}";
+    std::thread([folder, request] {
+        auto* result = new SettingsResult{SettingsResult::scan};
+        result->text = folder;
+        result->answer.answered = true;
+        result->answer.body = python_output(app.plan, L"", folder, request);
+        post_result(result);
+    }).detach();
+}
+
+void on_scan_answer(const SettingsResult& result) {
+    settings.scanning = false;
+    if (_wcsicmp(result.text.c_str(), full_path(value_of(*row_of(L"HF_HOME"))).c_str()) != 0) {  // (changed meanwhile)
+        scan_folder();
+        return;
+    }
+    Json parsed;
+    if (!JsonReader(result.answer.body).read(&parsed) || parsed.type != Json::object) {
+        SetWindowTextW(settings.summary, L"No estimate: the planner did not run. The log has the server's errors.");
+        settings.scanned = true;
+        return;
+    }
+    settings.scanned = true;
+    settings.scan_folder = result.text;
+    settings.scan_draft = parsed["draft"].flag;
+    settings.scan_weights.clear();
+    for (const auto& field : parsed["weights"].fields)
+        if (field.second.type != Json::string) settings.scan_weights.push_back(widen(field.first));
+    settings.scan_links.clear();
+    for (const auto& w : parsed["links"].items) settings.scan_links.push_back(widen(w.text));
+    if (weights_from_scan())
+        on_plan_answer(parsed);
+    else
+        settings.plan_wanted = true;  // (the server's answer)
+}
+
+// The folder chosen in Explorer's dialog ("": cancelled).
+std::wstring pick_folder(HWND owner, const std::wstring& start) {
+    std::wstring chosen;
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) return chosen;
+    IFileOpenDialog* dialog = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(FileOpenDialog), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+        DWORD options = 0;
+        dialog->GetOptions(&options);
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        dialog->SetTitle(L"Weights folder (a Hugging Face cache)");
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(start.c_str(), nullptr, IID_PPV_ARGS(&item)))) {
+            dialog->SetFolder(item);
+            item->Release();
+        }
+        if (SUCCEEDED(dialog->Show(owner)) && SUCCEEDED(dialog->GetResult(&item))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                chosen = path;
+                CoTaskMemFree(path);
+            }
+            item->Release();
+        }
+        dialog->Release();
+    }
+    CoUninitialize();
+    return chosen;
+}
+
+void browse_folder() {
+    Row& row = *row_of(L"HF_HOME");
+    std::wstring folder = pick_folder(settings.window, full_path(value_of(row)));
+    if (folder.empty()) return;
+    // (HF_HOME is the folder above hub\, easy to choose by mistake: the models are in hub\ under it)
+    size_t slash = folder.find_last_of(L'\\');
+    if (slash != std::wstring::npos && slash > 2 && _wcsicmp(folder.c_str() + slash + 1, L"hub") == 0) {
+        WIN32_FIND_DATAW found;
+        HANDLE models = FindFirstFileW((folder + L"\\models--*").c_str(), &found);
+        if (models != INVALID_HANDLE_VALUE) {
+            FindClose(models);
+            folder.resize(slash);
+        }
+    }
+    SetWindowTextW(row.control, folder.c_str());  // (EN_CHANGE: the weights follow)
+}
+
+// The links Windows cannot read in the folder, as hard links to the same files (download_weights.py --fix-links).
+void fix_links() {
+    std::wstring folder = full_path(value_of(*row_of(L"HF_HOME")));
+    std::wstring question = L"Replace the links in " + folder + L" with hard links to the same files?\n\n"
+                            L"Windows and WSL then both read them. Nothing is copied or downloaded.";
+    if (MessageBoxW(settings.window, question.c_str(), APP_TITLE, MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
+    EnableWindow(settings.fix_links, FALSE);
+    set_message(L"Replacing the links...", false, true);
+    std::thread([folder] {
+        auto* result = new SettingsResult{SettingsResult::fixed};
+        result->answer.body = python_output(app.download, L" --fix-links", folder);
+        post_result(result);
+    }).detach();
+}
+
+void on_links_fixed(const std::string& body) {
+    Json parsed;
+    EnableWindow(settings.fix_links, TRUE);
+    if (!JsonReader(body).read(&parsed) || parsed["fixed"].type != Json::number) {
+        set_message(L"The links could not be replaced.", true, true);
+    } else {
+        size_t failed = parsed["failed"].items.size();
+        for (const auto& item : parsed["failed"].items) tray_log("--fix-links: " + item.text);
+        std::wstring text = L"Replaced " + std::to_wstring(static_cast<long long>(parsed["fixed"].value)) + L" links.";
+        if (failed) text += L" " + std::to_wstring(failed) + L" failed: the log has them.";
+        set_message(text, failed != 0, true);
+    }
+    settings.scanned = false;      // (the next tick asks the folder and the server again)
+    settings.has_engine = false;
+}
+
+void fetch_engine() {
+    settings.busy = true;
+    int port = app.port;
+    std::thread([port] {
+        auto* result = new SettingsResult{SettingsResult::engine};
+        result->answer = http_call(port, L"GET", L"/admin/engine", "");
+        post_result(result);
+    }).detach();
+}
+
+// The start settings as the controls have them, for the admin API.
+std::string settings_json() {
+    std::string out;
+    for (const auto& row : settings.rows) {
+        if (!row.key || !row.known) continue;
+        std::wstring value = value_of(row);
+        std::wstring var = row.var;
+        std::string text;
+        if (var == L"WEIGHTS" && !weights_from_scan() && weights_need_server(value)) continue;  // (the server does not take them)
+        if (var == L"MAX_SEQS" || var == L"MAX_TOKENS") text = narrow(value);
+        else if (var == L"VRAM_BUDGET_GIB") text = value.empty() ? "null" : narrow(value);
+        else text = json_quote(value);
+        out += (out.empty() ? "\"" : ",\"") + std::string(row.key) + "\":" + text;
+    }
+    return "{" + out + "}";
+}
+
+void fetch_plan() {
+    settings.busy = true;
+    settings.plan_wanted = false;
+    int port = app.port;
+    std::string body = "{\"settings\":" + settings_json() + "}";
+    std::thread([port, body] {
+        auto* result = new SettingsResult{SettingsResult::plan};
+        result->answer = http_call(port, L"POST", L"/admin/engine/plan", body);
+        post_result(result);
+    }).detach();
+}
+
+// What neither the file nor the environment has: the server's default.
+void fill_defaults(const Json& at_start) {
+    if (at_start.type != Json::object) return;
+    for (auto& row : settings.rows) {
+        if (row.known || !row.key) continue;
+        row.known = true;
+        row.initial = env_text(at_start[row.key]);
+        fill_choice(row, {{row.initial, value_name(row, row.initial)}}, row.initial, false);
+    }
+}
+
+void on_engine_answer(const HttpAnswer& answer) {
+    Json parsed;
+    if (!answer.answered || answer.status != 200 || !JsonReader(answer.body).read(&parsed)) return;
+    settings.engine = std::move(parsed);
+    settings.has_engine = true;
+    if (settings.restarting) set_message(L"Saved. The server has restarted.", false, true);
+    settings.restarting = false;
+    fill_defaults(settings.engine["at_start"]);
+    settings.plan_wanted = true;
+}
+
+// The answer of POST /admin/engine/plan or frontend/plan.py: the choices and what each leaves for the context.
+void on_plan_answer(const Json& parsed) {
+    fill_defaults(parsed["at_start"]);
+    const Json& plan = parsed["plan"];
+    if (plan.type != Json::object) {
+        SetWindowTextW(settings.summary, (L"No estimate: " + widen(parsed["error"].text)).c_str());
+        return;
+    }
+    const Json& device = parsed["device"];
+    constexpr double GIB = 1 << 30;
+    wchar_t pools[160] = L"";
+    if (plan["fits"].type == Json::boolean) {
+        swprintf(pools, 160, L"\nDevice pools %.1f of %.1f GiB budget; %.1f GiB free of %.1f GiB.", plan["device"].value / GIB,
+                 plan["budget"].value / GIB, device["free"].value / GIB, device["total"].value / GIB);
+    }
+    std::wstring error = widen(plan["error"].text);
+    std::wstring text = !error.empty()     ? (error.find(L"VRAM") != std::wstring::npos ? L"Does not fit: " : L"No estimate: ") + error
+                        : !plan["fits"].flag ? std::wstring(L"These do not fit the VRAM free now.") + pools
+                                             : L"Longest context " + grouped(plan["max_tokens"].value) + L" tokens; KV pool " +
+                                                   grouped(plan["kv_tokens"].value) + L" tokens, shared by the requests." + pools;
+    SetWindowTextW(settings.summary, text.c_str());
+
+    for (auto& row : settings.rows) {
+        if (!row.key) continue;
+        if (SendMessageW(row.control, CB_GETDROPPEDSTATE, 0, 0)) continue;  // (not while someone is choosing)
+        std::vector<std::pair<std::wstring, std::wstring>> items;
+        std::wstring current = value_of(row);
+        for (const auto& item : parsed["variants"][row.key].items) {
+            std::wstring value = env_text(item["value"]);
+            std::wstring var = row.var;
+            std::wstring label = value_name(row, value) + L"  -  " + plan_text(item["plan"]);
+            if (var == L"WEIGHTS") {
+                const std::string name = narrow(value);
+                const Json& why = parsed["weights"][name];
+                const Json& server_why = settings.engine["weights"][name];
+                bool tokenizer = server_why.text.find("tokenizer") != std::string::npos || why.text.find("tokenizer") != std::string::npos;
+                if (why.type == Json::string && !tokenizer) {
+                    if (value != current) continue;  // (not downloaded)
+                    label = value + L"  (not in this folder)";
+                }
+                if (tokenizer) label += L"  (another tokenizer: restarts the server)";
+            }
+            items.push_back({value, label});
+        }
+        if (!strcmp(row.key, "weights") && std::none_of(items.begin(), items.end(), [&](const auto& item) { return item.first == current; }))
+            items.insert(items.begin(), {current, current + L"  (not in this folder)"});
+        fill_choice(row, std::move(items), current, true);
+    }
+}
+
+void on_plan_http_answer(const HttpAnswer& answer) {
+    Json parsed;
+    if (!answer.answered || answer.status != 200 || !JsonReader(answer.body).read(&parsed)) {
+        SetWindowTextW(settings.summary, (L"No estimate: " + api_error(answer)).c_str());
+        return;
+    }
+    on_plan_answer(parsed);
+}
+
+// Writes the changed settings in the [env] section; the other lines stay as they are.
+bool write_settings(const std::vector<std::pair<std::wstring, std::wstring>>& changes) {
+    std::vector<std::wstring> lines = lines_of(read_text(app.ini));
+    size_t section = std::find_if(lines.begin(), lines.end(), is_env_section) - lines.begin();
+    if (section == lines.size()) lines.push_back(L"[env]");
+    for (const auto& [name, value] : changes) {
+        bool done = false;
+        for (size_t at = section + 1; at < lines.size() && trimmed(lines[at]).rfind(L'[', 0) != 0;) {
+            if (name_of(lines[at]) != upper(name)) {
+                at++;
+            } else if (done) {
+                lines.erase(lines.begin() + at);  // (the last of several wins when reading)
+            } else {
+                lines[at++] = name + L"=" + value;
+                done = true;
+            }
+        }
+        if (!done) lines.insert(lines.begin() + section + 1, name + L"=" + value);
+    }
+    std::wstring text;
+    for (const auto& line : lines) text += line + L"\r\n";
+    std::string utf8 = narrow(text);
+    std::wstring temporary = app.ini + L".tmp";
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    BOOL ok = WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr) && written == utf8.size();
+    CloseHandle(file);
+    return ok && MoveFileExW(temporary.c_str(), app.ini.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+void apply_settings() {
+    std::wstring wrong = check_values();
+    if (!wrong.empty()) {
+        set_message(wrong, true, false);
+        return;
+    }
+    ApplyPlan plan = apply_plan();
+    if (!plan.any) return;
+    bool loaded = engine_holds_vram();
+    if ((loaded && (plan.server || plan.engine)) || (settings.download_needed && (plan.server || !server_is_running()))) {
+        std::wstring question = effect_text(plan) + L"\n\nContinue?";
+        if (MessageBoxW(settings.window, question.c_str(), APP_TITLE, MB_OKCANCEL | MB_ICONWARNING) != IDOK) return;
+    }
+    std::vector<std::pair<std::wstring, std::wstring>> changes;
+    for (const auto& row : settings.rows)
+        if (row_changed(row)) changes.push_back({row.var, value_of(row)});
+    if (!write_settings(changes)) {
+        set_message(L"Cannot write " + app.ini + L". Nothing changed.", true, true);
+        return;
+    }
+    for (const auto& [name, value] : changes) tray_log("settings.ini: " + narrow(name + L"=" + value));
+
+    std::string engine_body = "{\"action\":\"restart\",\"settings\":" + settings_json() + "}";
+    std::string idle = narrow(value_of(*row_of(L"ENGINE_IDLE_UNLOAD_S")));
+    for (auto& row : settings.rows) {
+        if (row_changed(row)) row.in_file = true;
+        row.chosen = false;
+        row.initial = value_of(row);
+    }
+
+    bool active;
+    Phase phase;
+    {
+        std::lock_guard lock(app.mutex);
+        active = app.runner_active;
+        phase = app.shared.phase;
+    }
+    settings.has_engine = false;  // (asked again below or when the server is up)
+    if (plan.server && active) {
+        app.restart_pending = settings.restarting = true;
+        stop_server();
+        set_message(L"Saved. The server is restarting.", false, true);
+    } else if (!active) {
+        if (phase == Phase::failed) start_server();
+        set_message(phase == Phase::failed ? L"Saved. The server is starting." : L"Saved. It is used when the server starts.", false, true);
+    } else if (!server_is_running()) {
+        set_message(L"Saved. It is used when the server starts: restart it to use it now.", false, true);
+    } else if (plan.engine || plan.live) {
+        settings.busy = true;
+        set_message(L"Saved. Applying...", false, true);
+        int port = app.port;
+        bool engine = plan.engine, live = plan.live;
+        std::thread([port, engine_body, idle, engine, live] {
+            auto* result = new SettingsResult{SettingsResult::applied};
+            result->text = L"Saved and applied.";
+            if (live) {
+                HttpAnswer a = http_call(port, L"POST", L"/admin/engine/idle", "{\"idle_unload_s\":" + idle + "}");
+                if (a.status != 200) {
+                    result->failed = true;
+                    result->text = L"Saved in settings.ini. Not applied: " + api_error(a);
+                }
+            }
+            if (engine && !result->failed) {
+                HttpAnswer state = http_call(port, L"GET", L"/admin/engine", "");
+                Json parsed;
+                JsonReader(state.body).read(&parsed);
+                std::string body = engine_body;
+                bool stopped = parsed["state"].text == "stopped";
+                if (stopped) body.replace(body.find("restart"), 7, "save");  // (nothing to reload: for the next load)
+                HttpAnswer a = http_call(port, L"POST", L"/admin/engine", body);
+                if (a.status != 200) {
+                    result->failed = true;
+                    result->text = L"Saved in settings.ini. Not applied: " + api_error(a);
+                } else {
+                    result->text = stopped ? L"Saved. The engine uses it when it loads." : L"Saved. The engine is reloading.";
+                }
+            }
+            post_result(result);
+        }).detach();
+    } else {
+        set_message(L"Saved.", false, true);
+    }
+    update_controls();
+}
+
+void open_ini() {
+    if (!exists(app.ini)) write_settings({});
+    ShellExecuteW(settings.window, L"open", L"notepad.exe", (L"\"" + app.ini + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+void set_settings_font() {
+    UINT dpi = GetDpiForWindow(settings.window);
+    NONCLIENTMETRICSW metrics{sizeof metrics};
+    SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof metrics, &metrics, 0, dpi);
+    HFONT font = CreateFontIndirectW(&metrics.lfMessageFont);
+    EnumChildWindows(settings.window, [](HWND child, LPARAM f) {
+        SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(f), TRUE);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(font));
+    if (settings.font) DeleteObject(settings.font);
+    settings.font = font;
+}
+
+void layout_settings() {
+    UINT dpi = GetDpiForWindow(settings.window);
+    auto px = [dpi](int dip) { return MulDiv(dip, dpi, 96); };
+    constexpr int WIDTH = 680, MARGIN = 12, INSET = 12, ROW = 28, LABEL = 180;
+    const int control_x = MARGIN + INSET + LABEL, control_w = WIDTH - control_x - MARGIN - INSET;
+    int y = MARGIN;
+    auto place = [&](HWND w, int x, int top, int width, int height) { MoveWindow(w, px(x), px(top), px(width), px(height), TRUE); };
+    place(settings.state, MARGIN, y, WIDTH - 2 * MARGIN, 20);
+    y += 26;
+
+    auto place_rows = [&](size_t first, size_t last) {
+        for (size_t i = first; i <= last; i++) {
+            Row& row = settings.rows[i];
+            place(row.label_window, MARGIN + INSET, y + 3, LABEL - 6, 20);
+            int width = row.hint ? 110 : control_w;
+            if (!wcscmp(row.var, L"HF_HOME")) {
+                width = control_w - 100;
+                place(settings.browse, control_x + width + 8, y - 1, 92, 26);
+            }
+            place(row.control, control_x, y, width, row.kind == Kind::edit ? 23 : 240);
+            if (row.hint) place(row.hint_window, control_x + width + 8, y + 3, control_w - width - 8, 20);
+            y += ROW;
+        }
+    };
+    auto group = [&](int index, int top) { place(settings.groups[index], MARGIN, top, WIDTH - 2 * MARGIN, y + 8 - top); y += 16; };
+
+    int top = y;
+    y += 20;
+    place_rows(0, ROW_SERVER_LAST);
+    place(settings.folder_note, MARGIN + INSET, y, WIDTH - 2 * (MARGIN + INSET) - 110, 52);
+    place(settings.fix_links, WIDTH - MARGIN - INSET - 100, y, 100, 26);
+    y += 54;
+    place(settings.host_warning, MARGIN + INSET, y, WIDTH - 2 * (MARGIN + INSET), 20);
+    y += 22;
+    group(2, top);
+
+    top = y;
+    y += 20;
+    place_rows(ROW_SERVER_LAST + 1, ROW_ENGINE_LAST);
+    place(settings.summary, MARGIN + INSET, y + 2, WIDTH - 2 * (MARGIN + INSET), 36);
+    y += 40;
+    group(0, top);
+
+    top = y;
+    y += 20;
+    place_rows(ROW_ENGINE_LAST + 1, ROW_LOAD_LAST);
+    place(settings.load_warning, MARGIN + INSET, y, WIDTH - 2 * (MARGIN + INSET), 20);
+    y += 22;
+    group(1, top);
+
+    place(settings.keep_text, MARGIN, y + 3, WIDTH - 2 * MARGIN - 110, 36);
+    place(settings.keep_button, WIDTH - MARGIN - 100, y, 100, 26);
+    y += 40;
+    place(settings.message, MARGIN, y, WIDTH - 2 * MARGIN, 36);
+    y += 40;
+    place(settings.open_ini, MARGIN, y, 130, 28);
+    place(settings.apply, WIDTH - MARGIN - 190, y, 90, 28);
+    place(settings.close, WIDTH - MARGIN - 90, y, 90, 28);
+    y += 28 + MARGIN;
+
+    RECT frame{0, 0, px(WIDTH), px(y)};
+    DWORD style = GetWindowLongW(settings.window, GWL_STYLE);
+    AdjustWindowRectExForDpi(&frame, style, FALSE, GetWindowLongW(settings.window, GWL_EXSTYLE), dpi);
+    SetWindowPos(settings.window, nullptr, 0, 0, frame.right - frame.left, frame.bottom - frame.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void create_settings_controls(HWND window) {
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    auto child = [&](const wchar_t* type, const wchar_t* text, DWORD style, int id = 0, DWORD ex = 0) {
+        return CreateWindowExW(ex, type, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, window,
+                               reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance, nullptr);
+    };
+    settings.state = child(L"STATIC", L"", SS_NOPREFIX);
+    settings.groups[2] = child(L"BUTTON", L"Server: changing these restarts it", BS_GROUPBOX);
+    settings.groups[0] = child(L"BUTTON", L"Engine: what it loads", BS_GROUPBOX);
+    settings.groups[1] = child(L"BUTTON", L"When it holds the VRAM", BS_GROUPBOX);
+    settings.rows = make_rows();
+    int id = IDC_ROW;
+    for (auto& row : settings.rows) {
+        row.label_window = child(L"STATIC", row.label, SS_NOPREFIX);
+        if (row.kind == Kind::choice)
+            row.control = child(L"COMBOBOX", nullptr, WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, id);
+        else if (row.kind == Kind::combo_edit)
+            row.control = child(L"COMBOBOX", nullptr, WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL, id);
+        else
+            row.control = child(L"EDIT", nullptr, WS_TABSTOP | ES_AUTOHSCROLL, id, WS_EX_CLIENTEDGE);
+        if (row.hint) row.hint_window = child(L"STATIC", row.hint, SS_NOPREFIX);
+        if (!wcscmp(row.var, L"HF_HOME")) settings.browse = child(L"BUTTON", L"&Browse...", WS_TABSTOP, IDC_BROWSE);
+        id++;
+    }
+    SendMessageW(row_of(L"HOST")->control, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"127.0.0.1"));
+    SendMessageW(row_of(L"HOST")->control, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"0.0.0.0"));
+    settings.summary = child(L"STATIC", L"Reading the weights folder...", SS_NOPREFIX);
+    settings.load_warning = child(L"STATIC", L"", SS_NOPREFIX);
+    settings.host_warning = child(L"STATIC", L"", SS_NOPREFIX);
+    settings.folder_note = child(L"STATIC", L"", SS_NOPREFIX);
+    settings.fix_links = child(L"BUTTON", L"Fix the links", WS_TABSTOP, IDC_FIX_LINKS);
+    ShowWindow(settings.fix_links, SW_HIDE);
+    settings.keep_text = child(L"STATIC", L"", SS_NOPREFIX);
+    settings.keep_button = child(L"BUTTON", L"Use these", WS_TABSTOP, IDC_USE_KEEP);
+    ShowWindow(settings.keep_button, SW_HIDE);
+    settings.message = child(L"STATIC", L"", SS_NOPREFIX);
+    settings.open_ini = child(L"BUTTON", L"Open settings.ini", WS_TABSTOP, IDC_OPEN_INI);
+    settings.apply = child(L"BUTTON", L"&Apply", WS_TABSTOP | BS_DEFPUSHBUTTON, IDC_APPLY);
+    settings.close = child(L"BUTTON", L"Close", WS_TABSTOP, IDC_CLOSE);
+}
+
+// Once a second while the window is open: the state, and the server's answers when they are missing or out of date.
+void settings_tick() {
+    Shared shared;
+    bool running = server_is_running(&shared);
+    SetWindowTextW(settings.state, view_of(shared).text.c_str());
+    if (!running && settings.has_engine) settings.has_engine = false;
+    if (!running && !settings.scanned) {
+        for (auto& row : settings.rows)
+            if (row.key) EnableWindow(row.control, FALSE);
+    }
+    if (running && !settings.has_engine && !settings.busy) fetch_engine();
+    if (!settings.scanning && (!settings.scanned || (settings.plan_wanted && weights_from_scan())))
+        scan_folder();
+    else if (running && settings.has_engine && !settings.busy && settings.plan_wanted && !weights_from_scan())
+        fetch_plan();
+}
+
+LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    switch (message) {
+        case WM_CREATE:
+            settings.window = window;
+            create_settings_controls(window);
+            set_settings_font();
+            load_rows();
+            show_rows();
+            layout_settings();
+            update_controls();
+            settings_tick();
+            SetTimer(window, TIMER_TICK, 1000, nullptr);
+            return 0;
+        case WM_TIMER:
+            if (wparam == TIMER_PLAN) {
+                KillTimer(window, TIMER_PLAN);
+                settings.plan_wanted = true;
+                update_controls();
+            } else if (wparam == TIMER_SCAN) {
+                KillTimer(window, TIMER_SCAN);
+                settings.scanned = false;
+                settings.plan_wanted = true;  // (the server's list again, if back to its folder)
+                if (!settings.scanning) scan_folder();
+                update_controls();
+            }
+            settings_tick();
+            return 0;
+        case WM_APP_SETTINGS: {
+            std::unique_ptr<SettingsResult> result(reinterpret_cast<SettingsResult*>(lparam));
+            if (result->what == SettingsResult::scan) {
+                on_scan_answer(*result);
+                update_controls();
+                if (settings.plan_wanted) settings_tick();
+                return 0;
+            }
+            if (result->what == SettingsResult::fixed) {
+                on_links_fixed(result->answer.body);
+                update_controls();
+                return 0;
+            }
+            settings.busy = false;
+            if (result->what == SettingsResult::engine) {
+                on_engine_answer(result->answer);
+            } else if (result->what == SettingsResult::plan) {
+                on_plan_http_answer(result->answer);
+            } else {
+                set_message(result->text, result->failed, true);
+                settings.has_engine = false;
+            }
+            update_controls();
+            if (settings.has_engine && settings.plan_wanted) settings_tick();  // (otherwise the next tick asks again)
+            return 0;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wparam), code = HIWORD(wparam);
+            if (id == IDC_APPLY || id == IDOK) {
+                apply_settings();
+            } else if (id == IDC_CLOSE || id == IDCANCEL) {
+                DestroyWindow(window);
+            } else if (id == IDC_OPEN_INI) {
+                open_ini();
+            } else if (id == IDC_FIX_LINKS) {
+                fix_links();
+            } else if (id == IDC_BROWSE) {
+                browse_folder();
+            } else if (id == IDC_USE_KEEP) {
+                for (const auto& [var, value] : std::map(settings.keep)) {
+                    Row* row = row_of(var);
+                    if (row->kind == Kind::choice)
+                        fill_choice(*row, {{value, value_name(*row, value)}}, value, true);
+                    else
+                        SetWindowTextW(row->control, value.c_str());
+                }
+                settings.plan_wanted = true;
+                update_controls();
+            } else if (id >= IDC_ROW && !settings.filling && (code == CBN_SELCHANGE || code == CBN_SELENDOK || code == EN_CHANGE || code == CBN_EDITCHANGE)) {
+                settings.rows[id - IDC_ROW].chosen = true;  // (CBN_SELENDOK: also the item that was selected already)
+                settings.message_is_result = false;
+                // (at CBN_SELCHANGE an address's edit box still has the old text, so also a moment later)
+                int row = id - IDC_ROW;
+                if ((row > ROW_SERVER_LAST && row <= ROW_ENGINE_LAST) || code == CBN_SELCHANGE || code == CBN_SELENDOK) SetTimer(window, TIMER_PLAN, 100, nullptr);
+                if (row == ROW_SERVER_LAST) SetTimer(window, TIMER_SCAN, 500, nullptr);
+                update_controls();
+            }
+            return 0;
+        }
+        case WM_CTLCOLORSTATIC: {
+            auto control = reinterpret_cast<HWND>(lparam);
+            HDC dc = reinterpret_cast<HDC>(wparam);
+            bool warn = control == settings.load_warning || control == settings.host_warning ||
+                        (control == settings.folder_note && settings.folder_warning) ||
+                        (control == settings.message && settings.message_is_error);
+            SetTextColor(dc, warn ? RGB(192, 0, 0) : GetSysColor(COLOR_WINDOWTEXT));
+            SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
+            return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_BTNFACE));
+        }
+        case WM_DPICHANGED: {
+            auto* r = reinterpret_cast<RECT*>(lparam);
+            SetWindowPos(window, nullptr, r->left, r->top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            set_settings_font();
+            layout_settings();
+            return 0;
+        }
+        case WM_DESTROY: {
+            KillTimer(window, TIMER_TICK);
+            KillTimer(window, TIMER_PLAN);
+            KillTimer(window, TIMER_SCAN);
+            if (settings.font) DeleteObject(settings.font);
+            settings = SettingsWindow{};
+            return 0;
+        }
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
+void show_settings() {
+    if (!settings.window) {
+        std::wstring title = std::wstring(APP_TITLE) + L" settings";
+        CreateWindowExW(WS_EX_CONTROLPARENT, SETTINGS_CLASS, title.c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                        CW_USEDEFAULT, CW_USEDEFAULT, 700, 800, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    }
+    ShowWindow(settings.window, IsIconic(settings.window) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(settings.window);
+}
+
 // ------------------------------------------------------------ the menu and the main window
 
 void show_menu() {
@@ -806,6 +2014,7 @@ void show_menu() {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (s.phase == Phase::stopping ? MF_GRAYED : 0), ID_TOGGLE, active ? L"&Stop server" : L"&Start server");
     AppendMenuW(menu, MF_STRING | (s.phase == Phase::running ? 0 : MF_GRAYED), ID_UI, L"Open stats &page");
+    AppendMenuW(menu, MF_STRING, ID_SETTINGS, L"S&ettings...");
     AppendMenuW(menu, MF_STRING, ID_LOG, L"Show &log");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (logon_value(&ignored) ? MF_CHECKED : 0), ID_LOGON, L"Start at log&on");
@@ -851,10 +2060,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 app.runner_active = false;
                 if (app.shared.phase == Phase::stopping) app.shared.phase = Phase::stopped;
             }
-            if (app.quitting)
+            if (app.quitting) {
                 DestroyWindow(window);
-            else
+            } else {
+                if (app.restart_pending) start_server();
+                app.restart_pending = false;
                 refresh();
+            }
             return 0;
         }
         case WM_APP_AGAIN:
@@ -873,6 +2085,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                     ShellExecuteW(window, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                     break;
                 }
+                case ID_SETTINGS: show_settings(); break;
                 case ID_LOG: show_log(); break;
                 case ID_LOGON: {
                     std::wstring ignored;
@@ -885,6 +2098,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         case WM_DESTROY:
             Shell_NotifyIconW(NIM_DELETE, &app.icon);
             if (app.log_window) DestroyWindow(app.log_window);
+            if (settings.window) DestroyWindow(settings.window);
             SetEvent(app.quit_event);
             if (app.poller.joinable()) app.poller.join();
             PostQuitMessage(0);
@@ -901,6 +2115,7 @@ bool find_package() {
     app.python = app.root + L"\\python\\python.exe";
     app.server = app.root + L"\\app\\frontend\\server.py";
     app.download = app.root + L"\\app\\scripts\\download_weights.py";
+    app.plan = app.root + L"\\app\\frontend\\plan.py";
     app.log_dir = app.root + L"\\logs";
     app.log_path = app.log_dir + L"\\server.log";
     app.old_log = app.log_dir + L"\\server.1.log";
@@ -957,6 +2172,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     log_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     log_class.lpszClassName = LOG_CLASS;
     RegisterClassExW(&log_class);
+    WNDCLASSEXW settings_class = log_class;
+    settings_class.lpfnWndProc = settings_proc;
+    settings_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    settings_class.lpszClassName = SETTINGS_CLASS;
+    RegisterClassExW(&settings_class);
 
     app.taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     app.quit_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -977,6 +2197,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
 
     MSG message;
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (settings.window && IsDialogMessageW(settings.window, &message)) continue;  // (Tab, Enter, Esc)
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }

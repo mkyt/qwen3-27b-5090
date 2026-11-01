@@ -81,6 +81,14 @@ def downloaded_repos():
     return out
 
 
+def unreadable_repos():
+    """The repositories of this model whose config.json is a link this system cannot follow (Windows, with the LX
+    symlinks huggingface_hub leaves under WSL on a 9p mount of the drive: scripts/download_weights.py --fix-links)."""
+    return [base.name.removeprefix("models--").replace("--", "/", 1) for base in sorted(HF_HUB.glob("models--*--*"))
+            if "qwen3.8-27b" in base.name.lower() and any(os.path.lexists(s / "config.json") and not (s / "config.json").is_file()
+                                                           for s in base.glob("snapshots/*"))]
+
+
 def is_model(path: pathlib.Path) -> bool:
     """Whether config.json describes a quantized Qwen3.8-27B (the engine's dims.h)."""
     try:

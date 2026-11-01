@@ -13,7 +13,7 @@ import multiprocessing as mp
 import os
 import threading
 
-from qwen27b.paths import DFLASH2, PROFILES, TARGET, downloaded_repos, engine_target, snapshot
+from qwen27b.paths import DFLASH2, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
 from tokenizer import fingerprint
 
 CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
@@ -25,9 +25,32 @@ VARIANTS = {"max_seqs": tuple(range(1, MAX_SEQS + 1)), "max_tokens": (32768, 655
             "vram_budget_gib": (None, 20.0, 22.0, 24.0, 26.0, 28.0)}  # (gdnfp4 needs about 19 GiB without a KV pool)
 LM_HEAD_ENV = os.environ.get("Q27_LM_HEAD_CKPT", "")  # (engine_target("quasar") sets it in this process)
 GiB = 1 << 30
+# Engine settings whose library default (q27lib.Engine, for the tests and scripts) is not the server's, set when
+# unset: the server starts the same with or without compose.yaml, which lists them too (tests/test_parsing.py).
+# MAX_TOKENS is an upper bound the engine lowers to what the VRAM budget fits (e.g. with MAX_SEQS=8); the prefix
+# cache keeps 4 GiB of pinned state checkpoints.
+ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "4"}
 # The variables the settings start from (server.py).
 ENV_NAMES = {"weights": "WEIGHTS", "kv_dtype": "KV_DTYPE", "spec": "SPEC", "vision": "VISION", "max_seqs": "MAX_SEQS",
              "max_tokens": "MAX_TOKENS", "vram_budget_gib": "VRAM_BUDGET_GIB"}
+
+
+def set_engine_env(root):
+    """The environment an engine of the server starts with, besides the settings (`root`: the checkout or package)."""
+    for k, v in ENGINE_ENV_DEFAULTS.items():
+        os.environ.setdefault(k, v)
+    vocab = root / "bench/draft-vocab/vocab-128k.txt"
+    if "Q27_DRAFT_VOCAB" not in os.environ and vocab.exists():
+        os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
+
+
+def env_settings():
+    """The start settings from the variables, by default the server's."""
+    env = os.environ.get
+    budget = env("VRAM_BUDGET_GIB")
+    return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
+            "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 8)), MAX_SEQS)),
+            "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_budget_gib": float(budget) if budget else None}
 
 
 def margin_gib():
@@ -175,6 +198,13 @@ class Launch:
             out["variants"][k] = [{"value": v, "plan": r} for v, r in zip(values, res[i:i + len(values)])]
             i += len(values)
         return out
+
+    def plan_answer(self, changes, device, source):
+        """What a page or the tray app shows for changes to the next start's settings on this device: POST
+        /admin/engine/plan, and frontend/plan.py without a server."""
+        s = self.validate(changes, device=device, check_budget=False)
+        return dict(self.plans(s, device), device={"free": device[0], "total": device[1], "source": source},
+                    weights=self.weights_choices(), at_start=self.at_start)
 
     def _run(self, jobs):
         if self.planner is None or not self.planner[0].is_alive():

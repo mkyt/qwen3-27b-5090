@@ -36,6 +36,6 @@ set "UP=%ARGS:~0,2%"
 if /i "%ARGS%"=="update" set "UP=up"
 if /i "%UP%"=="up" (
   powershell.exe -NoProfile -Command "Start-Process wsl.exe -WindowStyle Hidden -ArgumentList '-d','%DISTRO%','--cd','%DIR%','--','bash','scripts/serve.sh','keepalive'"
-  start "" http://127.0.0.1:8000/ui
+  for /f "delims=" %%p in ('wsl.exe -d %DISTRO% --cd "%DIR%" -- bash scripts/serve.sh port') do start "" http://127.0.0.1:%%p/ui
 )
 if /i "%ARGS%"=="status" pause
