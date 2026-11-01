@@ -55,7 +55,7 @@ struct Shared {  // written by the worker threads, read by the window's thread (
 
 struct App {
     std::wstring root, python, server, download;     // the package's files
-    std::wstring data_dir, log_path, old_log, ini;   // in %LOCALAPPDATA%
+    std::wstring log_dir, log_path, old_log, ini;    // the package keeps what it writes in its own folder
     std::wstring host = L"127.0.0.1";
     int port = 8000;
 
@@ -147,31 +147,125 @@ void tray_log(const std::string& text) { logfile.line("[tray] " + text); }
 
 // ------------------------------------------------------------ settings
 
-// The server's environment: this process's, the app's defaults for what is unset, then [env] of settings.ini.
-std::map<std::wstring, std::wstring> server_env() {
+// A file's text as Notepad may save it: UTF-16, UTF-8 or the ANSI code page.
+std::wstring read_text(const std::wstring& path) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return {};
+    LARGE_INTEGER size{};
+    GetFileSizeEx(file, &size);
+    std::string raw(static_cast<size_t>(size.QuadPart), '\0');
+    DWORD n = 0;
+    ReadFile(file, raw.data(), static_cast<DWORD>(raw.size()), &n, nullptr);
+    CloseHandle(file);
+    raw.resize(n);
+    if (raw.rfind("\xFF\xFE", 0) == 0) return std::wstring(reinterpret_cast<const wchar_t*>(raw.data() + 2), (raw.size() - 2) / 2);
+    if (raw.rfind("\xEF\xBB\xBF", 0) == 0) raw.erase(0, 3);
+    if (raw.empty()) return {};
+    UINT page = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(), static_cast<int>(raw.size()), nullptr, 0) ? CP_UTF8 : CP_ACP;
+    int chars = MultiByteToWideChar(page, 0, raw.data(), static_cast<int>(raw.size()), nullptr, 0);
+    std::wstring text(chars, L'\0');
+    MultiByteToWideChar(page, 0, raw.data(), static_cast<int>(raw.size()), text.data(), chars);
+    return text;
+}
+
+std::wstring trimmed(const std::wstring& s) {
+    size_t first = s.find_first_not_of(L" \t\r\n"), last = s.find_last_not_of(L" \t\r\n");
+    return first == std::wstring::npos ? std::wstring() : s.substr(first, last - first + 1);
+}
+
+std::vector<std::wstring> lines_of(const std::wstring& text) {
+    std::vector<std::wstring> lines;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t end = text.find(L'\n', at);
+        if (end == std::wstring::npos) end = text.size();
+        std::wstring line = text.substr(at, end - at);
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        lines.push_back(line);
+        at = end + 1;
+    }
+    return lines;
+}
+
+bool is_env_section(const std::wstring& line) { return _wcsicmp(trimmed(line).c_str(), L"[env]") == 0; }
+
+// The name of a "name=value" line ("": a comment, a section or anything else).
+std::wstring name_of(const std::wstring& raw) {
+    std::wstring line = trimmed(raw);
+    size_t eq = line.find(L'=');
+    if (line.empty() || line[0] == L';' || line[0] == L'#' || line[0] == L'[' || eq == std::wstring::npos || eq == 0) return {};
+    return upper(trimmed(line.substr(0, eq)));
+}
+
+// The [env] section of settings.ini by upper-case name.
+std::map<std::wstring, std::wstring> read_settings() {
+    std::map<std::wstring, std::wstring> settings;
+    bool in_env = false;
+    for (const auto& line : lines_of(read_text(app.ini))) {
+        if (trimmed(line).rfind(L'[', 0) == 0) in_env = is_env_section(line);
+        std::wstring name = name_of(line);
+        if (!in_env || name.empty()) continue;
+        std::wstring value = trimmed(line.substr(line.find(L'=') + 1));
+        if (value.size() >= 2 && value.front() == L'"' && value.back() == L'"') value = value.substr(1, value.size() - 2);
+        settings[name] = value;
+    }
+    return settings;
+}
+
+// Sets a name of the [env] section in settings.ini; the other lines stay as they are.
+void write_setting(const std::wstring& name, const std::wstring& value) {
+    std::vector<std::wstring> lines = lines_of(read_text(app.ini));
+    size_t section = std::find_if(lines.begin(), lines.end(), is_env_section) - lines.begin();
+    if (section == lines.size()) lines.push_back(L"[env]");
+    size_t at = section + 1;
+    while (at < lines.size() && trimmed(lines[at]).rfind(L'[', 0) != 0 && name_of(lines[at]) != upper(name)) at++;
+    if (at < lines.size() && name_of(lines[at]) == upper(name))
+        lines[at] = name + L"=" + value;
+    else
+        lines.insert(lines.begin() + section + 1, name + L"=" + value);
+    std::wstring text;
+    for (const auto& line : lines) text += line + L"\r\n";
+    std::string utf8 = narrow(text);
+    std::wstring temporary = app.ini + L".tmp";
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD written;
+    WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+    CloseHandle(file);
+    MoveFileExW(temporary.c_str(), app.ini.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+// The server's environment: settings.ini, then this process's, then the defaults (and notes for the log). HF_HOME is
+// the exception: only settings.ini moves the weights out of this folder, not a variable of the whole PC.
+std::map<std::wstring, std::wstring> server_env(std::vector<std::string>* notes) {
     std::map<std::wstring, std::wstring> env;  // by upper-case name (names ignore case; Python's os.environ does the same)
-    auto put = [&](const std::wstring& k, const std::wstring& v) { env[upper(k)] = v; };
     wchar_t* block = GetEnvironmentStringsW();
     for (const wchar_t* p = block; *p; p += wcslen(p) + 1) {
         std::wstring e = p;
         size_t eq = e.find(L'=', 1);
-        if (eq != std::wstring::npos) put(e.substr(0, eq), e.substr(eq + 1));
+        if (eq != std::wstring::npos) env[upper(e.substr(0, eq))] = e.substr(eq + 1);
     }
     FreeEnvironmentStringsW(block);
+    auto settings = read_settings();
+    if (auto outside = env.find(L"HF_HOME"); outside != env.end()) {
+        if (!settings.count(L"HF_HOME"))
+            notes->push_back("HF_HOME=" + narrow(outside->second) + " in the environment is not used: set it in settings.ini to use that cache");
+        env.erase(outside);
+    }
+    for (const auto& [k, v] : settings) {
+        if (auto it = env.find(k); it != env.end() && it->second != v)
+            notes->push_back(narrow(k + L"=" + v) + " from settings.ini (the environment has " + narrow(it->second) + ")");
+        env[k] = v;
+    }
     env.try_emplace(L"HOST", L"127.0.0.1");
     env.try_emplace(L"PORT", L"8000");
     env.try_emplace(L"ENGINE_AUTOSTART", L"0");         // no VRAM in use until the first request ...
     env.try_emplace(L"ENGINE_IDLE_UNLOAD_S", L"1800");  // ... and again after half an hour without one
-
-    std::vector<wchar_t> section(32768);
-    DWORD n = GetPrivateProfileSectionW(L"env", section.data(), static_cast<DWORD>(section.size()), app.ini.c_str());
-    for (const wchar_t* p = section.data(); p < section.data() + n && *p; p += wcslen(p) + 1) {
-        std::wstring e = p;
-        size_t eq = e.find(L'=');
-        if (eq != std::wstring::npos && eq > 0 && e[0] != L';') put(e.substr(0, eq), e.substr(eq + 1));
-    }
-    put(L"PYTHONUNBUFFERED", L"1");  // the log follows the output
-    put(L"PYTHONUTF8", L"1");        // the log is UTF-8 whatever the locale
+    env.try_emplace(L"HF_HOME", L"huggingface");
+    wchar_t full[MAX_PATH * 4];                         // (the working directory is the package's folder)
+    if (GetFullPathNameW(env[L"HF_HOME"].c_str(), ARRAYSIZE(full), full, nullptr)) env[L"HF_HOME"] = full;
+    env[L"PYTHONUNBUFFERED"] = L"1";  // the log follows the output
+    env[L"PYTHONUTF8"] = L"1";        // the log is UTF-8 whatever the locale
     return env;
 }
 
@@ -244,7 +338,7 @@ void keep_idle_unload(const std::string& seconds) {
     std::lock_guard lock(app.mutex);
     if (value == app.idle_unload_s) return;
     app.idle_unload_s = value;
-    WritePrivateProfileStringW(L"env", L"ENGINE_IDLE_UNLOAD_S", widen(seconds).c_str(), app.ini.c_str());
+    write_setting(L"ENGINE_IDLE_UNLOAD_S", widen(seconds));
 }
 
 void poll_loop() {
@@ -386,7 +480,8 @@ bool stop_is_wanted() {
 }
 
 void run_server() {
-    auto env = server_env();
+    std::vector<std::string> notes;
+    auto env = server_env(&notes);
     app.host = env[L"HOST"];
     app.port = _wtoi(env[L"PORT"].c_str());
     std::wstring block = env_block(env);
@@ -395,7 +490,8 @@ void run_server() {
         app.idle_unload_s = _wtof(env[L"ENGINE_IDLE_UNLOAD_S"].c_str());
     }
     logfile.open_new();
-    tray_log("starting: HOST=" + narrow(app.host) + " PORT=" + std::to_string(app.port));
+    tray_log("starting: HOST=" + narrow(app.host) + " PORT=" + std::to_string(app.port) + " HF_HOME=" + narrow(env[L"HF_HOME"]));
+    for (const auto& note : notes) tray_log(note);
 
     // Windows lets two servers listen on one port (Python sets SO_REUSEADDR), so it has to be checked first.
     std::string body;
@@ -691,7 +787,7 @@ LRESULT CALLBACK log_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         }
         case WM_COMMAND:
             if (LOWORD(wparam) == ID_LOG_FOLDER)
-                ShellExecuteW(window, L"open", app.data_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                ShellExecuteW(window, L"open", app.log_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             return 0;
         case WM_DESTROY:
             KillTimer(window, 1);
@@ -855,32 +951,45 @@ bool find_package() {
     app.python = app.root + L"\\python\\python.exe";
     app.server = app.root + L"\\app\\frontend\\server.py";
     app.download = app.root + L"\\app\\scripts\\download_weights.py";
+    app.log_dir = app.root + L"\\logs";
+    app.log_path = app.log_dir + L"\\server.log";
+    app.old_log = app.log_dir + L"\\server.1.log";
+    app.ini = app.root + L"\\settings.ini";
     return exists(app.python) && exists(app.server) && exists(app.download);
+}
+
+// What the package writes stays in its folder, so the folder has to take it.
+bool can_write() {
+    CreateDirectoryW(app.log_dir.c_str(), nullptr);
+    HANDLE file = CreateFileW((app.log_dir + L"\\.write-test").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(file);
+    return true;
 }
 
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     bool found = find_package();
-    if (wcscmp(command_line, L"--check") == 0) return found ? 0 : 2;  // (the package's smoke test)
+    bool writable = found && can_write();
+    if (wcscmp(command_line, L"--check") == 0) return !found ? 2 : writable ? 0 : 3;  // (the package's smoke test)
     if (!found) {
         MessageBoxW(nullptr, L"python\\python.exe and app\\ were not found next to this program. Keep it in the folder of the unzipped package.",
                     APP_TITLE, MB_ICONERROR);
         return 2;
     }
+    if (!writable) {
+        std::wstring text = L"Cannot write in " + app.root + L".\n\nThis program keeps its settings, log and weights in its own folder. Unzip the package in a folder you can write to (not Program Files).";
+        MessageBoxW(nullptr, text.c_str(), APP_TITLE, MB_ICONERROR);
+        return 3;
+    }
+    SetCurrentDirectoryW(app.root.c_str());  // (a start at logon has another one; relative paths in settings.ini are from here)
     HANDLE mutex = CreateMutexW(nullptr, TRUE, MUTEX_NAME);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (HWND other = FindWindowW(WINDOW_CLASS, nullptr)) PostMessageW(other, WM_APP_AGAIN, 0, 0);
         return 0;
     }
-
-    wchar_t local[MAX_PATH * 4];
-    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, ARRAYSIZE(local))) wcscpy_s(local, L".");
-    app.data_dir = std::wstring(local) + L"\\qwen3-27b-5090";
-    CreateDirectoryW(app.data_dir.c_str(), nullptr);
-    app.log_path = app.data_dir + L"\\server.log";
-    app.old_log = app.data_dir + L"\\server.1.log";
-    app.ini = app.data_dir + L"\\settings.ini";
 
     std::wstring registered;  // (the package may have moved since the box was ticked)
     if (logon_value(&registered) && registered != run_command()) set_logon(true);

@@ -161,9 +161,9 @@ first in either case.
 - **Freeing disk space:** each update leaves the previous image behind, without a name.
   `docker image prune` deletes such images, including those of other projects, and asks first.
 
-The [Windows package](#windows-native) has no image: download the zip of the new
-[release](https://github.com/mkyt/qwen3-27b-5090/releases), unzip it and run its `start.cmd`. The weights in the Hugging
-Face cache are used again.
+The [Windows package](#windows-native) has no image: quit the tray app, delete `python\` and `app\` in its folder, and
+unzip the zip of the new [release](https://github.com/mkyt/qwen3-27b-5090/releases) over the folder. The settings and the
+weights stay ([docs/configuration.md](docs/configuration.md#updating)).
 
 ### Windows (native)
 
@@ -180,10 +180,13 @@ server then takes no VRAM until the first request and frees it after 30 minutes 
 ([docs/configuration.md](docs/configuration.md#tray-app)). The program is not signed, so Windows may warn about it at the
 first start (compare the zip's SHA-256 with the release's).
 
-Or run `start.cmd`, which keeps the server in a console window and loads the engine at once. The first start downloads the weights (23 GB, into
-`%USERPROFILE%\.cache\huggingface` or `HF_HOME`; an interrupted download resumes), then the server listens on
-http://127.0.0.1:8000 and the browser opens its stats page. Set `HOST=0.0.0.0` to serve the network (Windows Firewall
-asks), `PORT`, `OPEN_UI=0` (no browser, e.g. a start at logon) or `WEIGHTS` before running it
+Or run `start.cmd`, which keeps the server in a console window and loads the engine at once. The first start downloads
+the weights (23 GB, into the folder; an interrupted download resumes), then the server listens on http://127.0.0.1:8000
+and the browser opens its stats page.
+
+The package is portable: its settings (`settings.ini`, see `settings.example.ini`), weights and log stay in its folder, so
+it needs one you can write to. Versions before the tray app downloaded the weights to
+`%USERPROFILE%\.cache\huggingface`: set `HF_HOME` there in `settings.ini` to use them instead of downloading again
 ([docs/configuration.md](docs/configuration.md#windows-package)). Reading the weights from a Windows disk is also
 faster natively (about 5.8 GB/s against 2.6–2.8 GB/s from WSL2's `/mnt`).
 

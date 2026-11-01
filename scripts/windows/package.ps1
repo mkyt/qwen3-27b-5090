@@ -59,11 +59,11 @@ foreach ($d in "bench\draft-vocab", "engine\python", "frontend") {
 Remove-Item -Recurse -Force (Join-Path $app "frontend\tests")
 New-Item -ItemType Directory -Force "$app\reference\qwen27b", "$app\scripts", "$app\engine\build" | Out-Null
 foreach ($f in "__init__.py", "paths.py", "image_tokens.py") { Copy-Item "reference\qwen27b\$f" "$app\reference\qwen27b\" }
-Copy-Item scripts\download_weights.py "$app\scripts\"
+Copy-Item scripts\download_weights.py, scripts\windows\start_package.py "$app\scripts\"
 Copy-Item engine\build\q27.dll "$app\engine\build\"
 Get-ChildItem -Recurse -Directory -Filter __pycache__ $app | Remove-Item -Recurse -Force
 Copy-Item LICENSE $dst
-Copy-Item scripts\windows\start.cmd (Join-Path $dst "start.cmd")
+Copy-Item scripts\windows\start.cmd, scripts\windows\settings.example.ini $dst
 Copy-Item windows\tray\build\qwen3-27b-tray.exe $dst
 
 $zip = Join-Path $Out "$name.zip"

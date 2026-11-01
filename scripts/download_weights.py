@@ -222,7 +222,10 @@ def main():
     if not todo:
         print("all checkpoints are present")
         return
-    free = shutil.disk_usage(paths.HF_HUB.parent if paths.HF_HUB.parent.exists() else pathlib.Path.home()).free
+    place = paths.HF_HUB.absolute()
+    while not place.exists():  # (the first start: the drive it will be on)
+        place = place.parent
+    free = shutil.disk_usage(place).free
     if free < total + (1 << 30):
         sys.exit(f"not enough disk space: {total / 1e9:.1f} GB to download, {free / 1e9:.1f} GB free")
     print(f"downloading {total / 1e9:.1f} GB", flush=True)

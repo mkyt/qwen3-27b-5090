@@ -213,17 +213,42 @@ the fine-tune drifts.
 
 ## Windows package
 
-`start.cmd` of the Windows package (`scripts/windows/package.ps1`) runs `scripts/download_weights.py`, then the
-server with the defaults above. It reads these besides the serving variables (set them before running it, e.g.
-`set PORT=8001` in a command prompt, or in the user's environment variables):
+The package is portable: what it writes stays in its folder (the one with `qwen3-27b-tray.exe`), so it needs a folder
+you can write to, not Program Files. The exception is the start at logon, a value in the registry, only if you tick it.
+
+| Path in the folder | What |
+| --- | --- |
+| `settings.ini` | Your settings (below); the package does not ship one, so an update does not touch it |
+| `huggingface\` | The weights, 23 GB (`HF_HOME`) |
+| `logs\` | The tray app's `server.log`, and one older file, `server.1.log`: a new one at each start of the server and beyond 16 MiB |
+| `python\`, `app\`, `qwen3-27b-tray.exe`, `start.cmd`, `settings.example.ini`, `LICENSE` | The package; an update replaces them |
+
+### Settings
+
+Copy `settings.example.ini` to `settings.ini` and set any variable of this page in its `[env]` section. Both the tray
+app and `start.cmd` read it, when the server starts. A value comes from `settings.ini`, then from the environment, then
+from the default; the log says when `settings.ini` overrides the environment. Relative paths are from the folder.
+
+`HF_HOME` is the exception: without it in `settings.ini` the weights are in the folder, whatever the environment says, so
+that a variable of the whole PC does not move them out. To share an existing cache, write it there in full, for
+example the one earlier versions downloaded to:
+
+```ini
+[env]
+HF_HOME=C:\Users\me\.cache\huggingface
+PORT=8001
+```
+
+Windows limits most paths to 260 characters and the weights' are about 140 below the folder: keep the folder's path under
+about 110, or `HF_HOME` elsewhere.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HOST` | 127.0.0.1 | Address the server listens on (`0.0.0.0`: the network, which Windows Firewall asks about) |
 | `PORT` | 8000 | Port of the API and the web UI (also read by `frontend/server.py`) |
-| `OPEN_UI` | 1 | 1: open the web UI in the browser at the start; 0: do not (e.g. a start at logon) |
+| `OPEN_UI` | 1 | `start.cmd`: 1 opens the web UI in the browser at the start, 0 does not |
 | `WEIGHTS` | gdnfp4 | Weights downloaded before the start and served: a profile or `ORG/NAME[@REVISION]` ([Other checkpoints](#other-checkpoints)) |
-| `HF_HOME` | `%USERPROFILE%\.cache\huggingface` | Hugging Face cache the weights are downloaded to and loaded from (23 GB) |
+| `HF_HOME` | `huggingface` in the folder | Hugging Face cache the weights are downloaded to and loaded from (23 GB) |
 | `HF_TOKEN` | (none) | Sent with the downloads if set (needed for gated repositories; otherwise it only raises the rate limit) |
 
 ### Tray app
@@ -235,19 +260,14 @@ of the app does nothing. If another server answers on the port, the app reports 
 Its defaults differ from `start.cmd`: `ENGINE_AUTOSTART=0` and `ENGINE_IDLE_UNLOAD_S=1800`, so the service is up from the
 start but holds VRAM only between the first request and 30 minutes after the last one ([Unloading when idle](#unloading-when-idle)).
 
-The server gets the app's environment with these defaults for what is unset, then the `[env]` section of
-`%LOCALAPPDATA%\qwen3-27b-5090\settings.ini`, which wins. They apply when the server starts:
+The output goes to the log (the menu's **Show log**, which also works when the server did not start). **Start at
+logon** is the value `qwen3-27b-5090` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; the app corrects its
+path if the folder moved. A time changed on the stats page is saved in `settings.ini`.
 
-```ini
-[env]
-PORT=8001
-ENGINE_IDLE_UNLOAD_S=600
-HF_HOME=D:\huggingface
-```
+### Updating
 
-The output goes to `server.log` in the same folder (the menu's **Show log**, which also works when the server did not
-start), with one older file, `server.1.log`: a new one at each start of the server and beyond 16 MiB. **Start at logon**
-is the value `qwen3-27b-5090` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; the app corrects its path if the folder moved.
+Quit the tray app, delete `python\` and `app\` (files of the old version must not stay among the new ones), and unzip the
+new package over the folder. `settings.ini`, the weights and the log stay.
 
 ## Development switches
 
