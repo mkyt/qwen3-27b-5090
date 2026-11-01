@@ -1,7 +1,7 @@
 # Configuration
 
 All settings are environment variables of `frontend/server.py`, with the same names and defaults however it is started
-(the exceptions are in the first table below). The startup log prints the memory plan. Task IDs such as `P7-13` refer to
+(the exceptions are in the first table below, and `HOST`). The startup log prints the memory plan. Task IDs such as `P7-13` refer to
 [decisions.md](decisions.md).
 
 ## How settings work
@@ -40,11 +40,60 @@ What it takes for a setting to change depends on who reads it, and when:
   `HOST` and `PORT` (published by compose, above), the Windows package's, and most of
   [Development switches](#development-switches): add those in `compose.override.yaml`.
 
+## Using it from other machines
+
+By default Docker and the Windows package accept connections from this PC only. To use the server from other machines on
+your network, set `HOST` to `0.0.0.0`:
+
+| | What to do |
+| --- | --- |
+| Windows package, tray app | **Settings**, then **Address** `0.0.0.0` and **Apply**, or `HOST=0.0.0.0` in `settings.ini` |
+| Windows package, `start.cmd` | `HOST=0.0.0.0` in `settings.ini`, then run it again |
+| Docker on native Linux | `HOST=0.0.0.0` in `.env` next to `compose.yaml`, then `docker compose up -d serve`. Nothing else is needed |
+| Docker under WSL2 | The same, and also one of the two settings below: WSL2 does not take connections from the network by default |
+
+Use `0.0.0.0` rather than the PC's own address: the tray app and `scripts/serve.sh` check the server on `127.0.0.1`.
+
+**Security:** there is no authentication. Anyone who can reach the port can use the model, and can stop the engine and
+change its settings through the admin API and the stats page. Do this only on a network you trust, and do not forward the
+port to the internet.
+
+**Windows Firewall:** the first start of the Windows package with `0.0.0.0` asks whether to allow Python; allow it for
+private networks. If you closed that prompt, add a rule in an administrator PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "Qwen3.8-27B" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+```
+
+**Linux firewalls:** Docker publishes ports with its own iptables rules, ahead of `ufw` and `firewalld`'s usual rules, so
+the port opens without a firewall rule and those tools' rules do not close it. To limit who can connect, use Docker's
+`DOCKER-USER` chain or a firewall in front of the PC.
+
+**WSL2** ([Microsoft's documentation](https://learn.microsoft.com/en-us/windows/wsl/networking)), either of:
+
+- Mirrored networking (Windows 11 22H2 or later): add `networkingMode=mirrored` under `[wsl2]` in `%USERPROFILE%\.wslconfig`,
+  run `wsl --shutdown`, and allow the port in an administrator PowerShell:
+
+  ```powershell
+  New-NetFirewallHyperVRule -Name "Qwen3.8-27B" -DisplayName "Qwen3.8-27B" -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 8000
+  ```
+
+- A port proxy, in an administrator PowerShell, plus the Windows Firewall rule above. The WSL address can change when WSL
+  restarts; run it again then.
+
+  ```powershell
+  netsh interface portproxy add v4tov4 listenport=8000 listenaddress=0.0.0.0 connectport=8000 connectaddress=(wsl hostname -I).Trim()
+  ```
+
+**On the other machine,** use the PC's address in place of `127.0.0.1`: the API at `http://<address>:8000/v1` (Anthropic
+clients: `http://<address>:8000`) and the stats page at `http://<address>:8000/ui`. With another `PORT`, change the port
+everywhere above.
+
 ## Serving
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `HOST` | 127.0.0.1 | Address to listen on. `0.0.0.0`: the network; anyone there can then change the engine's settings, as the admin API has no authentication (on Windows, the firewall asks about it). With Docker, the address published on the host: the server in the container always listens on all its addresses (`--host`) |
+| `HOST` | `frontend/server.py` run directly: 0.0.0.0. Docker and the Windows package: 127.0.0.1 | Address to listen on. `0.0.0.0`: the network ([Using it from other machines](#using-it-from-other-machines)). With Docker, the address published on the host: the server in the container always listens on all its addresses |
 | `PORT` | 8000 | Port of the API and the web UI. With Docker, the port published on the host; in the container it stays 8000 |
 | `SERVED_MODEL_NAME` | `qwen3.8-27b` | Name in `/v1/models` (requests may use any model name) |
 | `MAX_TOKENS` | 262144 | Context limit of one request. If the KV pool cannot hold it, `MAX_TOKENS_FIT` lowers it; the value in effect is in the startup log (`max_tokens ... lowered to`) and in `/v1/models` (`max_model_len`) |
@@ -93,7 +142,7 @@ What it takes for a setting to change depends on who reads it, and when:
 - New requests wait until the KV pool can take them (`ADMIT_KV`). If the KV cache still runs out, the latest request
   (including the one that ran out) is suspended to a checkpoint and goes back to the head of the queue. When requests
   that arrive together share a prefix, the later one waits until the earlier one has passed it.
-- Admin API (no authentication; the service listens on 127.0.0.1 unless `HOST` says otherwise): `GET /admin/concurrency` returns the settings
+- Admin API (no authentication; Docker and the Windows package listen on 127.0.0.1 unless `HOST` says otherwise): `GET /admin/concurrency` returns the settings
   and the state (running, waiting, why requests wait, measured tok/s per number of running requests);
   `POST /admin/concurrency` changes `target_seqs` (1 to `MAX_SEQS`; lowering it does not stop running requests),
   `min_seq_tps`, `admit_kv` and `kv_reserve`. Changes survive an engine restart, not a service restart.

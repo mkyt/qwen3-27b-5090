@@ -230,7 +230,8 @@ to change it. The most useful ones:
 | `SPEC` | `dflash2` | `dflash2` or `none` |
 | `VISION` | `host` | `host`, `fp8`, `bf16` (vision tower placement) or `off` |
 
-[docs/configuration.md](docs/configuration.md) lists every setting.
+[docs/configuration.md](docs/configuration.md) lists every setting. By default the server accepts connections from this PC
+only; [Using it from other machines](docs/configuration.md#using-it-from-other-machines) says how to open it to your network.
 
 ### Other checkpoints
 

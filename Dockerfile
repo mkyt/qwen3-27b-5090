@@ -62,5 +62,4 @@ COPY reference/qwen27b/__init__.py reference/qwen27b/paths.py reference/qwen27b/
 COPY engine/python engine/python
 COPY frontend frontend
 EXPOSE 8000
-# (all the container's addresses: compose.yaml publishes the port on the host's 127.0.0.1 by default)
-CMD ["python", "frontend/server.py", "--host", "0.0.0.0"]
+CMD ["python", "frontend/server.py"]

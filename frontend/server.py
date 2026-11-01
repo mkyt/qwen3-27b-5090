@@ -1297,7 +1297,7 @@ START_TIME = time.time()
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     env = os.environ.get
-    ap.add_argument("--host", default=env("HOST", "127.0.0.1"))
+    ap.add_argument("--host", default=env("HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(env("PORT", 8000)))
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", 262144)))
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
