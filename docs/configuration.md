@@ -174,7 +174,9 @@ The same from a script:
   `kv_tokens`, `budget`, `device` and `pools` in bytes, `fits`, or `error`) and `variants` (the plans with each
   setting's other values).
 - `POST /admin/engine` with `{"action": "start" | "restart", "settings": {...}}`: starts with those changes, if they
-  fit (HTTP 400 otherwise; 409 for `start` while the engine runs). Example:
+  fit (HTTP 400 otherwise; 409 for `start` while the engine runs). With `"action": "save"` (the page's **Save for the
+  next load**) they only stay for the next load, while the engine is stopped or unloaded (409 otherwise): it does not
+  load, and whether they fit is decided when it does. Example:
   `curl -s -X POST localhost:8000/admin/engine -H 'Content-Type: application/json' -d '{"action": "restart", "settings": {"kv_dtype": "fp8", "max_seqs": 4}}'`.
 
 ## Prefix cache

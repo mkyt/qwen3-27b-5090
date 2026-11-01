@@ -1,10 +1,12 @@
 """Unloading the engine when idle (ENGINE_IDLE_UNLOAD_S, server.EngineClient) against a fake engine process: no GPU."""
 
+import email.message
 import multiprocessing as mp
 import pathlib
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -13,6 +15,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import server  # noqa: E402
 
 IDLE = 0.3
+GiB = 1 << 30
 
 
 class Hub:
@@ -231,6 +234,46 @@ def test_the_idle_time_changes_at_once(client):
     c.set_idle_unload(0)
     time.sleep(1.2)
     assert c.state() == "ready" and c.idle_state()["unload_in"] is None
+
+
+def test_save_keeps_settings_for_the_next_load_without_loading(client, monkeypatch):
+    class Launch:
+        settings = {"max_seqs": 8}
+        checked = []
+
+        def validate(self, changes, device=None, check_budget=True):
+            self.checked.append(check_budget)
+            return dict(self.settings, **changes)
+
+        def plan_many(self, _settings, _device):
+            return [{"error": "not enough VRAM"}]  # (other programs hold it now)
+
+        def config(self, s):
+            return {"max_seqs": s["max_seqs"], "settings": s}
+
+    monkeypatch.setattr(server.HUB, "plan_device", lambda: ((GiB, 32 * GiB), "nvml"), raising=False)
+    c = client(autostart=False)
+    c.cfg = {"max_seqs": 8}
+    answers = []
+    h = types.SimpleNamespace(headers=email.message.Message(), srv=types.SimpleNamespace(engine=c, launch=Launch(), use_template_of=lambda _w: None),
+                              _json=lambda code, obj: answers.append((code, obj)))
+    h.headers["Content-Type"] = "application/json"
+    control = lambda body: server.Handler.engine_control(h, body)
+    s = {"weights": "w", "max_seqs": 4}
+    h.srv.launch.settings = {"weights": "w", "max_seqs": 8}
+    control({"action": "save", "settings": s})
+    assert answers[-1][0] == 200 and answers[-1][1]["settings"]["max_seqs"] == 4
+    assert c.on_demand == "unloaded" and c.proc is None  # (still waiting, no fit asked)
+    assert h.srv.launch.checked == [False] and c.cfg["max_seqs"] == 4
+    with pytest.raises(server.ApiError):
+        control({"action": "start", "settings": s})  # (a start does ask)
+    with pytest.raises(server.ApiError):
+        control({"action": "save"})
+    _, q = c.submit({})  # (the first request loads with them)
+    assert finish(q) == "done" and c.cfg["max_seqs"] == 4
+    with pytest.raises(server.ApiError) as e:
+        control({"action": "save", "settings": s})
+    assert e.value.code == 409
 
 
 def test_no_request_is_lost_while_requests_race_the_unload(client):

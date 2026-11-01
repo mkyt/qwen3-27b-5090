@@ -154,7 +154,7 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
     <div class="row" style="justify-content:space-between;margin-bottom:10px">
       <div><h2 style="margin:0">Start settings</h2>
         <div class="muted" style="font-size:12px">Under each choice: the longest context of one request · the KV pool all requests share, if only that setting changes. <span style="display:inline-flex;align-items:center;gap:4px"><i class="dot" style="background:var(--good);width:6px;height:6px"></i>running engine</span></div></div>
-      <div class="row"><button class="plain" id="l-reset">Reset</button><button class="primary" id="l-go">Start</button><button class="plain" id="l-close" aria-label="Close the start settings">Close</button></div>
+      <div class="row"><button class="plain" id="l-reset">Reset</button><button class="plain" id="l-save" type="button" title="Keeps these settings for the next load, without loading the engine (until the server restarts)">Save for the next load</button><button class="primary" id="l-go">Start</button><button class="plain" id="l-close" aria-label="Close the start settings">Close</button></div>
     </div>
     <div class="opts" id="opts"></div>
     <div class="plan-sum" id="plan-sum"></div>
@@ -635,9 +635,10 @@ const OPTS = [
 const fmtVal = (k, v) => k === "vram_budget_gib" ? (v == null ? "auto" : `${v} GiB`) :
   k === "max_tokens" ? (v % 1024 ? v.toLocaleString() : `${v / 1024}K`) + (v === 262144 ? " (262,144)" : "") : String(v);
 const planNote = (p) => !p ? "…" : p.error ? "does not fit" : `${fmtTok(p.max_tokens)} · pool ${fmtTok(p.kv_tokens)}`;
-function launchChanges() {
-  if (!L.form || !L.running) return [];
-  return Object.keys(L.form).filter((k) => L.form[k] !== L.running[k]).map((k) => `${k} ${fmtVal(k, L.running[k])} → ${fmtVal(k, L.form[k])}`);
+function launchChanges() {  // (from the running engine, or the settings the next load uses)
+  const from = L.running || L.saved;
+  if (!L.form || !from) return [];
+  return Object.keys(L.form).filter((k) => L.form[k] !== from[k]).map((k) => `${k} ${fmtVal(k, from[k])} → ${fmtVal(k, L.form[k])}`);
 }
 
 async function loadLaunch(resetForm) {
@@ -737,7 +738,7 @@ function drawLaunch() {
   if (L.err) sum.append(el("div", { class: "bad" }, L.err));
   else if (!p) sum.append(el("div", { class: "muted" }, "Planning…"));
   else if (vramTaken()) sum.append(el("div", { class: "bad" }, `Only ${fmtGiB(dev.free)} of ${fmtGiB(dev.total)} of VRAM is free now: other programs are using it. ` +
-    "The choices are planned for what is free now and update when it is released."));
+    "The choices are planned for what is free now and update when it is released; settings can still be saved for the next load."));
   else if (p.error) sum.append(el("div", { class: "bad" }, `These settings do not fit: ${p.error}`));
   else {
     sum.append(el("div", { class: "big" }, "Context per request ", el("b", {}, p.max_tokens.toLocaleString()), " tokens",
@@ -754,7 +755,7 @@ function drawLaunch() {
       (dev.source === "engine" ? "(the running engine's, before its pools)" : "(now, less an engine's CUDA context: estimated)")));
   }
   const changes = launchChanges();
-  if (changes.length) sum.append(el("div", {}, el("span", { class: "muted" }, "Changes from the running engine: "), changes.join(" · ")));
+  if (changes.length) sum.append(el("div", {}, el("span", { class: "muted" }, L.running ? "Changes from the running engine: " : "Changes from the saved settings: "), changes.join(" · ")));
   drawGo();
 }
 function drawGo() {
@@ -764,7 +765,19 @@ function drawGo() {
   go.textContent = running ? (changes.length ? "Restart with these settings" : "Restart") : "Start with these settings";
   go.disabled = state.busy || !p || !!p.error || !p.fits || ["stopping", "loading"].includes(eng);
   go.onclick = () => engineAction(running ? "restart" : "start");
+  const save = $("l-save");
+  save.hidden = running;
+  save.disabled = state.busy || !changes.length;
 }
+$("l-save").addEventListener("click", async () => {
+  state.busy = true; drawGo();
+  try {
+    const r = await fetch("/admin/engine", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "save", settings: L.form }) });
+    if (!r.ok) alert(`save: ${(await r.json()).error?.message || r.status}`);
+  } catch (e) { alert(`save: ${e}`); }
+  state.busy = false;
+  await loadLaunch(false);
+});
 $("l-reset").addEventListener("click", () => { L.form = { ...(L.running || L.saved) }; replan(); });
 function showLaunch(open) {
   $("launch").hidden = !open;

@@ -1147,24 +1147,28 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, self.srv.engine.idle_state())
 
     def engine_control(self, body):
-        """{"action": "start" | "stop" | "restart", "settings": {...}}: the engine process (stop frees its VRAM;
+        """{"action": "start" | "stop" | "restart" | "save", "settings": {...}}: the engine process (stop frees its VRAM;
         requests in flight fail with 503). Start and restart take changes to the start settings (launch.py), kept for
-        later starts. Needs Content-Type: application/json, so that a web page cannot send it with a plain form."""
+        later starts; save only keeps them for the next load, while the engine is stopped or unloaded, without asking
+        whether they fit the VRAM free now (the load does). Needs Content-Type: application/json, so that a web page
+        cannot send it with a plain form."""
         if self.headers.get_content_type() != "application/json":
             raise ApiError(415, "send the action as JSON (Content-Type: application/json)")
         action, settings = body.get("action"), body.get("settings")
-        if action not in ("start", "stop", "restart"):
-            raise ApiError(400, "action: start, stop or restart")
+        if action not in ("start", "stop", "restart", "save"):
+            raise ApiError(400, "action: start, stop, restart or save")
+        if action == "save" and settings is None:
+            raise ApiError(400, "settings: what to save")
         eng, launch = self.srv.engine, self.srv.launch
         note = ""
         if settings is not None:
             if action == "stop" or not isinstance(settings, dict):
                 raise ApiError(400, "settings: an object, with start or restart")
-            if action == "start" and eng.state() != "stopped":
+            if action in ("start", "save") and eng.state() != "stopped":
                 raise ApiError(409, "the engine is running: restart it to change its settings")
             device, _ = HUB.plan_device()
-            s = launch.validate(settings, device=device)
-            if device is not None:
+            s = launch.validate(settings, device=device, check_budget=action != "save")
+            if device is not None and action != "save":
                 plan = launch.plan_many([s], device)[0]
                 if "error" in plan or not plan["fits"]:
                     raise ApiError(400, f"these settings do not fit: {plan.get('error') or 'the device pools exceed the budget'}")
@@ -1177,6 +1181,9 @@ class Handler(BaseHTTPRequestHandler):
             self.srv.use_template_of(s["weights"])
             launch.settings, eng.cfg = s, dict(cfg, **{k: eng.cfg[k] for k in keep if k in eng.cfg})
             note = " with " + ", ".join(f"{k}={v}" for k, v in s.items())
+        if action == "save":
+            HUB.add_log("admin", None, f"settings for the next load:{note.removeprefix(' with')}")
+            return self._json(200, {"state": eng.state(), "settings": launch.settings})
         HUB.add_log("admin", None, f"engine {action} requested{note}", level="warn" if action != "start" else "info")
         self._json(200, {"state": eng.control(action), "settings": launch.settings})
 
