@@ -146,6 +146,7 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
       <button data-a="start">Start</button><button data-a="stop">Stop</button><button data-a="restart">Restart</button>
     </span>
     <button class="cfgbtn" id="cfg" type="button" aria-expanded="false" aria-controls="launch" title="Start settings"></button>
+    <span class="muted" id="engine-note" style="font-size:12px"></span>
     <span class="muted" id="conn" style="margin-left:auto"></span>
   </header>
 
@@ -579,10 +580,17 @@ function drawLog() {
 for (const id of ["f-req", "f-sub", "f-ev"]) $(id).addEventListener("change", drawLog);
 
 // ---------------------------------------------------------------- header, stream
+const fmtDur = (s) => s < 60 ? `${Math.ceil(s)} s` : `${Math.ceil(s / 60)} min`;
 function drawHeader() {
   const i = state.info, eng = state.tick?.engine || "connecting";
-  const color = { ready: "--good", loading: "--warning", stopping: "--warning", stopped: "--muted" }[eng] || "--critical";
-  $("engine").replaceChildren(el("span", { class: "dot", style: `background:var(${color})` }), el("span", {}, `engine ${eng}`));
+  const idle = state.tick?.idle, unloaded = eng === "stopped" && idle?.unloaded;
+  const color = unloaded ? "--s1" : { ready: "--good", loading: "--warning", stopping: "--warning", stopped: "--muted" }[eng] || "--critical";
+  $("engine").replaceChildren(el("span", { class: "dot", style: `background:var(${color})` }), el("span", {}, unloaded ? "engine unloaded" : `engine ${eng}`));
+  const note = $("engine-note"), refused = unloaded && idle.refused;
+  note.textContent = refused ? `Not loaded: ${refused}` : unloaded ? "The first request loads it."
+    : eng === "stopped" ? "Requests get 503 until Start."
+    : eng === "ready" && idle?.idle_unload_s > 0 ? (idle.unload_in != null ? `Unloads in ${fmtDur(idle.unload_in)} without a request.` : `In use; unloads ${fmtDur(idle.idle_unload_s)} after the last request.`) : "";
+  note.style.color = refused ? "var(--critical)" : "";
   const can = { start: eng === "stopped", stop: ["ready", "loading", "restarting"].includes(eng), restart: ["ready", "loading", "restarting"].includes(eng) };
   document.querySelectorAll("#ctl button").forEach((b) => { b.disabled = state.busy || !can[b.dataset.a]; });
   // The running engine's start settings (when stopped, the next start's), with its context after MAX_TOKENS_FIT.
@@ -636,7 +644,7 @@ async function loadLaunch(resetForm) {
   try {
     const r = await fetch("/admin/engine");
     const d = await r.json();
-    L.saved = d.settings; L.running = d.running; L.weights = d.weights || {}; L.eng = d.state;
+    L.saved = d.settings; L.running = d.running; L.weights = d.weights || {}; L.eng = d.state; L.idle = d.idle_unload_s;
     if (resetForm || !L.form) L.form = { ...d.settings };
   } catch (e) { L.err = String(e); }
   replan();
@@ -680,6 +688,29 @@ function optButton(o, v, p) {
 // The plan failed because the engine is not running and other programs hold the VRAM (no setting would fit now).
 const vramTaken = () => L.plan?.device?.source === "nvml" && /not enough VRAM/.test(L.plan.plan?.error || "");
 setInterval(() => { if (!$("launch").hidden && vramTaken()) replan(); }, 5000);
+// The time without a request before an unload: not a start setting, it changes without touching the engine.
+async function setIdle(seconds) {
+  try {
+    const r = await fetch("/admin/engine/idle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idle_unload_s: seconds }) });
+    const d = await r.json();
+    if (r.ok) L.idle = d.idle_unload_s; else alert(`unload when idle: ${d.error?.message || r.status}`);
+  } catch (e) { alert(`unload when idle: ${e}`); }
+  drawLaunch();
+}
+function idleRow() {
+  const row = el("div", { class: "choices" }), values = [0, 300, 1800, 3600];
+  for (const v of values) {
+    const b = el("button", { class: "opt", "aria-pressed": String(L.idle === v), type: "button", title: "Kept until the server restarts (the tray app keeps it)" },
+      el("b", {}, v ? fmtDur(v) : "off"));
+    b.addEventListener("click", () => setIdle(v));
+    row.append(b);
+  }
+  const inp = el("input", { type: "number", min: "0", step: "1", placeholder: "min", "aria-label": "Minutes without a request before an unload" });
+  if (L.idle != null && !values.includes(L.idle)) inp.value = L.idle / 60;
+  inp.addEventListener("change", () => { const v = parseFloat(inp.value); if (isFinite(v) && v >= 0) setIdle(v * 60); });
+  row.append(el("label", { class: "opt", style: "cursor:default" }, el("b", {}, "custom "), inp, el("span", { class: "n" }, "min")));
+  return row;
+}
 function drawLaunch() {
   const box = $("opts"), sum = $("plan-sum");
   if (!L.form) { box.replaceChildren(el("div", { class: "empty" }, L.err || "Loading the settings…")); sum.replaceChildren(); return; }
@@ -699,6 +730,7 @@ function drawLaunch() {
     }
     box.append(el("div", { class: "k" }, o.label, o.note ? el("small", {}, o.note) : null), row);
   }
+  box.append(el("div", { class: "k" }, "Unload when idle", el("small", {}, "applies at once")), idleRow());
   // The plan of the settings as chosen.
   const p = L.plan?.plan, dev = L.plan?.device;
   sum.replaceChildren();

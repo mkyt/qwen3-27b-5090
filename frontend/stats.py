@@ -129,6 +129,7 @@ class Hub:
         self.log_n = 0
         self.engine_state = "loading"
         self.device = None                  # (free at the start, total) of the last engine (cudaMemGetInfo)
+        self.engine_idle = None             # the unload when idle: EngineClient.idle_state
         self.ready_t = None                 # when the engine became ready
         self.engine_overhead = None         # NVML used beyond the engine's allocations, soon after it became ready
         self.context_bytes = CONTEXT_BYTES  # what an engine's CUDA context takes (NVML free before it - free at start)
@@ -377,6 +378,7 @@ class Hub:
                                  endpoint=meta.get("endpoint"), client=meta.get("client"), preview=meta.get("preview")))
             cache = snap["cache"] if snap else None
             return {"t": time.time(), "engine": self.engine_state, "seqs": seqs, "vram": self.vram(), "cache": cache,
+                    "idle": self.engine_idle() if self.engine_idle else None,
                     "sample": self.samples[-1] if self.samples else None,
                     "sched": {k: snap[k] for k in ("running", "waiting", "blocked", "target_seqs")} if snap else None}
 

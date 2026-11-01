@@ -4,7 +4,7 @@ SGLang environments (same port, model name, parsers and request options).
 Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses (Codex), /v1/messages,
 /v1/messages/count_tokens, /tokenize, /detokenize; GET /v1/models, /health, /metrics; GET / POST
 /admin/concurrency (the admission settings, P7-14); GET / POST /admin/engine (stop, start or restart the engine,
-with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
+with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); POST /admin/engine/idle (the unload when idle); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
 /ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py). Streaming everywhere (SSE), reasoning (`<think>`, returned as
 `reasoning_content` / `reasoning`, or Anthropic thinking blocks), tool calls (qwen3_coder XML, streamed call by
 call), images (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
@@ -177,8 +177,7 @@ class EngineClient:
             HUB.engine_state_set("stopped", "engine not loaded (the first request loads it)")
         else:
             HUB.engine_state_set("stopped", "engine not started (ENGINE_AUTOSTART=0)")
-        if idle_unload > 0:
-            threading.Thread(target=self.idle_watch, daemon=True, name="engine-idle").start()
+        threading.Thread(target=self.idle_watch, daemon=True, name="engine-idle").start()
 
     def start(self):
         free = HUB.device_free_now()
@@ -213,16 +212,30 @@ class EngineClient:
         """Stops the engine after idle_unload seconds without a request. The decision is taken under self.lock, as
         submit() hands a request over, so that no request goes to an engine that is stopping."""
         while not self.stopping:
-            time.sleep(min(1.0, self.idle_unload))
+            time.sleep(min(1.0, self.idle_unload or 1.0))
             with self.life:
                 with self.lock:
-                    if (self.stopping or not self.ready.is_set() or self.on_demand or self.handles
+                    if (self.stopping or self.idle_unload <= 0 or not self.ready.is_set() or self.on_demand or self.handles
                             or time.monotonic() - self.last_active < self.idle_unload):
                         continue
                     self.on_demand = "unloaded"
                 HUB.add_log("admin", None, f"no request for {self.idle_unload:g} s: unloading the engine "
                                            "(the next request loads it)")
                 self._stop()
+
+    def set_idle_unload(self, seconds):
+        """Changes the time without a request before an unload (0: off); the time runs from now."""
+        with self.lock:
+            self.idle_unload, self.last_active = seconds, time.monotonic()
+
+    def idle_state(self):
+        """For the stats page. unload_in: seconds until an unload, None if none is coming (off, loading, in use)."""
+        unload_in = None
+        if self.idle_unload > 0 and self.ready.is_set() and not self.on_demand and not self.handles:
+            unload_in = max(0.0, self.idle_unload - (time.monotonic() - self.last_active))
+        refused = self.refused
+        return {"idle_unload_s": self.idle_unload, "unloaded": self.on_demand == "unloaded", "unload_in": unload_in,
+                "refused": refused[1] if refused else None}
 
     def wake(self):
         """Starts the engine after an idle unload (the first request that needs it; the others wait with it)."""
@@ -288,7 +301,7 @@ class EngineClient:
                     log(f"engine failed: {msg[1]}")
                 elif kind == "refused":
                     log(f"engine did not start: {msg[1]}")
-                    if self.idle_unload > 0:  # (no retries: the next request tries again; without it, as for a crash)
+                    if self.idle_unload > 0 or self.on_demand:  # (no retries: the next request tries again; else as for a crash)
                         self.wanted, self.refused = False, (time.monotonic(), msg[1])
                         self.on_demand = "unloaded"
                         HUB.engine_state_set("stopped", msg[1])
@@ -669,13 +682,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
         if path == "/health":
+            idle = {"idle_unload_s": self.srv.engine.idle_unload}
             if self.srv.engine.on_demand:  # (the service is up: a request loads the engine and waits for it)
                 refused = self.srv.engine.refused
-                self._json(200, {"status": self.srv.engine.on_demand, **({"refused": refused[1]} if refused else {})})
+                self._json(200, {"status": self.srv.engine.on_demand, **({"refused": refused[1]} if refused else {}), **idle})
             elif self.srv.engine.ready.is_set():
-                self._json(200, {"status": "ok"})
+                self._json(200, {"status": "ok", **idle})
             else:
-                self._json(503, {"status": self.srv.engine.state()})
+                self._json(503, {"status": self.srv.engine.state(), **idle})
         elif path == "/metrics":
             body = "".join(f"{k} {v}\n" for k, v in sorted(self.srv.engine.metrics.items())).encode()
             self.send_response(200)
@@ -757,7 +771,8 @@ class Handler(BaseHTTPRequestHandler):
         routes = {"/v1/chat/completions": self.chat, "/v1/completions": self.completions, "/v1/responses": self.responses_api,
                   "/v1/messages": self.messages, "/v1/messages/count_tokens": self.count_tokens,
                   "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency,
-                  "/admin/engine": self.engine_control, "/admin/engine/plan": self.engine_plan}
+                  "/admin/engine": self.engine_control, "/admin/engine/plan": self.engine_plan,
+                  "/admin/engine/idle": self.engine_idle}
         fn = routes.get(path)
         if fn is None:
             return self._error(404, "not found", "not_found")
@@ -1119,6 +1134,18 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, dict(self.srv.launch.plans(s, device), device={"free": device[0], "total": device[1],
                                                                         "source": source}))
 
+    def engine_idle(self, body):
+        """{"idle_unload_s": seconds} (0: off): applies at once, until the service restarts. Needs Content-Type:
+        application/json, like engine_control."""
+        if self.headers.get_content_type() != "application/json":
+            raise ApiError(415, "send the setting as JSON (Content-Type: application/json)")
+        v = body.get("idle_unload_s")
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v < float("inf"):
+            raise ApiError(400, "idle_unload_s: seconds, 0 or more (0: off)")
+        self.srv.engine.set_idle_unload(float(v))
+        HUB.add_log("admin", None, f"unload when idle: {f'after {v:g} s without a request' if v else 'off'}")
+        self._json(200, self.srv.engine.idle_state())
+
     def engine_control(self, body):
         """{"action": "start" | "stop" | "restart", "settings": {...}}: the engine process (stop frees its VRAM;
         requests in flight fail with 503). Start and restart take changes to the start settings (launch.py), kept for
@@ -1316,6 +1343,7 @@ def main():
     HUB.start()
     engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0",
                           idle_unload=max(0.0, args.idle_unload))
+    HUB.engine_idle = engine.idle_state
     Handler.srv = Server(engine, tok, args.max_tokens, launch)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True

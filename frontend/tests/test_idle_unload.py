@@ -202,6 +202,35 @@ def test_autostart_0_without_idle_unload_stays_stopped_until_a_start(client):
     assert c.ready.wait(2)
 
 
+def test_the_idle_state_counts_down_and_says_why_not(client):
+    c = client(idle=5)
+    assert c.ready.wait(5)
+    s = c.idle_state()
+    assert s["idle_unload_s"] == 5 and not s["unloaded"] and 0 < s["unload_in"] <= 5 and s["refused"] is None
+    assert client(autostart=False).idle_state()["unloaded"]
+    c = client(idle=5, hold=True)
+    assert c.ready.wait(5)
+    _, q = c.submit({})
+    assert c.idle_state()["unload_in"] is None  # (in use)
+    c.proc.done.set()
+    assert finish(q) == "done"
+
+
+def test_the_idle_time_changes_at_once(client):
+    c = client(idle=0)
+    assert c.ready.wait(5)
+    assert c.idle_state()["unload_in"] is None
+    time.sleep(1.2)
+    assert c.state() == "ready"  # (off)
+    c.set_idle_unload(0.3)
+    assert until(lambda: c.on_demand == "unloaded" and c.state() == "stopped")
+    _, q = c.submit({})  # (the first request loads it)
+    assert finish(q) == "done"
+    c.set_idle_unload(0)
+    time.sleep(1.2)
+    assert c.state() == "ready" and c.idle_state()["unload_in"] is None
+
+
 def test_no_request_is_lost_while_requests_race_the_unload(client):
     c = client(idle=0.05)
     assert c.ready.wait(5)

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cwchar>
 #include <map>
 #include <mutex>
@@ -62,6 +63,7 @@ struct App {
     Shared shared;
     HANDLE job = nullptr;       // of the running process (mutex)
     bool stop_wanted = false;   // (mutex)
+    double idle_unload_s = 0;   // what the server last had (mutex)
     std::thread runner;         // while the server is started
     bool runner_active = false;
     HANDLE quit_event = nullptr;
@@ -226,6 +228,25 @@ std::string json_string(const std::string& body, const std::string& key) {
     return out;
 }
 
+// The number value of `key` in a flat JSON object, as written ("" when absent).
+std::string json_number(const std::string& body, const std::string& key) {
+    size_t at = body.find("\"" + key + "\"");
+    if (at == std::string::npos) return {};
+    at = body.find_first_not_of(" :", at + key.size() + 2);
+    if (at == std::string::npos) return {};
+    return body.substr(at, body.find_first_of(",} ", at) - at);
+}
+
+// Keeps in settings.ini what the stats page changed (the server forgets it when it restarts): a value other than the
+// one the server was started with or last reported.
+void keep_idle_unload(const std::string& seconds) {
+    double value = std::strtod(seconds.c_str(), nullptr);
+    std::lock_guard lock(app.mutex);
+    if (value == app.idle_unload_s) return;
+    app.idle_unload_s = value;
+    WritePrivateProfileStringW(L"env", L"ENGINE_IDLE_UNLOAD_S", widen(seconds).c_str(), app.ini.c_str());
+}
+
 void poll_loop() {
     HINTERNET session = http_session();
     while (WaitForSingleObject(app.quit_event, POLL_MS) == WAIT_TIMEOUT) {
@@ -238,6 +259,8 @@ void poll_loop() {
         if (session && http_get(session, L"/health", &body)) {
             health = json_string(body, "status");
             refused = widen(json_string(body, "refused"));
+            std::string idle = json_number(body, "idle_unload_s");
+            if (!idle.empty()) keep_idle_unload(idle);
         }
         std::lock_guard lock(app.mutex);
         if (app.shared.phase == Phase::running && (app.shared.health != health || app.shared.refused != refused)) {
@@ -367,6 +390,10 @@ void run_server() {
     app.host = env[L"HOST"];
     app.port = _wtoi(env[L"PORT"].c_str());
     std::wstring block = env_block(env);
+    {
+        std::lock_guard lock(app.mutex);
+        app.idle_unload_s = _wtof(env[L"ENGINE_IDLE_UNLOAD_S"].c_str());
+    }
     logfile.open_new();
     tray_log("starting: HOST=" + narrow(app.host) + " PORT=" + std::to_string(app.port));
 

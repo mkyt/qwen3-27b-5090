@@ -107,6 +107,12 @@ a request and does not keep the engine loaded.
 - `ENGINE_AUTOSTART=0` starts the server in this unloaded state: no VRAM in use until the first request.
 - A stop from the stats page or `POST /admin/engine` stays until a start from there: requests get 503, as without this
   setting.
+- The stats page tells these states apart (`engine unloaded`: the first request loads it; `engine stopped`: requests get
+  503 until a start), shows the time left before an unload and why a load was refused, and changes the time under
+  **Unload when idle** in the start settings. From a script:
+  `curl -s -X POST localhost:8000/admin/engine/idle -H 'Content-Type: application/json' -d '{"idle_unload_s": 600}'`
+  (0: off). It applies at once, the time running from then, and lasts until the service restarts; `/health` has
+  `idle_unload_s`. The tray app keeps it in `settings.ini`.
 
 ### Too little VRAM
 
