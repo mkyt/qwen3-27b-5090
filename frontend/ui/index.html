@@ -388,7 +388,7 @@ function drawTiles() {
   const s = state.history[state.history.length - 1] || {}, tk = state.tick, v = tk?.vram, c = tk?.cache, sch = tk?.sched;
   const fresh = s.t && Date.now() / 1000 - s.t < 5;
   const used = s.used, total = s.total || v?.total;
-  const app = v ? v.parts.filter((p) => !["free", "other processes"].includes(p.name)).reduce((a, p) => a + p.bytes, 0) : null;
+  const app = v ? v.parts.filter((p) => !["free", "other programs & driver"].includes(p.name)).reduce((a, p) => a + p.bytes, 0) : null;
   const hit = c && c.prompt_tokens ? c.cached_tokens / c.prompt_tokens : null;
   const powerFrac = s.power != null && s.power_limit ? s.power / s.power_limit : null;
   const tiles = [
@@ -408,7 +408,7 @@ function drawTiles() {
 
 // ---------------------------------------------------------------- VRAM
 const VRAM_COLORS = { "weights": "--s1", "KV cache": "--s2", "sequence state": "--s3", "activations": "--s4",
-  "CUDA context & runtime": "--s5", "other processes": "--s6", "free": "--track" };
+  "CUDA context & runtime": "--s5", "other programs & driver": "--s6", "engine (loading)": "--s1", "free": "--track" };
 const KV_COLORS = { "active sequences": "--s2", "prefix cache only": "--s1", "parked state": "--s3", "free": "--track" };
 const SEQ6 = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--track"];
 function stackBar(node, legend, parts, total, colorOf, label) {
@@ -424,18 +424,18 @@ function stackBar(node, legend, parts, total, colorOf, label) {
   });
 }
 function drawVram() {
-  const v = state.tick?.vram;
-  if (!v) {
-    const s = state.history[state.history.length - 1], eng = state.tick?.engine;
-    $("vram-sum").textContent = (eng === "stopped" ? "The engine is stopped; its VRAM is free." : "Waiting for the engine.") +
-      (s?.used != null ? ` ${fmtGiB(s.used)} of ${fmtGiB(s.total)} in use on the device (NVML).` : "");
-    for (const id of ["vram-bar", "vram-legend", "kv-bar", "kv-legend", "w-bar", "w-legend", "vram-table"]) $(id).replaceChildren();
+  const v = state.tick?.vram, eng = state.tick?.engine;
+  if (!v || !v.engine) {
+    $("vram-sum").textContent = (eng === "stopped" ? "The engine is not loaded." : "Waiting for the engine.") + (v ? ` ${fmtGiB(v.total)} on the device.` : "");
+    if (v) stackBar($("vram-bar"), $("vram-legend"), v.parts, v.total, (p) => VRAM_COLORS[p.name] || "--track");
+    else for (const id of ["vram-bar", "vram-legend"]) $(id).replaceChildren();
+    for (const id of ["kv-bar", "kv-legend", "w-bar", "w-legend", "vram-table"]) $(id).replaceChildren();
     $("mem-grid").style.display = "none";
     return;
   }
   $("mem-grid").style.display = "";
   const free = v.parts.find((p) => p.name === "free").bytes;
-  const app = v.parts.filter((p) => !["free", "other processes"].includes(p.name)).reduce((a, p) => a + p.bytes, 0);
+  const app = v.parts.filter((p) => !["free", "other programs & driver"].includes(p.name)).reduce((a, p) => a + p.bytes, 0);
   $("vram-sum").textContent = `${fmtGiB(v.total)} on the device · this server ${fmtGiB(app)} · free ${fmtGiB(free)} · pool budget ${fmtGiB(v.budget)}`;
   stackBar($("vram-bar"), $("vram-legend"), v.parts, v.total, (p) => VRAM_COLORS[p.name] || "--track");
   const kv = v.parts.find((p) => p.name === "KV cache");

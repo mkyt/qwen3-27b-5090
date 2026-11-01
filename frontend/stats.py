@@ -19,6 +19,7 @@ LOG_SIZE = 500    # log entries kept
 PREVIEW = 160     # characters of the last user message in a log entry
 MiB = 1 << 20
 CONTEXT_BYTES = int(1.21 * (1 << 30))  # an engine's CUDA context and runtime before its pools (RTX 5090, WSL2)
+OTHER = "other programs & driver"      # the part of the device memory that is not the engine's
 
 
 class Nvml:
@@ -128,6 +129,8 @@ class Hub:
         self.log_n = 0
         self.engine_state = "loading"
         self.device = None                  # (free at the start, total) of the last engine (cudaMemGetInfo)
+        self.ready_t = None                 # when the engine became ready
+        self.engine_overhead = None         # NVML used beyond the engine's allocations, soon after it became ready
         self.context_bytes = CONTEXT_BYTES  # what an engine's CUDA context takes (NVML free before it - free at start)
         self._counters = None               # (t, generated, prefilled) at the last sample
         self.nvml = None
@@ -149,6 +152,7 @@ class Hub:
             self.engine_state = "loading"
             self.snap = self.snap_prev = None
             self.device = None
+            self.ready_t = self.engine_overhead = None
             if self.nvml:
                 g = self.nvml.sample()
                 self.baseline_used, self.nvml_total = g["used"], g["total"]
@@ -157,6 +161,7 @@ class Hub:
     def engine_ready(self, info, cfg):
         with self.lock:
             self.engine_state = "ready"
+            self.ready_t = time.time()
             self.info = dict(info, kv_dtype=cfg.get("kv_dtype"), model=cfg.get("weights") or os.path.basename(str(cfg.get("model"))),
                              draft=bool(cfg.get("draft")), prefill_chunk=cfg.get("prefill_chunk"),
                              gpu=self.nvml.name if self.nvml else None)
@@ -298,11 +303,24 @@ class Hub:
             return None
         return max(0, g["total"] - g["used"] - self.context_bytes)
 
+    def vram_device(self, g):
+        """The device memory without an engine's report: what NVML sees, and what a loading engine added since it started."""
+        used, loading = g["used"], self.engine_state != "stopped" and self.baseline_used is not None
+        other = min(used, self.baseline_used) if loading else used
+        parts = [{"name": OTHER, "bytes": other}]
+        if loading:
+            parts.append({"name": "engine (loading)", "bytes": used - other})
+        return {"total": g["total"], "parts": parts + [{"name": "free", "bytes": max(0, g["total"] - used)}], "engine": False}
+
     def vram(self):
-        """The device memory by owner (bytes; the parts add up to the device total)."""
+        """The device memory by owner (bytes; the parts add up to the device total). With NVML it is the memory in use
+        now: cudaMemGetInfo does not count other programs on WSL2 and Windows, and it reserves more than NVML shows."""
         snap, mem = self.snap, self.memory
+        g = self.samples[-1] if self.samples else None
+        if g is not None and g.get("used") is None:
+            g = None
         if not snap or not mem:
-            return None
+            return self.vram_device(g) if g else None
         d, c = snap["device"], snap["cache"]
         pools = {p["name"]: p for p in mem["pools"] if not p["host"]}
         kv = pools.get("kv", {"bytes": 0})
@@ -316,8 +334,19 @@ class Hub:
                     {"name": "parked state", "bytes": park * page}, {"name": "free", "bytes": (free + 1) * page}]
         dev_pools = sum(p["bytes"] for p in pools.values())
         runtime = max(0, d["free_at_start"] - d["free"] - dev_pools)  # CUDA graphs, libraries (since the start)
-        before = d["total"] - d["free_at_start"]                       # CUDA context and other processes
+        before = d["total"] - d["free_at_start"]                       # CUDA context and other programs
         other = min(before, self.baseline_used) if self.baseline_used is not None else 0
+        context, free, total = before - other, d["free"], d["total"]
+        if g:
+            # What other programs started or released since the engine became ready is the change of what NVML sees
+            # beyond the engine's own allocations.
+            beyond = g["used"] - (d["free_at_start"] - d["free"])
+            if self.engine_overhead is None and self.ready_t is not None and g["t"] > self.ready_t:
+                self.engine_overhead = beyond
+            change = 0 if self.engine_overhead is None else beyond - self.engine_overhead
+            other = min(max(0, (self.baseline_used or 0) + change), g["used"])
+            context = max(0, g["used"] - other - dev_pools - runtime)
+            total, free = g["total"], max(0, g["total"] - other - dev_pools - runtime - context)
         parts = [{"name": "weights", "bytes": pools.get("weights", {}).get("bytes", 0),
                   "parts": pools.get("weights", {}).get("parts", [])},
                  {"name": "KV cache", "bytes": kv["bytes"], "parts": kv_parts},
@@ -325,15 +354,15 @@ class Hub:
                   "parts": pools.get("state", {}).get("parts", [])},
                  {"name": "activations", "bytes": pools.get("activations", {}).get("bytes", 0),
                   "parts": pools.get("activations", {}).get("parts", [])},
-                 {"name": "CUDA context & runtime", "bytes": before - other + runtime,
-                  "parts": [{"name": "context (at start)", "bytes": before - other},
+                 {"name": "CUDA context & runtime", "bytes": context + runtime,
+                  "parts": [{"name": "context (at start)", "bytes": context},
                             {"name": "graphs & libraries", "bytes": runtime}]},
-                 {"name": "other processes", "bytes": other},
-                 {"name": "free", "bytes": d["free"]}]
+                 {"name": OTHER, "bytes": other},
+                 {"name": "free", "bytes": free}]
         # (the state cache's slots are allocated as needed: show what is allocated)
         host = [dict(p, bytes=c.get("slots_allocated", 0) * mem["checkpoint_bytes"], planned=p["bytes"])
                 if p["name"] == "state cache" else p for p in mem["pools"] if p["host"]]
-        return {"total": d["total"], "budget": d["budget"], "free_at_start": d["free_at_start"], "parts": parts,
+        return {"total": total, "engine": True, "budget": d["budget"], "free_at_start": d["free_at_start"], "parts": parts,
                 "host": host, "kv_page_tokens": 64, "kv_page_bytes": page, "slots": mem["slots"],
                 "checkpoints": c["checkpoints"], "checkpoint_bytes": mem["checkpoint_bytes"]}
 

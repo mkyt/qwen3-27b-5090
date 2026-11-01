@@ -71,8 +71,10 @@ directly uses the same defaults. The startup log prints the memory plan. Task ID
   tokens per second, over the last 1 to 10 minutes.
 - Device memory by owner: weights (by part of the model), the KV pool (pages of running requests, pages only
   prefix-cache checkpoints hold, parked sequence state, free), sequence state, activations, the CUDA context and
-  runtime (CUDA graphs, libraries), other processes and free memory, plus the pinned host pools. The pool sizes come
-  from the engine's memory plan; the context and runtime are what `cudaMemGetInfo` shows beyond the pools.
+  runtime (CUDA graphs, libraries), other programs and the driver, and free memory, plus the pinned host pools. The
+  pool sizes come from the engine's memory plan. The bar always shows the whole device from NVML, updated every
+  second: without an engine, other programs and free memory; with one, what other programs take or release after it
+  started is the change of the memory in use beyond the engine's own allocations (`cudaMemGetInfo`).
 - Each running or waiting request: its context (tokens restored from the prefix cache, prefilled, still to run,
   generated, with the message boundaries), current and average prefill and decode tokens per second, tokens per
   speculative step, TTFT, time queued.

@@ -21,6 +21,7 @@ def hub():
     h.rates, h.meta, h.samples, h.log, h.log_n = {}, {}, collections.deque(maxlen=10), collections.deque(maxlen=50), 0
     h.engine_state, h._counters, h.nvml, h.started = "ready", None, None, 0.0
     h.device, h.context_bytes, h.nvml_total = None, stats.CONTEXT_BYTES, None
+    h.ready_t, h.engine_overhead = None, None
     return h
 
 
@@ -60,10 +61,45 @@ def test_vram_parts_add_up_to_the_device():
     assert kv["active sequences"] == (1023 - 500 - 200 - 100) * page and abs(sum(kv.values()) - 10 * GiB) < 1
     # Pools 29.5 GiB of the 31 free at the start, 1 GiB free now: 0.5 GiB of graphs and libraries.
     assert parts["CUDA context & runtime"]["parts"][1]["bytes"] == GiB // 2
-    assert parts["other processes"]["bytes"] == GiB // 4
+    assert parts[stats.OTHER]["bytes"] == GiB // 4
     host = {p["name"]: p for p in v["host"]}
     assert set(host) == {"embedding", "state cache"}
     assert host["state cache"]["bytes"] == 5 * (189 << 20) and host["state cache"]["planned"] == 21 * (189 << 20)
+
+
+def test_vram_without_an_engine_is_what_nvml_sees():
+    h = hub()
+    assert h.vram() is None  # (no NVML)
+    h.samples.append({"t": 1.0, "used": 3 * GiB, "total": 32 * GiB})
+    h.engine_state = "stopped"
+    v = h.vram()
+    assert not v["engine"] and [(p["name"], p["bytes"]) for p in v["parts"]] == [(stats.OTHER, 3 * GiB), ("free", 29 * GiB)]
+    h.engine_state, h.baseline_used = "loading", GiB
+    parts = {p["name"]: p["bytes"] for p in h.vram()["parts"]}
+    assert parts == {stats.OTHER: GiB, "engine (loading)": 2 * GiB, "free": 29 * GiB}
+
+
+def test_vram_follows_other_programs_while_the_engine_runs():
+    h = hub()
+    h.set_memory(REPORT)
+    h.baseline_used = GiB // 4
+    h.ready_t = 1.0
+    h.set_snapshot(snapshot(1.0, []))
+    allocated = 30 * GiB  # (31 free at the start, 1 free now)
+    overhead = GiB // 2
+
+    def parts(used):
+        h.samples.append({"t": 2.0, "used": used, "total": 32 * GiB})
+        v = h.vram()
+        assert v["engine"] and sum(p["bytes"] for p in v["parts"]) == 32 * GiB
+        return {p["name"]: p["bytes"] for p in v["parts"]}
+
+    base = allocated + overhead + GiB // 4  # (as the engine became ready)
+    assert parts(base)[stats.OTHER] == GiB // 4
+    now = parts(base + GiB)  # another program takes 1 GiB
+    assert now[stats.OTHER] == GiB // 4 + GiB and now["free"] == 32 * GiB - base - GiB
+    assert now["weights"] == 18 * GiB
+    assert parts(base - GiB // 8)[stats.OTHER] == GiB // 8  # part of what was there is released
 
 
 def test_rates_and_log_records():
