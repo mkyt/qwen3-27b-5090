@@ -172,9 +172,15 @@ The same engine and server also run on Windows itself, without WSL2 or Docker, a
 is bit-identical to Linux on the golden set. The package, `qwen3-27b-5090-windows-x64.zip` (44 MB, attached to the
 [releases](https://github.com/mkyt/qwen3-27b-5090/releases) from the first versioned one; `scripts/windows/package.ps1`
 builds it from a checkout), holds `q27.dll`, the embeddable Python from python.org with the server's packages, and
-`start.cmd`. It needs no VC++ redistributable, CUDA toolkit or administrator rights.
+the tray app `qwen3-27b-tray.exe` and `start.cmd`. It needs no VC++ redistributable, CUDA toolkit or administrator rights.
 
-Unzip it anywhere and run `start.cmd`. The first start downloads the weights (23 GB, into
+Unzip it anywhere and run `qwen3-27b-tray.exe`: an icon appears in the notification area, its color and tooltip show
+the state, and its menu starts and stops the server, opens the stats page and the log, and sets the start at logon. The
+server then takes no VRAM until the first request and frees it after 30 minutes without one
+([docs/configuration.md](docs/configuration.md#tray-app)). The program is not signed, so Windows may warn about it at the
+first start (compare the zip's SHA-256 with the release's).
+
+Or run `start.cmd`, which keeps the server in a console window and loads the engine at once. The first start downloads the weights (23 GB, into
 `%USERPROFILE%\.cache\huggingface` or `HF_HOME`; an interrupted download resumes), then the server listens on
 http://127.0.0.1:8000 and the browser opens its stats page. Set `HOST=0.0.0.0` to serve the network (Windows Firewall
 asks), `PORT`, `OPEN_UI=0` (no browser, e.g. a start at logon) or `WEIGHTS` before running it
@@ -304,6 +310,7 @@ frontend/     the HTTP server (OpenAI / Anthropic APIs, chat template, tool-call
 reference/    PyTorch reference model, golden recordings
 scripts/      weight download, end-to-end tests, benchmarks, quality evaluations, building gdnfp4;
               windows/: the Windows package (package.ps1, start.cmd) and serve.cmd for WSL2
+windows/tray/ the tray app of the Windows package (Win32, C++)
 tools/        memory plan / roofline calculator, draft vocabulary builder
 micro/        microbenchmarks of the GPU (bandwidth, MMA peaks, PCIe)
 Dockerfile    the serving image (libq27.so, the server and four Python packages; 350 MB, ghcr.io/mkyt/qwen3-27b-5090)

@@ -1,6 +1,6 @@
 <#
 Builds the Windows package dist\qwen3-27b-5090-windows-x64.zip: q27.dll, the embeddable Python (python.org) with the
-server's packages, the server and start.cmd (scripts\windows\start.cmd). Like the serving image, it holds no compiler,
+server's packages, the server, the tray app (windows\tray) and start.cmd (scripts\windows\start.cmd). Like the serving image, it holds no compiler,
 CUDA toolkit or PyTorch: the GPU driver is the only requirement.
 
 Run on Windows in a shell with MSVC and the CUDA toolkit (vcvars64.bat, then CUDA_PATH and CUDACXX), CMake and Ninja
@@ -25,6 +25,12 @@ cmake -S engine -B engine\build -G Ninja -DCMAKE_BUILD_TYPE=Release
 if ($LASTEXITCODE) { throw "cmake configure failed" }
 cmake --build engine\build --target q27
 if ($LASTEXITCODE) { throw "cmake build failed" }
+
+# The tray app
+cmake -S windows\tray -B windows\tray\build -G Ninja -DCMAKE_BUILD_TYPE=Release
+if ($LASTEXITCODE) { throw "cmake configure failed (tray)" }
+cmake --build windows\tray\build
+if ($LASTEXITCODE) { throw "cmake build failed (tray)" }
 
 if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
 New-Item -ItemType Directory -Force $dst | Out-Null
@@ -58,6 +64,7 @@ Copy-Item engine\build\q27.dll "$app\engine\build\"
 Get-ChildItem -Recurse -Directory -Filter __pycache__ $app | Remove-Item -Recurse -Force
 Copy-Item LICENSE $dst
 Copy-Item scripts\windows\start.cmd (Join-Path $dst "start.cmd")
+Copy-Item windows\tray\build\qwen3-27b-tray.exe $dst
 
 $zip = Join-Path $Out "$name.zip"
 if (Test-Path $zip) { Remove-Item $zip }

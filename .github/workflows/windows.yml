@@ -14,6 +14,7 @@ on:
       - bench/draft-vocab/**
       - scripts/download_weights.py
       - scripts/windows/**
+      - windows/tray/**
       - .github/workflows/windows.yml
   workflow_dispatch:
 
@@ -67,6 +68,8 @@ jobs:
           $app = "dist\qwen3-27b-5090-windows-x64\app"
           & $py -c "import sys; sys.path.insert(0, r'$app\engine\python'); import q27lib; l = q27lib.lib(); assert l.q27t_sf_bytes(2048, 320) == 655360; import numpy, PIL, tokenizers, jinja2; print('ok', sys.version)"
           if ($LASTEXITCODE) { throw "smoke test failed" }
+          $tray = Start-Process "dist\qwen3-27b-5090-windows-x64\qwen3-27b-tray.exe" -ArgumentList "--check" -Wait -PassThru
+          if ($tray.ExitCode) { throw "the tray app does not find the package ($($tray.ExitCode))" }
           (Get-FileHash -Algorithm SHA256 dist\qwen3-27b-5090-windows-x64.zip).Hash.ToLower() + "  qwen3-27b-5090-windows-x64.zip" | Set-Content -Encoding ascii dist\qwen3-27b-5090-windows-x64.zip.sha256
       - uses: actions/upload-artifact@v7
         with:

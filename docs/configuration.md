@@ -35,7 +35,7 @@ directly uses the same defaults. The startup log prints the memory plan. Task ID
 | `MIN_KV_TOKENS` | 0 | Do not start the engine if the KV pool would hold fewer tokens (other programs are using the GPU, or a low budget). 0: start with the KV pool that fits ([Too little VRAM](#too-little-vram)) |
 | `Q27_LOAD_THREADS` | 8 | Threads that read the weight files ahead of the uploads (the bytes loaded are the same with any number). On WSL2 one read stream from a Windows drive (`/mnt/d`, virtiofs) gets 1.2–1.5 GB/s; 4 to 16 threads reach the filesystem's 2.6–2.8 GB/s, and the engine starts in about 10 s instead of 18–21 s. A copy of the weights on the Linux file system, `cache/weights/<org>--<name>/<revision>/` (`cp -L` of the HF snapshot; used before the HF cache when present; the serve container sees it when `compose.override.yaml` mounts `./cache/weights:/work/cache/weights:ro`), starts in about 3.3 s while it is in the page cache |
 | `SERVE_TAG` | `latest` | Tag of the serving image `ghcr.io/mkyt/qwen3-27b-5090` (compose): `latest` (main), a version such as `1.0.0`, or `sha-<commit>`. `docker compose pull serve` fetches it; `--build` builds it from the checkout instead |
-| `ENGINE_AUTOSTART` | 1 | 0: the server starts with the engine stopped (no VRAM in use; requests get 503) until it is started at `/ui` or with `POST /admin/engine` |
+| `ENGINE_AUTOSTART` | 1 | 0: the server starts with the engine stopped (no VRAM in use). Requests get 503 until it is started at `/ui` or with `POST /admin/engine`; with `ENGINE_IDLE_UNLOAD_S` above 0, the first generation request loads it instead |
 | `ENGINE_IDLE_UNLOAD_S` | 0 | Seconds without a request after which the engine stops and frees its VRAM; the next generation request loads it again and waits for it ([Unloading when idle](#unloading-when-idle)). 0: off, the engine stays ready |
 | `STATS_SAMPLE_S` | 1 | Seconds between the GPU samples (NVML: utilization, power, clocks, temperature, memory) of the stats page `/ui`; the last 10 minutes are kept. 0: no sampling (the page still shows requests, VRAM and the log) |
 | `API_DUMP_DIR` | unset | Debugging: write the body of every POST to this directory (to see what a client sends; may contain personal data) |
@@ -97,12 +97,14 @@ default: the first request after an unload takes the load time longer (see above
 that request and the next ones with its context prefill from the start. Polling `/health`, `/metrics`, `/v1/models` or the stats page does not count as
 a request and does not keep the engine loaded.
 
-- `/health` answers 200 with `{"status": "unloaded"}` while unloaded and `{"status": "loading"}` during such a load: the
-  service can take requests. `GET /admin/engine` has `state: "stopped"`, `unloaded: true` and `idle_unload_s`.
+- `/health` answers 200 with `{"status": "unloaded"}` while unloaded (with `refused`, the reason, after a load that found
+  too little VRAM) and `{"status": "loading"}` during such a load: the service can take requests.
+  `GET /admin/engine` has `state: "stopped"`, `unloaded: true` and `idle_unload_s`.
 - The memory plan is made when the engine loads, from the VRAM free then ([Too little VRAM](#too-little-vram)).
 - A request waits at most 5 minutes for the load, then gets 503. Clients with a shorter timeout see their own timeout.
+- `ENGINE_AUTOSTART=0` starts the server in this unloaded state: no VRAM in use until the first request.
 - A stop from the stats page or `POST /admin/engine` stays until a start from there: requests get 503, as without this
-  setting. So does `ENGINE_AUTOSTART=0` until the first start.
+  setting.
 
 ### Too little VRAM
 
@@ -215,6 +217,29 @@ server with the defaults above. It reads these besides the serving variables (se
 | `WEIGHTS` | gdnfp4 | Weights downloaded before the start and served: a profile or `ORG/NAME[@REVISION]` ([Other checkpoints](#other-checkpoints)) |
 | `HF_HOME` | `%USERPROFILE%\.cache\huggingface` | Hugging Face cache the weights are downloaded to and loaded from (23 GB) |
 | `HF_TOKEN` | (none) | Sent with the downloads if set (needed for gated repositories; otherwise it only raises the rate limit) |
+
+### Tray app
+
+`qwen3-27b-tray.exe` does the same as `start.cmd` without a console: it runs `scripts/download_weights.py`, then the
+server, in a job object, so that the server and the engine end with the app, even if the app is killed. A second start
+of the app does nothing. If another server answers on the port, the app reports it and does not start one.
+
+Its defaults differ from `start.cmd`: `ENGINE_AUTOSTART=0` and `ENGINE_IDLE_UNLOAD_S=1800`, so the service is up from the
+start but holds VRAM only between the first request and 30 minutes after the last one ([Unloading when idle](#unloading-when-idle)).
+
+The server gets the app's environment with these defaults for what is unset, then the `[env]` section of
+`%LOCALAPPDATA%\qwen3-27b-5090\settings.ini`, which wins. They apply when the server starts:
+
+```ini
+[env]
+PORT=8001
+ENGINE_IDLE_UNLOAD_S=600
+HF_HOME=D:\huggingface
+```
+
+The output goes to `server.log` in the same folder (the menu's **Show log**, which also works when the server did not
+start), with one older file, `server.1.log`: a new one at each start of the server and beyond 16 MiB. **Start at logon**
+is the value `qwen3-27b-5090` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; the app corrects its path if the folder moved.
 
 ## Development switches
 

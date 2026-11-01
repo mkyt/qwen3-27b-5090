@@ -172,6 +172,9 @@ class EngineClient:
         self.proc = None
         if autostart:
             self.start()
+        elif idle_unload > 0:  # (no VRAM in use until the first request, as after an idle unload)
+            self.on_demand = "unloaded"
+            HUB.engine_state_set("stopped", "engine not loaded (the first request loads it)")
         else:
             HUB.engine_state_set("stopped", "engine not started (ENGINE_AUTOSTART=0)")
         if idle_unload > 0:
@@ -667,7 +670,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/")
         if path == "/health":
             if self.srv.engine.on_demand:  # (the service is up: a request loads the engine and waits for it)
-                self._json(200, {"status": self.srv.engine.on_demand})
+                refused = self.srv.engine.refused
+                self._json(200, {"status": self.srv.engine.on_demand, **({"refused": refused[1]} if refused else {})})
             elif self.srv.engine.ready.is_set():
                 self._json(200, {"status": "ok"})
             else:
@@ -1323,7 +1327,7 @@ def main():
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    log(f"serving {MODEL_NAME} on {args.host}:{args.port} (the engine is loading)")
+    log(f"serving {MODEL_NAME} on {args.host}:{args.port} (the engine {'is loading' if engine.wanted else 'is not loaded'})")
     server.serve_forever()
     engine.stop()
 

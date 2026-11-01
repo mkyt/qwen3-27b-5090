@@ -186,11 +186,20 @@ def test_a_start_from_the_admin_api_after_an_unload(client):
     assert c.on_demand is None and c.ready.wait(5) and c.starts == 2
 
 
-def test_autostart_0_stays_stopped_until_a_start(client):
+def test_autostart_0_waits_for_the_first_request(client):
     c = client(autostart=False)
+    assert c.on_demand == "unloaded" and c.proc is None and not c.ready.is_set()
+    _, q = c.submit({})
+    assert q.get(timeout=5)[0] == "done"
+    assert c.ready.is_set() and c.on_demand is None and c.starts == 1
+
+
+def test_autostart_0_without_idle_unload_stays_stopped_until_a_start(client):
+    c = client(idle=0, autostart=False)
     with pytest.raises(server.ApiError):
         c.submit({})
-    assert c.on_demand is None and c.proc is None
+    c.control("start")
+    assert c.ready.wait(2)
 
 
 def test_no_request_is_lost_while_requests_race_the_unload(client):
