@@ -43,6 +43,14 @@ def test_validate():
     assert lc.validate({"vram_budget_gib": 28.5}, device=DEVICE)["vram_budget_gib"] == 28.5
 
 
+def test_env_changes_name_what_changed_since_the_start():
+    lc = object.__new__(launch.Launch)
+    lc.settings = lc.at_start = dict(DEFAULTS, vram_budget_gib=28.0)
+    assert lc.env_changes() == {}
+    lc.settings = dict(lc.at_start, kv_dtype="fp8", max_seqs=4, vram_budget_gib=None)
+    assert lc.env_changes() == {"KV_DTYPE": "fp8", "MAX_SEQS": "4", "VRAM_BUDGET_GIB": ""}
+
+
 def test_plan_device():
     h = hub()
     assert h.plan_device() == (None, None)

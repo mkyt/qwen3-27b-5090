@@ -154,7 +154,7 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
     <div class="row" style="justify-content:space-between;margin-bottom:10px">
       <div><h2 style="margin:0">Start settings</h2>
         <div class="muted" style="font-size:12px">Under each choice: the longest context of one request · the KV pool all requests share, if only that setting changes. <span style="display:inline-flex;align-items:center;gap:4px"><i class="dot" style="background:var(--good);width:6px;height:6px"></i>running engine</span></div></div>
-      <div class="row"><button class="plain" id="l-reset">Reset</button><button class="plain" id="l-save" type="button" title="Keeps these settings for the next load, without loading the engine (until the server restarts)">Save for the next load</button><button class="primary" id="l-go">Start</button><button class="plain" id="l-close" aria-label="Close the start settings">Close</button></div>
+      <div class="row"><button class="plain" id="l-reset">Reset</button><button class="plain" id="l-save" type="button" title="Uses these settings for the next load, without loading the engine. They last until the server restarts">Save for the next load</button><button class="primary" id="l-go">Start</button><button class="plain" id="l-close" aria-label="Close the start settings">Close</button></div>
     </div>
     <div class="opts" id="opts"></div>
     <div class="plan-sum" id="plan-sum"></div>
@@ -645,7 +645,7 @@ async function loadLaunch(resetForm) {
   try {
     const r = await fetch("/admin/engine");
     const d = await r.json();
-    L.saved = d.settings; L.running = d.running; L.weights = d.weights || {}; L.eng = d.state; L.idle = d.idle_unload_s;
+    L.saved = d.settings; L.running = d.running; L.weights = d.weights || {}; L.eng = d.state; L.idle = d.idle_unload_s; L.keep = d.keep_env || {};
     if (resetForm || !L.form) L.form = { ...d.settings };
   } catch (e) { L.err = String(e); }
   replan();
@@ -694,14 +694,14 @@ async function setIdle(seconds) {
   try {
     const r = await fetch("/admin/engine/idle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idle_unload_s: seconds }) });
     const d = await r.json();
-    if (r.ok) L.idle = d.idle_unload_s; else alert(`unload when idle: ${d.error?.message || r.status}`);
+    if (!r.ok) alert(`unload when idle: ${d.error?.message || r.status}`);
   } catch (e) { alert(`unload when idle: ${e}`); }
-  drawLaunch();
+  await loadLaunch(false);
 }
 function idleRow() {
   const row = el("div", { class: "choices" }), values = [0, 300, 1800, 3600];
   for (const v of values) {
-    const b = el("button", { class: "opt", "aria-pressed": String(L.idle === v), type: "button", title: "Kept until the server restarts (the tray app keeps it)" },
+    const b = el("button", { class: "opt", "aria-pressed": String(L.idle === v), type: "button", title: "Lasts until the server restarts" },
       el("b", {}, v ? fmtDur(v) : "off"));
     b.addEventListener("click", () => setIdle(v));
     row.append(b);
@@ -756,6 +756,9 @@ function drawLaunch() {
   }
   const changes = launchChanges();
   if (changes.length) sum.append(el("div", {}, el("span", { class: "muted" }, L.running ? "Changes from the running engine: " : "Changes from the saved settings: "), changes.join(" · ")));
+  const keep = Object.entries(L.keep || {});
+  if (keep.length) sum.append(el("div", {}, el("div", { class: "muted" }, "Changes here last until the server restarts. To keep them, set these variables (settings.ini in the Windows package):"),
+    el("div", { style: "font-family:monospace;white-space:pre-wrap;user-select:all" }, keep.map(([k, v]) => `${k}=${v}`).join("\n"))));
   drawGo();
 }
 function drawGo() {

@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cwchar>
 #include <map>
 #include <mutex>
@@ -63,7 +62,6 @@ struct App {
     Shared shared;
     HANDLE job = nullptr;       // of the running process (mutex)
     bool stop_wanted = false;   // (mutex)
-    double idle_unload_s = 0;   // what the server last had (mutex)
     std::thread runner;         // while the server is started
     bool runner_active = false;
     HANDLE quit_event = nullptr;
@@ -212,29 +210,6 @@ std::map<std::wstring, std::wstring> read_settings() {
     return settings;
 }
 
-// Sets a name of the [env] section in settings.ini; the other lines stay as they are.
-void write_setting(const std::wstring& name, const std::wstring& value) {
-    std::vector<std::wstring> lines = lines_of(read_text(app.ini));
-    size_t section = std::find_if(lines.begin(), lines.end(), is_env_section) - lines.begin();
-    if (section == lines.size()) lines.push_back(L"[env]");
-    size_t at = section + 1;
-    while (at < lines.size() && trimmed(lines[at]).rfind(L'[', 0) != 0 && name_of(lines[at]) != upper(name)) at++;
-    if (at < lines.size() && name_of(lines[at]) == upper(name))
-        lines[at] = name + L"=" + value;
-    else
-        lines.insert(lines.begin() + section + 1, name + L"=" + value);
-    std::wstring text;
-    for (const auto& line : lines) text += line + L"\r\n";
-    std::string utf8 = narrow(text);
-    std::wstring temporary = app.ini + L".tmp";
-    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
-    DWORD written;
-    WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
-    CloseHandle(file);
-    MoveFileExW(temporary.c_str(), app.ini.c_str(), MOVEFILE_REPLACE_EXISTING);
-}
-
 // The server's environment: settings.ini, then this process's, then the defaults (and notes for the log). HF_HOME is
 // the exception: only settings.ini moves the weights out of this folder, not a variable of the whole PC.
 std::map<std::wstring, std::wstring> server_env(std::vector<std::string>* notes) {
@@ -322,25 +297,6 @@ std::string json_string(const std::string& body, const std::string& key) {
     return out;
 }
 
-// The number value of `key` in a flat JSON object, as written ("" when absent).
-std::string json_number(const std::string& body, const std::string& key) {
-    size_t at = body.find("\"" + key + "\"");
-    if (at == std::string::npos) return {};
-    at = body.find_first_not_of(" :", at + key.size() + 2);
-    if (at == std::string::npos) return {};
-    return body.substr(at, body.find_first_of(",} ", at) - at);
-}
-
-// Keeps in settings.ini what the stats page changed (the server forgets it when it restarts): a value other than the
-// one the server was started with or last reported.
-void keep_idle_unload(const std::string& seconds) {
-    double value = std::strtod(seconds.c_str(), nullptr);
-    std::lock_guard lock(app.mutex);
-    if (value == app.idle_unload_s) return;
-    app.idle_unload_s = value;
-    write_setting(L"ENGINE_IDLE_UNLOAD_S", widen(seconds));
-}
-
 void poll_loop() {
     HINTERNET session = http_session();
     while (WaitForSingleObject(app.quit_event, POLL_MS) == WAIT_TIMEOUT) {
@@ -353,8 +309,6 @@ void poll_loop() {
         if (session && http_get(session, L"/health", &body)) {
             health = json_string(body, "status");
             refused = widen(json_string(body, "refused"));
-            std::string idle = json_number(body, "idle_unload_s");
-            if (!idle.empty()) keep_idle_unload(idle);
         }
         std::lock_guard lock(app.mutex);
         if (app.shared.phase == Phase::running && (app.shared.health != health || app.shared.refused != refused)) {
@@ -485,10 +439,6 @@ void run_server() {
     app.host = env[L"HOST"];
     app.port = _wtoi(env[L"PORT"].c_str());
     std::wstring block = env_block(env);
-    {
-        std::lock_guard lock(app.mutex);
-        app.idle_unload_s = _wtof(env[L"ENGINE_IDLE_UNLOAD_S"].c_str());
-    }
     logfile.open_new();
     tray_log("starting: HOST=" + narrow(app.host) + " PORT=" + std::to_string(app.port) + " HF_HOME=" + narrow(env[L"HF_HOME"]));
     for (const auto& note : notes) tray_log(note);

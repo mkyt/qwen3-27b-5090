@@ -150,7 +150,7 @@ class EngineClient:
 
     def __init__(self, cfg, autostart=True, idle_unload=0.0):
         self.cfg = cfg
-        self.idle_unload = idle_unload
+        self.idle_unload = self.idle_unload_at_start = idle_unload
         self.on_demand = None              # after an idle unload: "unloaded", then "loading" until ready (else None)
         self.last_active = time.monotonic()
         self.refused = None                # (time, why) of the last load that found too little VRAM (idle_unload)
@@ -682,14 +682,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
         if path == "/health":
-            idle = {"idle_unload_s": self.srv.engine.idle_unload}
             if self.srv.engine.on_demand:  # (the service is up: a request loads the engine and waits for it)
                 refused = self.srv.engine.refused
-                self._json(200, {"status": self.srv.engine.on_demand, **({"refused": refused[1]} if refused else {}), **idle})
+                self._json(200, {"status": self.srv.engine.on_demand, **({"refused": refused[1]} if refused else {})})
             elif self.srv.engine.ready.is_set():
-                self._json(200, {"status": "ok", **idle})
+                self._json(200, {"status": "ok"})
             else:
-                self._json(503, {"status": self.srv.engine.state(), **idle})
+                self._json(503, {"status": self.srv.engine.state()})
         elif path == "/metrics":
             body = "".join(f"{k} {v}\n" for k, v in sorted(self.srv.engine.metrics.items())).encode()
             self.send_response(200)
@@ -1111,11 +1110,15 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, self.srv.engine.configure(changes))
 
     def engine_settings(self):
-        """GET /admin/engine: the state, the settings of the running engine and of the next start, the weights."""
+        """GET /admin/engine: the state, the settings of the running engine and of the next start, the weights, and the
+        variables that would keep what changed since the server started."""
         eng, launch = self.srv.engine, self.srv.launch
         (device, source) = HUB.plan_device()
         running = eng.cfg.get("settings") if eng.state() != "stopped" else None
-        return {"state": eng.state(), "unloaded": eng.on_demand == "unloaded", "idle_unload_s": eng.idle_unload,
+        keep = launch.env_changes()
+        if eng.idle_unload != eng.idle_unload_at_start:
+            keep["ENGINE_IDLE_UNLOAD_S"] = f"{eng.idle_unload:g}"
+        return {"state": eng.state(), "unloaded": eng.on_demand == "unloaded", "idle_unload_s": eng.idle_unload, "keep_env": keep,
                 "refused": eng.refused[1] if eng.refused else None,
                 "running": running, "settings": launch.settings,
                 "weights": launch.weights_choices(), "device": {"free": device[0], "total": device[1], "source": source}
@@ -1135,7 +1138,7 @@ class Handler(BaseHTTPRequestHandler):
                                                                         "source": source}))
 
     def engine_idle(self, body):
-        """{"idle_unload_s": seconds} (0: off): applies at once, until the service restarts. Needs Content-Type:
+        """{"idle_unload_s": seconds} (0: off): applies at once, until the server restarts. Needs Content-Type:
         application/json, like engine_control."""
         if self.headers.get_content_type() != "application/json":
             raise ApiError(415, "send the setting as JSON (Content-Type: application/json)")

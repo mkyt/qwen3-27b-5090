@@ -111,8 +111,7 @@ a request and does not keep the engine loaded.
   503 until a start), shows the time left before an unload and why a load was refused, and changes the time under
   **Unload when idle** in the start settings. From a script:
   `curl -s -X POST localhost:8000/admin/engine/idle -H 'Content-Type: application/json' -d '{"idle_unload_s": 600}'`
-  (0: off). It applies at once, the time running from then, and lasts until the service restarts; `/health` has
-  `idle_unload_s`. The tray app keeps it in `settings.ini`.
+  (0: off). It applies at once, the time running from then, and lasts until the service restarts.
 
 ### Too little VRAM
 
@@ -164,7 +163,8 @@ its pools; a restart sees the same), or with the engine stopped the free memory 
 CUDA context (about 1.2 GiB on WSL2, measured at each start).
 
 The settings stay for later starts and restarts (also after a crash) until the service restarts, which starts from
-the variables again. Changes of `/admin/concurrency` stay too (`target_seqs` only while `max_seqs` is the same).
+the variables again: to keep them, set the variables, which `GET /admin/engine` lists in `keep_env` and the page shows
+(in `settings.ini` for the Windows package). Changes of `/admin/concurrency` stay too (`target_seqs` only while `max_seqs` is the same).
 The same from a script:
 
 - `GET /admin/engine`: the state, `running` (the running engine's settings), `settings` (the next start's),
@@ -229,7 +229,9 @@ you can write to, not Program Files. The exception is the start at logon, a valu
 
 Copy `settings.example.ini` to `settings.ini` and set any variable of this page in its `[env]` section. Both the tray
 app and `start.cmd` read it, when the server starts. A value comes from `settings.ini`, then from the environment, then
-from the default; the log says when `settings.ini` overrides the environment. Relative paths are from the folder.
+from the default; the log says when `settings.ini` overrides the environment. Relative paths are from the folder. The
+package only reads the file: what you change on the stats page lasts until the server restarts, and the page shows the
+lines to add here to keep it.
 
 `HF_HOME` is the exception: without it in `settings.ini` the weights are in the folder, whatever the environment says, so
 that a variable of the whole PC does not move them out. To share an existing cache, write it there in full, for
@@ -264,7 +266,7 @@ start but holds VRAM only between the first request and 30 minutes after the las
 
 The output goes to the log (the menu's **Show log**, which also works when the server did not start). **Start at
 logon** is the value `qwen3-27b-5090` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; the app corrects its
-path if the folder moved. A time changed on the stats page is saved in `settings.ini`.
+path if the folder moved.
 
 ### Updating
 

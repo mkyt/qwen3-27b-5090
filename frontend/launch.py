@@ -25,6 +25,9 @@ VARIANTS = {"max_seqs": tuple(range(1, MAX_SEQS + 1)), "max_tokens": (32768, 655
             "vram_budget_gib": (None, 20.0, 22.0, 24.0, 26.0, 28.0)}  # (gdnfp4 needs about 19 GiB without a KV pool)
 LM_HEAD_ENV = os.environ.get("Q27_LM_HEAD_CKPT", "")  # (engine_target("quasar") sets it in this process)
 GiB = 1 << 30
+# The variables the settings start from (server.py).
+ENV_NAMES = {"weights": "WEIGHTS", "kv_dtype": "KV_DTYPE", "spec": "SPEC", "vision": "VISION", "max_seqs": "MAX_SEQS",
+             "max_tokens": "MAX_TOKENS", "vram_budget_gib": "VRAM_BUDGET_GIB"}
 
 
 def margin_gib():
@@ -46,8 +49,8 @@ def model_dir(weights):
 
 
 class Launch:
-    """The settings the next engine start uses (changed with a start or restart from the admin API; kept until the
-    service restarts) and their plans."""
+    """The settings the next engine start uses (changed with a start, restart or save from the admin API; they last
+    until the server restarts, which starts from the variables again) and their plans."""
 
     KEYS = ("weights", "kv_dtype", "spec", "vision", "max_seqs", "max_tokens", "vram_budget_gib")
 
@@ -58,7 +61,7 @@ class Launch:
         self.plans_cache = {}
         self.planner = None
         self.extra_weights = () if settings["weights"] in PROFILES else (settings["weights"],)
-        self.settings = self.validate(settings, check_budget=False)
+        self.settings = self.at_start = self.validate(settings, check_budget=False)
 
     # ------------------------------------------------------------ settings
 
@@ -80,6 +83,11 @@ class Launch:
             except (FileNotFoundError, KeyError, ValueError) as e:
                 out[w] = str(e)
         return out
+
+    def env_changes(self):
+        """{variable: value} that would start the server with the settings changed since it started ("": automatic)."""
+        return {ENV_NAMES[k]: "" if self.settings[k] is None else str(self.settings[k])
+                for k in self.KEYS if self.settings[k] != self.at_start[k]}
 
     def validate(self, changes, base=None, device=None, check_budget=True):
         """The settings with `changes` applied; ValueError names a bad one."""
