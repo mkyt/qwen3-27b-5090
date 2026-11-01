@@ -677,6 +677,9 @@ function optButton(o, v, p) {
   b.addEventListener("click", () => setForm(o.key, v));
   return b;
 }
+// The plan failed because the engine is not running and other programs hold the VRAM (no setting would fit now).
+const vramTaken = () => L.plan?.device?.source === "nvml" && /not enough VRAM/.test(L.plan.plan?.error || "");
+setInterval(() => { if (!$("launch").hidden && vramTaken()) replan(); }, 5000);
 function drawLaunch() {
   const box = $("opts"), sum = $("plan-sum");
   if (!L.form) { box.replaceChildren(el("div", { class: "empty" }, L.err || "Loading the settings…")); sum.replaceChildren(); return; }
@@ -701,6 +704,8 @@ function drawLaunch() {
   sum.replaceChildren();
   if (L.err) sum.append(el("div", { class: "bad" }, L.err));
   else if (!p) sum.append(el("div", { class: "muted" }, "Planning…"));
+  else if (vramTaken()) sum.append(el("div", { class: "bad" }, `Only ${fmtGiB(dev.free)} of ${fmtGiB(dev.total)} of VRAM is free now: other programs are using it. ` +
+    "The choices are planned for what is free now and update when it is released."));
   else if (p.error) sum.append(el("div", { class: "bad" }, `These settings do not fit: ${p.error}`));
   else {
     sum.append(el("div", { class: "big" }, "Context per request ", el("b", {}, p.max_tokens.toLocaleString()), " tokens",
