@@ -87,6 +87,7 @@ class Seq:
         self.computed = 0        # prompt tokens prefilled (not restored from the cache)
         self.prefill_s = self.decode_s = 0.0  # time in its prefill turns / decode turns (a batched turn counts for each)
         self.steps = 0           # decode steps (speculative: verify steps)
+        self.drafted = self.draft_accepted = 0  # draft tokens verified, and those accepted (as llama.cpp counts them)
         self.marks = [0, 0, 0]   # end of the first message, starts of the last message and the generation prompt
 
     def rest(self):
@@ -111,6 +112,8 @@ class Scheduler:
         self.engine = Engine(cfg["model"], max_tokens=cfg["max_tokens"], prefill_chunk=cfg["prefill_chunk"],
                              kv_dtype=cfg["kv_dtype"], draft=cfg.get("draft"))
         self.spec = cfg.get("draft") is not None and self.engine.has_draft
+        # Draft tokens of a verify step: a chain of 7. Several paths verify a tree: not reported.
+        self.draft_block = 7 if int(os.environ.get("Q27_SPEC_PATHS") or 1) <= 1 else 0
         self.engine_seqs = max(1, min(cfg["max_seqs"], self.engine.park_slots + 1))
         self.max_seqs = self.engine_seqs  # the target number of running requests (<= engine_seqs)
         self.admit_kv, self.kv_reserve, self.min_tps = True, 4096, 0.0
@@ -497,6 +500,7 @@ class Scheduler:
             if self.spec:
                 toks = self.engine.spec_step(ahead=not last)
                 self.m["q27:spec_verify_calls_total"] += 1
+                self.count_draft(s, toks)
             else:
                 toks = [self.engine.forward_sample([s.out[-1]], s.temperature, s.top_k, s.top_p, s.rng.random())]
             step = max(step * 0.8, time.time() - ts)
@@ -527,6 +531,7 @@ class Scheduler:
             self.m["q27:batched_steps_total"] += 1
             for s, toks in zip(seqs, new):
                 s.steps += 1
+                self.count_draft(s, toks)
                 self.emit(s, toks)
             if any(s.dead for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0):
                 break
@@ -537,6 +542,11 @@ class Scheduler:
             s.decode_s += dt
         if has_prefill:
             self.credit -= dt
+
+    def count_draft(self, s, toks):
+        """A verify step's tokens are the accepted drafts and the bonus token."""
+        s.drafted += self.draft_block
+        s.draft_accepted += len(toks) - 1
 
     def emit(self, s, toks):
         """Tokens of a step: stops at EOS and at max_new; the rest goes to the server."""
@@ -600,7 +610,7 @@ class Scheduler:
                 "ttft": (s.first_token - s.arrival) if s.first_token else None, "total": now - s.arrival,
                 "preempted": s.preempted, "reusable_tokens": s.reusable, "computed_tokens": s.computed,
                 "queued": (s.begun - s.arrival) if s.begun else None, "prefill_s": s.prefill_s,
-                "decode_s": s.decode_s, "steps": s.steps}
+                "decode_s": s.decode_s, "steps": s.steps, "drafted": s.drafted, "draft_accepted": s.draft_accepted}
         self.m[f'q27:requests_finished_total{{reason="{reason}"}}'] += 1
         if notify:
             self.send("done", s.rid, reason, dict(info, metrics=self.metrics()))

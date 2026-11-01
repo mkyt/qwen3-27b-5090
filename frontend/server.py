@@ -466,7 +466,7 @@ class Generation:
         self.stops = [s for s in stop if s]
         self.prompt_tokens = len(ids)
         self.finish, self.stop_sequence, self.cached = None, None, 0
-        self.tokens = 0
+        self.tokens, self.timings = 0, None
         req = dict(ids=ids, max_new=max_new, images=images, **sampling)
         self.rid, self.q = server.engine.submit(req)
         self.detok = Detokenizer(server.tok, server.tok_lock)
@@ -532,16 +532,54 @@ class Generation:
                 elif kind == "error":
                     raise ApiError(msg[3] if len(msg) > 3 else 500, msg[2],
                                    "overloaded_error" if (len(msg) > 3 and msg[3] == 503) else "api_error")
+            if self.timings is None:
+                self._await_done()
         except BaseException:
             if self.finish is None:
                 self.cancel()
             raise
+
+    def _await_done(self, timeout=1.0):
+        """A stop string ended the request: the engine's report follows the cancel, within a turn."""
+        end = time.time() + timeout
+        try:
+            while (left := end - time.time()) > 0:
+                msg = self.q.get(timeout=left)
+                if msg[0] == "done":
+                    self.timings = msg[3]
+                if msg[0] in ("done", "error"):
+                    return
+        except queue.Empty:
+            pass
 
     @property
     def usage(self):
         return {"prompt_tokens": self.prompt_tokens, "completion_tokens": self.tokens,
                 "total_tokens": self.prompt_tokens + self.tokens,
                 "prompt_tokens_details": {"cached_tokens": self.cached}}
+
+    @property
+    def timing_fields(self):
+        """llama.cpp's `timings` object as response fields ({} without the engine's report). As there,
+        prompt_n + cache_n is the whole prompt and predicted_per_second is predicted_n / predicted_ms. The prompt
+        rates use the tokens really prefilled: a preempted request prefills more than prompt_n."""
+        t = self.timings
+        if t is None:
+            return {}
+        computed, prompt_ms = t["computed_tokens"], t["prefill_s"] * 1000
+        n, predicted_ms = self.tokens, (t["total"] - t["ttft"]) * 1000 if t["ttft"] is not None else 0.0
+        rated = n > 1 and predicted_ms > 0  # (one token: no time to rate it over)
+        drafts = {"draft_n": t["drafted"], "draft_n_accepted": t["draft_accepted"]} if t.get("drafted") else {}
+        return {"timings": {
+            "cache_n": self.cached,
+            "prompt_n": max(self.prompt_tokens - self.cached, 0),
+            "prompt_ms": prompt_ms,
+            "prompt_per_token_ms": prompt_ms / computed if computed else 0.0,
+            "prompt_per_second": computed * 1000 / prompt_ms if prompt_ms > 0 else 0.0,
+            "predicted_n": n,
+            "predicted_ms": predicted_ms,
+            "predicted_per_token_ms": predicted_ms / n if rated else 0.0,
+            "predicted_per_second": n * 1000 / predicted_ms if rated else 0.0, **drafts}}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -837,7 +875,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"id": rid, "object": "chat.completion", "created": created, "model": model,
                          "choices": [{"index": 0, "message": msg, "finish_reason": finish, "logprobs": None,
                                       "stop_reason": gen.stop_sequence}],
-                         "usage": gen.usage})
+                         "usage": gen.usage, **gen.timing_fields})
 
     def _keepalive_comment(self):
         self.wfile.write(b": keep-alive\n\n")
@@ -846,9 +884,9 @@ class Handler(BaseHTTPRequestHandler):
     def _chat_stream(self, gen, parser, rid, created, model, body, single_call):
         self._sse_start()
 
-        def chunk(delta, finish=None):
+        def chunk(delta, finish=None, **extra):
             self._sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
-                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": None}]})
+                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": None}], **extra})
 
         chunk({"role": "assistant", "content": ""})
         ncalls = 0
@@ -872,10 +910,11 @@ class Handler(BaseHTTPRequestHandler):
             self._sse({"error": {"message": str(e), "type": e.kind, "code": e.code}})
             self.wfile.write(b"data: [DONE]\n\n")
             return
-        chunk({}, "tool_calls" if ncalls else gen.finish)
-        if (body.get("stream_options") or {}).get("include_usage"):
+        include_usage = (body.get("stream_options") or {}).get("include_usage")  # (timings go on the last chunk)
+        chunk({}, "tool_calls" if ncalls else gen.finish, **({} if include_usage else gen.timing_fields))
+        if include_usage:
             self._sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
-                       "choices": [], "usage": gen.usage})
+                       "choices": [], "usage": gen.usage, **gen.timing_fields})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -901,18 +940,20 @@ class Handler(BaseHTTPRequestHandler):
             for piece in gen:
                 self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
                            "choices": [{"index": 0, "text": piece, "finish_reason": None, "logprobs": None}]})
+            include_usage = (body.get("stream_options") or {}).get("include_usage")
             self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
-                       "choices": [{"index": 0, "text": "", "finish_reason": gen.finish, "logprobs": None}]})
-            if (body.get("stream_options") or {}).get("include_usage"):
+                       "choices": [{"index": 0, "text": "", "finish_reason": gen.finish, "logprobs": None}],
+                       **({} if include_usage else gen.timing_fields)})
+            if include_usage:
                 self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
-                           "choices": [], "usage": gen.usage})
+                           "choices": [], "usage": gen.usage, **gen.timing_fields})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             return
         text = "".join(gen)
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": model,
                          "choices": [{"index": 0, "text": text, "finish_reason": gen.finish, "logprobs": None}],
-                         "usage": gen.usage})
+                         "usage": gen.usage, **gen.timing_fields})
 
     # ------------------------------------------------------------ Anthropic messages
 

@@ -86,6 +86,13 @@ class Client:
         return events
 
 
+def timings_ok(t, usage):
+    """llama.cpp's timings: the counts agree with usage, and it took time."""
+    return bool(t) and t["prompt_n"] + t["cache_n"] == usage["prompt_tokens"] and t["predicted_n"] == usage["completion_tokens"] \
+        and t["prompt_ms"] > 0 and t["predicted_ms"] > 0 and t["prompt_per_second"] > 0 and t["predicted_per_second"] > 0 \
+        and ("draft_n" not in t or (t["draft_n"] % 7 == 0 and 0 <= t["draft_n_accepted"] <= t["draft_n"]))
+
+
 def openai_tests(cl):
     msgs = [{"role": "user", "content": "Read src/main.py and tell me what it prints. Use the tool."}]
     ev = cl.stream("/v1/chat/completions", {"model": "qwen3.8-27b", "messages": msgs, "tools": TOOLS,
@@ -101,6 +108,13 @@ def openai_tests(cl):
     check("openai stream: reasoning, finish_reason tool_calls, usage chunk",
           bool(reasoning) and finish == ["tool_calls"] and len(usage) == 1 and usage[0]["completion_tokens"] > 0,
           f"reasoning {len(reasoning)} chars, finish {finish}, usage {usage}")
+    check("openai stream: timings on the last chunk only", timings_ok(ev[-1][1].get("timings"), usage[0] if usage else {})
+          and sum("timings" in e for _, e in ev) == 1, json.dumps(ev[-1][1])[:300])
+    ev = cl.stream("/v1/chat/completions", {"messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 32,
+                                            "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}})
+    check("openai stream: timings without include_usage, on the finish_reason chunk",
+          "timings" in ev[-1][1] and ev[-1][1]["choices"][0]["finish_reason"] is not None
+          and sum("timings" in e for _, e in ev) == 1, json.dumps(ev[-1][1])[:300])
 
     st, r = cl.post("/v1/chat/completions", {"model": "x", "messages": [{"role": "user", "content": "Count from 1 to 20, comma separated."}],
                                              "max_tokens": 200, "temperature": 0, "stop": ["7"],
@@ -108,9 +122,11 @@ def openai_tests(cl):
     content = r["choices"][0]["message"]["content"] if st == 200 else r
     check("openai: stop string ends the text before it", st == 200 and "7" not in content and "6" in content
           and r["choices"][0]["finish_reason"] == "stop", repr(content))
+    check("openai: timings with a stop string", st == 200 and timings_ok(r.get("timings"), r["usage"]), str(r.get("timings")))
 
     st, r = cl.post("/v1/completions", {"prompt": "The capital of France is", "max_tokens": 8, "temperature": 0})
     check("openai: completions", st == 200 and "Paris" in r["choices"][0]["text"], repr(r["choices"][0]["text"]) if st == 200 else r)
+    check("openai: completions timings", st == 200 and timings_ok(r.get("timings"), r["usage"]), str(r.get("timings")))
 
     st, r = cl.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "x"}], "n": 2})
     check("openai: unsupported n gives 400 in the OpenAI error format", st == 400 and "error" in r, str(r))

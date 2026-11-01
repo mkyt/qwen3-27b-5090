@@ -327,6 +327,10 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
 - Anthropic `thinking` is honored; with `display: omitted`, the reasoning travels in the signature so that the next
   turn's prompt (and the prefix cache) still has it.
 - The server marks message boundaries for the prefix cache and reports, per request, how many tokens came from it.
+- OpenAI chat completions and completions also return llama.cpp's `timings` object (`cache_n`, `prompt_n`, `prompt_ms`,
+  `predicted_n`, `predicted_ms` and the rates), on the response or the last streamed chunk, which front-ends such as
+  llama-swap read. With a draft, `draft_n` is 7 per verify step and `draft_n_accepted` the step's tokens minus the
+  bonus token, as llama.cpp counts them; they are left out without a draft and with `Q27_SPEC_PATHS` above 1.
 - `/metrics` exposes Prometheus metrics; `/admin/concurrency` reads and sets the admission settings. There is no
   authentication: the server is meant to listen on 127.0.0.1 for one user.
 - `/ui` is a stats page (`frontend/stats.py`, `frontend/ui/index.html`): the engine process sends a snapshot of its
