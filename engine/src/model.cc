@@ -187,7 +187,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   // sized by max_pages_ above stays as planned (a few hundred KiB more than needed).
   if (opt.fit_max_tokens && opt.kv_pool_tokens <= 0 && left_pages < max_pages_) {
     const int fit = (left_pages * kPageTokens - kSpecBlock) / 1024 * 1024;
-    Q27_CHECK(fit >= opt.prefill_chunk, "MAX_TOKENS_FIT: the VRAM budget leaves no room for the KV pool");
+    if (fit < opt.prefill_chunk) fail("not enough VRAM: the VRAM budget leaves no room for the KV pool (MAX_TOKENS_FIT)");
     log("max_tokens %d does not fit the VRAM budget: lowered to %d (MAX_TOKENS_FIT)", opt.max_tokens, fit);
     opt_.max_tokens = fit;
     max_pages_ = int(ceil_div(fit + kSpecBlock, kPageTokens));
@@ -203,8 +203,12 @@ Model::Model(const Options& opt) : opt_(opt) {
     kv_pages -= kv_block_;
   // Without the prefix cache (tests) the pool holds max_tokens (or KV_POOL_TOKENS) with every area in use.
   const int kv_total = cache_on_ && opt.kv_pool_tokens <= 0 ? kv_pages : kv_pages + park_all;
-  Q27_CHECK(kv_total - park_all >= kv_block_, "the KV pool does not hold the parking areas (MAX_SEQS)");
+  if (kv_total - park_all < kv_block_) fail("not enough VRAM: the KV pool does not hold the parking areas (lower MAX_SEQS)");
   pool_pages = kv_total - 1;
+  if (int64_t(pool_pages) * kPageTokens < opt.min_kv_tokens)
+    fail("not enough VRAM: the KV pool would hold " + std::to_string(int64_t(pool_pages) * kPageTokens) +
+         " tokens, MIN_KV_TOKENS is " + std::to_string(opt.min_kv_tokens) + " (VRAM budget " +
+         std::to_string(budget.budget >> 20) + " MiB; other programs may be using the GPU)");
   const char* high = getenv("Q27_PAGES_HIGH");
   pool_.init(kv_total, high && atoi(high) != 0);
   const size_t o_kv = kv_.add("K | V pages (and parking areas)", size_t(kv_total) * per_page);

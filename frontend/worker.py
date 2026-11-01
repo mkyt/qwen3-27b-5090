@@ -665,10 +665,12 @@ def run(conn, cfg):
         Scheduler(conn, cfg).run()
     except SystemExit:
         raise
-    except BaseException:  # noqa: BLE001 - report and exit; the server starts a new engine
-        traceback.print_exc()
+    except BaseException as e:  # noqa: BLE001 - report and exit; the server starts a new engine
+        refused = "not enough VRAM" in str(e)
+        if not refused:
+            traceback.print_exc()
         try:
-            conn.send(("fatal", traceback.format_exc(limit=3)))
+            conn.send(("refused", str(e)) if refused else ("fatal", traceback.format_exc(limit=3)))
         except OSError:
             pass
         os._exit(1)

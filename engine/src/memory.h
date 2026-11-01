@@ -48,9 +48,10 @@ struct Budget {
   size_t free_at_start = 0;   // cudaMemGetInfo free before any allocation
   size_t total = 0;
   size_t budget = 0;          // device bytes this process may allocate in pools
+  size_t asked = 0;           // VRAM_BUDGET_GIB, if it was above what is free (and so not used)
 };
 
-// VRAM_BUDGET_GIB (if set) or min(free - WDDM_MARGIN_GIB (0.6), 30.3 GiB minus the CUDA context).
+// min(free - WDDM_MARGIN_GIB (0.6), 30.3 GiB minus the CUDA context), or VRAM_BUDGET_GIB if that is lower.
 Budget make_budget();
 // The same for a device with `free` of `total` bytes free (after the CUDA context), without CUDA (Options::plan_only).
 Budget budget_for(size_t free, size_t total);

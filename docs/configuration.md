@@ -30,10 +30,13 @@ directly uses the same defaults. The startup log prints the memory plan. Task ID
 | `VISION` | `host` | Image input. `host`: the vision tower's BF16 weights (0.86 GiB) stay in pinned host memory and are streamed to the GPU one layer ahead of the computation; the KV pool loses 192 tokens, small images take +13 ms (the copy is about 20 ms), 1024x1024 and larger +1–4 ms; output identical to `bf16`. `fp8`: E4M3 weights with per-row scales on the GPU, widened per layer (0.43 GiB; embedding error about 3x that of `bf16`, answers can change). `bf16`: BF16 weights on the GPU (fastest, 0.86 GiB). `off`: requests with images get HTTP 400 (the engine library's default). Activations and the weight staging (90 MiB) share the prefill's buffers |
 | `IMAGE_MAX_PIXELS` | 4194304 | Images are resized to at most this many pixels (2048x2048 = 4,096 tokens, 370 ms in the vision tower) |
 | `IMAGE_TOKENS` | 16384 | Image tokens per request (embeddings in pinned host memory, 10 KiB per token: 160 MiB) |
-| `VRAM_BUDGET_GIB` / `WDDM_MARGIN_GIB` | free − 0.6 / 0.6 | VRAM budget (at most 30.3 GiB) and the margin kept free for the display driver |
+| `VRAM_BUDGET_GIB` / `WDDM_MARGIN_GIB` | free − 0.6 / 0.6 | VRAM budget and the margin kept free for the display driver. The budget is never above the automatic one (free − margin, at most 30.3 GiB for the process): beyond it the driver moves memory to system RAM without an error, about 7 times slower. A higher `VRAM_BUDGET_GIB` is lowered, with a line in the log |
+| `Q27_DEVICE_FREE_BYTES` | set by the server | Free VRAM with other programs counted (NVML), which the engine's budget uses if it is below what `cudaMemGetInfo` says |
+| `MIN_KV_TOKENS` | 0 | Do not start the engine if the KV pool would hold fewer tokens (other programs are using the GPU, or a low budget). 0: start with the KV pool that fits ([Too little VRAM](#too-little-vram)) |
 | `Q27_LOAD_THREADS` | 8 | Threads that read the weight files ahead of the uploads (the bytes loaded are the same with any number). On WSL2 one read stream from a Windows drive (`/mnt/d`, virtiofs) gets 1.2–1.5 GB/s; 4 to 16 threads reach the filesystem's 2.6–2.8 GB/s, and the engine starts in about 10 s instead of 18–21 s. A copy of the weights on the Linux file system, `cache/weights/<org>--<name>/<revision>/` (`cp -L` of the HF snapshot; used before the HF cache when present; the serve container sees it when `compose.override.yaml` mounts `./cache/weights:/work/cache/weights:ro`), starts in about 3.3 s while it is in the page cache |
 | `SERVE_TAG` | `latest` | Tag of the serving image `ghcr.io/mkyt/qwen3-27b-5090` (compose): `latest` (main), a version such as `1.0.0`, or `sha-<commit>`. `docker compose pull serve` fetches it; `--build` builds it from the checkout instead |
 | `ENGINE_AUTOSTART` | 1 | 0: the server starts with the engine stopped (no VRAM in use; requests get 503) until it is started at `/ui` or with `POST /admin/engine` |
+| `ENGINE_IDLE_UNLOAD_S` | 0 | Seconds without a request after which the engine stops and frees its VRAM; the next generation request loads it again and waits for it ([Unloading when idle](#unloading-when-idle)). 0: off, the engine stays ready |
 | `STATS_SAMPLE_S` | 1 | Seconds between the GPU samples (NVML: utilization, power, clocks, temperature, memory) of the stats page `/ui`; the last 10 minutes are kept. 0: no sampling (the page still shows requests, VRAM and the log) |
 | `API_DUMP_DIR` | unset | Debugging: write the body of every POST to this directory (to see what a client sends; may contain personal data) |
 
@@ -85,6 +88,45 @@ a script: `curl -s -X POST localhost:8000/admin/engine -H 'Content-Type: applica
 (`start`, `stop` or `restart`; `GET /admin/engine` returns the state: `stopped`, `loading`, `ready`, `restarting`
 after a crash, `stopping`). The JSON content type is required, so that another web page cannot send the action as a
 form.
+
+### Unloading when idle
+
+With `ENGINE_IDLE_UNLOAD_S` above 0 the engine stops after that many seconds without a generation request, so that the
+GPU is free for other work, and the next generation request starts it and waits for it instead of getting 503. It is off by
+default: the first request after an unload takes the load time longer (see above), and the prefix cache is lost, so
+that request and the next ones with its context prefill from the start. Polling `/health`, `/metrics`, `/v1/models` or the stats page does not count as
+a request and does not keep the engine loaded.
+
+- `/health` answers 200 with `{"status": "unloaded"}` while unloaded and `{"status": "loading"}` during such a load: the
+  service can take requests. `GET /admin/engine` has `state: "stopped"`, `unloaded: true` and `idle_unload_s`.
+- The memory plan is made when the engine loads, from the VRAM free then ([Too little VRAM](#too-little-vram)).
+- A request waits at most 5 minutes for the load, then gets 503. Clients with a shorter timeout see their own timeout.
+- A stop from the stats page or `POST /admin/engine` stays until a start from there: requests get 503, as without this
+  setting. So does `ENGINE_AUTOSTART=0` until the first start.
+
+### Too little VRAM
+
+The engine plans its memory once, when it loads, from the VRAM free at that moment, with other programs counted (NVML; CUDA
+alone does not see them, on WSL2 or on Windows), and allocates nothing beyond that budget. NVML catches up with a program's
+allocation within about 2 s, so a load in that moment can count too little. If other programs are using the GPU then, what
+happens depends on the settings:
+
+| Setting | Effect |
+| --- | --- |
+| Default | The KV pool takes what is left. If it cannot hold `MAX_TOKENS`, `MAX_TOKENS` is lowered as well (`MAX_TOKENS_FIT=1`) |
+| `MIN_KV_TOKENS=N` | The engine does not start if the KV pool would hold fewer than N tokens (for scale: about 610K with nothing else on the GPU, nvfp4) |
+| `MAX_TOKENS_FIT=0` | The engine does not start if the KV pool cannot hold `MAX_TOKENS` |
+
+For scale, with the defaults (gdnfp4, nvfp4, `MAX_SEQS=8`), by the memory other programs use: nothing, a KV pool of about 610K
+tokens; 6 GiB, about 230K and `MAX_TOKENS` lowered to about 230K; 8 GiB, 120K; from about 9 GiB the engine does not start, unless `MAX_SEQS` is lower.
+
+An engine that does not start allocates no pools. With `ENGINE_IDLE_UNLOAD_S` set, the requests waiting for it get 503 with the
+reason (also `refused` in `GET /admin/engine`), and the next request tries again; there are no retries in between. Without it,
+the server retries as after a crash, up to every 60 s.
+
+**This covers the load only, by design.** The engine does not watch the GPU afterwards. A program that starts allocating VRAM
+while the engine is loaded can push memory to system RAM, its own or the engine's, without an error. Before starting other GPU
+work, unload the engine (the stats page, `POST /admin/engine`, or `ENGINE_IDLE_UNLOAD_S`).
 
 `GET /ui/stream` is the page's event stream (server-sent events) and `GET /ui/state` returns one snapshot as JSON.
 

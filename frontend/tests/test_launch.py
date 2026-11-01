@@ -60,6 +60,19 @@ def test_plan_device():
     assert h.plan_device() == ((28 * GiB, 31.9 * GiB), "nvml")
 
 
+def test_device_free_now_counts_other_programs():
+    h = hub()
+    assert h.device_free_now() is None  # (no NVML)
+
+    class Nvml:
+        @staticmethod
+        def sample():
+            return {"used": 6 * GiB, "total": 32 * GiB}
+
+    h.nvml, h.context_bytes = Nvml, 1 * GiB
+    assert h.device_free_now() == 25 * GiB
+
+
 def planner_or_skip():
     lc = settings()
     if not pathlib.Path(os.environ.get("Q27_LIB", "/build/engine/libq27.so")).exists():
@@ -113,6 +126,33 @@ def test_tokenizer_fingerprint(tmp_path):
     assert fingerprint(write("rewritten", ["a b"], r"\p{L}+")) == base
     assert fingerprint(write("template", [["a", "b"]], r"\p{L}\p{M}+", template="{{ bos_token }}")) == base
     assert fingerprint(write("other", [["a", "b"]], r"\p{L}\p{M}+", {"a": 0, "b": 1, "ab": 5})) != base
+
+
+def test_too_little_free_vram_lowers_the_pool_and_an_asked_budget():
+    lc = planner_or_skip()
+    full = lc.plan_many([dict(DEFAULTS)], DEVICE)[0]
+    busy, asked = lc.plan_many([dict(DEFAULTS), dict(DEFAULTS, vram_budget_gib=30.0)], (int(25 * GiB), DEVICE[1]))
+    assert busy["kv_tokens"] < full["kv_tokens"] and busy["fits"]
+    assert asked["budget"] == busy["budget"] == launch.auto_budget(int(25 * GiB), DEVICE[1])  # (not 30 GiB)
+    assert asked["device"] <= launch.auto_budget(int(25 * GiB), DEVICE[1])
+
+
+def test_every_shortage_is_named_as_such():
+    # (worker.run tells these from a crash by this text: no retries with ENGINE_IDLE_UNLOAD_S)
+    lc = planner_or_skip()
+    for free in (21, 20, 19, 18, 5):
+        plan = lc.plan_many([dict(DEFAULTS)], (int(free * GiB), DEVICE[1]))[0]
+        assert "not enough VRAM" in plan.get("error", "") or plan["fits"], (free, plan)
+
+
+def test_min_kv_tokens_refuses(monkeypatch):
+    lc = planner_or_skip()
+    tokens = lc.plan_many([dict(DEFAULTS)], DEVICE)[0]["kv_tokens"]
+    monkeypatch.setenv("MIN_KV_TOKENS", str(tokens))
+    lc = planner_or_skip()
+    assert lc.plan_many([dict(DEFAULTS)], DEVICE)[0]["kv_tokens"] == tokens
+    plan = lc.plan_many([dict(DEFAULTS)], (int(25 * GiB), DEVICE[1]))[0]
+    assert "not enough VRAM" in plan["error"] and "MIN_KV_TOKENS" in plan["error"]
 
 
 def test_tokenizer_template_of_other_weights():

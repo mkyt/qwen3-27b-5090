@@ -57,7 +57,7 @@ case "${1:-}" in
   status)
     state=$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo "not created")
     health=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" || true)
-    echo "container $NAME: $state, /health: $health (200 ready, 503 engine loading or stopped)"
+    echo "container $NAME: $state, /health: $health (200 ready or unloaded when idle, 503 engine loading or stopped)"
     ;;
   keepalive)
     exec 9>"/tmp/$NAME-keepalive.lock"

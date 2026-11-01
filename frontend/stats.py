@@ -290,6 +290,14 @@ class Hub:
         total = self.device[1] if self.device else g["total"]
         return (max(0, g["total"] - g["used"] - self.context_bytes), total), "nvml"
 
+    def device_free_now(self):
+        """Bytes an engine started now would have after its CUDA context, with every process's memory counted (the
+        engine's cudaMemGetInfo does not count other processes, on WSL2 and Windows); None without NVML."""
+        g = self.nvml.sample() if self.nvml else None
+        if not g or g.get("used") is None:
+            return None
+        return max(0, g["total"] - g["used"] - self.context_bytes)
+
     def vram(self):
         """The device memory by owner (bytes; the parts add up to the device total)."""
         snap, mem = self.snap, self.memory

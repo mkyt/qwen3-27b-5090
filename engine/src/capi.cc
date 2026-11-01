@@ -131,6 +131,7 @@ Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk,
   if (const char* e = getenv("MAX_SEQS"); e && *e) o.park_slots = std::max(0, atoi(e) - 1);
   // MAX_TOKENS_FIT=1: lower max_tokens to what the VRAM budget fits (q27_max_tokens) instead of failing.
   if (const char* e = getenv("MAX_TOKENS_FIT"); e && *e) o.fit_max_tokens = atoi(e) != 0;
+  if (const char* e = getenv("MIN_KV_TOKENS"); e && *e) o.min_kv_tokens = atoi(e);
   return o;
 }
 

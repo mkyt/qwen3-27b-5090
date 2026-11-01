@@ -143,10 +143,17 @@ class Images:
 class EngineClient:
     """Starts the engine process (worker.py) and routes its messages to the requests' queues; starts a new
     one when it dies. The engine holds all the VRAM: control() stops it (the server stays up and answers 503),
-    starts it again or restarts it (POST /admin/engine, the stats page)."""
+    starts it again or restarts it (POST /admin/engine, the stats page). With idle_unload (seconds, 0: off) it also
+    stops after that long without a request, and the next request starts it and waits for it."""
 
-    def __init__(self, cfg, autostart=True):
+    LOAD_WAIT_S = 300  # how long a request waits for the engine it started (idle_unload)
+
+    def __init__(self, cfg, autostart=True, idle_unload=0.0):
         self.cfg = cfg
+        self.idle_unload = idle_unload
+        self.on_demand = None              # after an idle unload: "unloaded", then "loading" until ready (else None)
+        self.last_active = time.monotonic()
+        self.refused = None                # (time, why) of the last load that found too little VRAM (idle_unload)
         self.lock = threading.Lock()       # handles
         self.send_lock = threading.Lock()  # (a Connection is not thread-safe)
         self.handles = {}
@@ -167,12 +174,16 @@ class EngineClient:
             self.start()
         else:
             HUB.engine_state_set("stopped", "engine not started (ENGINE_AUTOSTART=0)")
+        if idle_unload > 0:
+            threading.Thread(target=self.idle_watch, daemon=True, name="engine-idle").start()
 
     def start(self):
+        free = HUB.device_free_now()
         HUB.engine_starting()
+        cfg = dict(self.cfg, env=dict(self.cfg.get("env", {}), Q27_DEVICE_FREE_BYTES=None if free is None else str(free)))
         ctx = mp.get_context("spawn")
         parent, child = ctx.Pipe()
-        self.proc = ctx.Process(target=worker.run, args=(child, self.cfg), daemon=True, name="q27-engine")
+        self.proc = ctx.Process(target=worker.run, args=(child, cfg), daemon=True, name="q27-engine")
         self.proc.start()
         child.close()
         self.conn = parent
@@ -185,6 +196,8 @@ class EngineClient:
     def control(self, action):
         """start | stop | restart the engine process; returns the state afterwards (start: "loading")."""
         with self.life:
+            if action != "start" or self.on_demand == "unloaded":
+                self.on_demand = None  # (a stop from the admin API stays until a start from it)
             if action in ("stop", "restart"):
                 self._stop()
             if action in ("start", "restart") and not (self.proc is not None and self.proc.is_alive()):
@@ -192,6 +205,31 @@ class EngineClient:
                 self.gen += 1
                 self.start()
         return self.state()
+
+    def idle_watch(self):
+        """Stops the engine after idle_unload seconds without a request. The decision is taken under self.lock, as
+        submit() hands a request over, so that no request goes to an engine that is stopping."""
+        while not self.stopping:
+            time.sleep(min(1.0, self.idle_unload))
+            with self.life:
+                with self.lock:
+                    if (self.stopping or not self.ready.is_set() or self.on_demand or self.handles
+                            or time.monotonic() - self.last_active < self.idle_unload):
+                        continue
+                    self.on_demand = "unloaded"
+                HUB.add_log("admin", None, f"no request for {self.idle_unload:g} s: unloading the engine "
+                                           "(the next request loads it)")
+                self._stop()
+
+    def wake(self):
+        """Starts the engine after an idle unload (the first request that needs it; the others wait with it)."""
+        with self.life:
+            if self.on_demand == "unloaded":
+                self.on_demand = "loading"
+                self.wanted, self.restarts = True, 0
+                self.gen += 1
+                HUB.add_log("admin", None, "a request is loading the engine")
+                self.start()
 
     def _stop(self):
         self.wanted = False
@@ -224,6 +262,8 @@ class EngineClient:
                 kind = msg[0]
                 if kind == "ready":
                     self.info = msg[1]
+                    self.last_active = time.monotonic()
+                    self.on_demand = self.refused = None
                     self.ready.set()
                     log(f"engine ready: {self.info}")
                     HUB.engine_ready(self.info, self.cfg)
@@ -243,6 +283,12 @@ class EngineClient:
                         self.config_seen.notify_all()
                 elif kind == "fatal":
                     log(f"engine failed: {msg[1]}")
+                elif kind == "refused":
+                    log(f"engine did not start: {msg[1]}")
+                    if self.idle_unload > 0:  # (no retries: the next request tries again; without it, as for a crash)
+                        self.wanted, self.refused = False, (time.monotonic(), msg[1])
+                        self.on_demand = "unloaded"
+                        HUB.engine_state_set("stopped", msg[1])
                 else:
                     rid = msg[1]
                     if kind == "done":
@@ -254,6 +300,7 @@ class EngineClient:
                         q = self.handles.get(rid)
                         if kind in ("done", "error"):
                             self.handles.pop(rid, None)
+                            self.last_active = time.monotonic()
                     if q is not None:
                         q.put(msg)
         except (EOFError, OSError):
@@ -266,6 +313,7 @@ class EngineClient:
             q.put(("error", None, "the engine was stopped" if planned else "the engine stopped; it is restarting", 503))
         if planned:
             return
+        self.on_demand = None  # (after a crash, as without idle_unload: 503 until the new engine is ready)
         self.proc.join(timeout=10)
         code = self.proc.exitcode
         self.restarts += 1
@@ -283,12 +331,26 @@ class EngineClient:
         return ApiError(503, "the engine is loading", "overloaded_error")
 
     def submit(self, req):
-        if not self.ready.is_set():
-            raise self.not_ready()
         rid = new_id("req-", 16)
         q = queue.Queue()
-        with self.lock:
-            self.handles[rid] = q
+        arrival = time.monotonic()
+        deadline = arrival + self.LOAD_WAIT_S
+        while True:
+            with self.lock:
+                self.last_active = time.monotonic()
+                on_demand = self.on_demand
+                if self.ready.is_set() and on_demand != "unloaded":
+                    self.handles[rid] = q
+                    break
+            if not on_demand:
+                raise self.not_ready()
+            if on_demand == "unloaded":
+                if self.refused and self.refused[0] >= arrival:  # (the load this request waited for)
+                    raise ApiError(503, self.refused[1], "overloaded_error")
+                self.wake()
+            if time.monotonic() > deadline:
+                raise ApiError(503, "the engine is loading", "overloaded_error")
+            self.ready.wait(0.2)
         try:
             with self.send_lock:
                 self.conn.send(("submit", rid, req))
@@ -604,7 +666,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
         if path == "/health":
-            if self.srv.engine.ready.is_set():
+            if self.srv.engine.on_demand:  # (the service is up: a request loads the engine and waits for it)
+                self._json(200, {"status": self.srv.engine.on_demand})
+            elif self.srv.engine.ready.is_set():
                 self._json(200, {"status": "ok"})
             else:
                 self._json(503, {"status": self.srv.engine.state()})
@@ -670,7 +734,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_HEAD(self):
-        self.send_response(200 if self.srv.engine.ready.is_set() else 503)
+        self.send_response(200 if self.srv.engine.ready.is_set() or self.srv.engine.on_demand else 503)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -1032,7 +1096,9 @@ class Handler(BaseHTTPRequestHandler):
         eng, launch = self.srv.engine, self.srv.launch
         (device, source) = HUB.plan_device()
         running = eng.cfg.get("settings") if eng.state() != "stopped" else None
-        return {"state": eng.state(), "running": running, "settings": launch.settings,
+        return {"state": eng.state(), "unloaded": eng.on_demand == "unloaded", "idle_unload_s": eng.idle_unload,
+                "refused": eng.refused[1] if eng.refused else None,
+                "running": running, "settings": launch.settings,
                 "weights": launch.weights_choices(), "device": {"free": device[0], "total": device[1], "source": source}
                 if device else None}
 
@@ -1219,6 +1285,9 @@ def main():
                     help="decode turn of a request when several decode")
     ap.add_argument("--batch-decode", type=int, default=int(env("BATCH_DECODE", 1)),
                     help="1: requests in decode step together (batched speculative steps); 0: they take turns")
+    ap.add_argument("--idle-unload", type=float, default=float(env("ENGINE_IDLE_UNLOAD_S", 0)),
+                    help="stop the engine after this many seconds without a request, freeing its VRAM; the next "
+                         "request loads it again (0: off, the engine stays ready)")
     args = ap.parse_args()
 
     from tokenizer import Tokenizer, fingerprint
@@ -1241,7 +1310,8 @@ def main():
                            "max_tokens": args.max_tokens, "vram_budget_gib": float(budget) if budget else None},
                     tokenizer=fingerprint(path))
     HUB.start()
-    engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0")
+    engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0",
+                          idle_unload=max(0.0, args.idle_unload))
     Handler.srv = Server(engine, tok, args.max_tokens, launch)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
