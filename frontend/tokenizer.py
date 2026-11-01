@@ -71,6 +71,9 @@ class Tokenizer:
         path = pathlib.Path(path)
         self.path, self.template_path = path, pathlib.Path(template or path)
         self.tok = RustTokenizer.from_file(str(path / "tokenizer.json"))
+        # (an export can leave these in the file, and they would cut a long prompt without an error)
+        self.tok.no_truncation()
+        self.tok.no_padding()
         path = self.template_path
         config = json.loads((path / "tokenizer_config.json").read_text(encoding="utf-8"))
         template = path / "chat_template.jinja"
