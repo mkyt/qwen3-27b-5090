@@ -38,6 +38,7 @@ class FakeProcess:
 
     def __init__(self, conn, load, hold, refuse=None):
         self.conn, self.load, self.hold, self.refuse = conn, load, hold, refuse
+        self.closing = threading.Lock()  # (run and terminate may close the pipe at once: EBADF)
         self.submitted, self.done = [], threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
@@ -46,7 +47,7 @@ class FakeProcess:
         time.sleep(self.load)
         if self.refuse:
             self.conn.send(("refused", self.refuse))
-            self.conn.close()
+            self.terminate()
             return
         self.conn.send(("ready", {}))
         try:
@@ -61,7 +62,7 @@ class FakeProcess:
                     self.conn.send(("done", msg[1], "stop", {}))
         except (EOFError, OSError):
             pass
-        self.conn.close()
+        self.terminate()
 
     def is_alive(self):
         return self.thread.is_alive()
@@ -70,7 +71,8 @@ class FakeProcess:
         self.thread.join(timeout)
 
     def terminate(self):
-        self.conn.close()
+        with self.closing:
+            self.conn.close()
 
     kill = terminate
 
