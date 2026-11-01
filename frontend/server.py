@@ -685,7 +685,7 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/")
         if DUMP_DIR:  # (debug: the requests as clients send them)
             name = f"{time.strftime('%H%M%S')}-{time.time_ns() % 10**9:09d}{path.replace('/', '_')}.json"
-            (pathlib.Path(DUMP_DIR) / name).write_text(json.dumps(body, ensure_ascii=False, indent=1))
+            (pathlib.Path(DUMP_DIR) / name).write_text(json.dumps(body, ensure_ascii=False, indent=1), encoding="utf-8")
         routes = {"/v1/chat/completions": self.chat, "/v1/completions": self.completions, "/v1/responses": self.responses_api,
                   "/v1/messages": self.messages, "/v1/messages/count_tokens": self.count_tokens,
                   "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency,

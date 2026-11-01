@@ -212,7 +212,7 @@ def main():
             print(f"{repo}@{commit[:7]}: " + (why or "the engine accepts it"), flush=True)
         if rev != commit:  # (the branch or tag, for paths.repo_snapshot)
             (base / "refs").mkdir(parents=True, exist_ok=True)
-            (base / "refs" / rev).write_text(commit)
+            (base / "refs" / rev).write_text(commit, encoding="utf-8")
         print(f"{repo}@{commit[:7]}: {len(missing)} files to download -> {snap}", flush=True)
         for p, s, h in missing:
             (snap / p).parent.mkdir(parents=True, exist_ok=True)

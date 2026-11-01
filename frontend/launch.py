@@ -114,7 +114,7 @@ class Launch:
         """The engine's configuration (worker.run) for settings s; FileNotFoundError when weights are missing."""
         path = model_dir(s["weights"])
         draft = snapshot(*DFLASH2) if s["spec"] == "dflash2" else None
-        eos = json.loads((path / "generation_config.json").read_text())["eos_token_id"]
+        eos = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))["eos_token_id"]
         env = {"VISION": s["vision"], "MAX_SEQS": str(s["max_seqs"]),
                "VRAM_BUDGET_GIB": None if s["vram_budget_gib"] is None else f"{s['vram_budget_gib']:g}",
                "Q27_LM_HEAD_CKPT": str(snapshot(*TARGET)) if s["weights"] == "quasar" else LM_HEAD_ENV}

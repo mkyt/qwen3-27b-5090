@@ -60,7 +60,7 @@ def repo_snapshot(repo: str, rev: str | None = None) -> pathlib.Path:
         ref = HF_HUB / f"models--{repo.replace('/', '--')}" / "refs" / rev
         if not ref.is_file():
             raise FileNotFoundError(f"{repo}@{rev} is not in {HF_HUB} (scripts/download_weights.py --weights {repo})")
-        rev = ref.read_text().strip()
+        rev = ref.read_text(encoding="utf-8").strip()
     return snapshot(repo, rev)
 
 
@@ -73,7 +73,8 @@ def downloaded_repos():
         repo = base.name.removeprefix("models--").replace("--", "/", 1)
         if repo in pinned:
             continue
-        refs = {(base / "refs" / r).read_text().strip(): r for r in ("main",) if (base / "refs" / r).is_file()}
+        refs = {(base / "refs" / r).read_text(encoding="utf-8").strip(): r
+                for r in ("main",) if (base / "refs" / r).is_file()}
         for snap in sorted(base.glob("snapshots/*")):
             if is_model(snap):
                 out[repo if refs.get(snap.name) == "main" else f"{repo}@{snap.name}"] = snap
@@ -83,7 +84,7 @@ def downloaded_repos():
 def is_model(path: pathlib.Path) -> bool:
     """Whether config.json describes a quantized Qwen3.8-27B (the engine's dims.h)."""
     try:
-        cfg = json.loads((path / "config.json").read_text())
+        cfg = json.loads((path / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
     text = cfg.get("text_config", cfg)

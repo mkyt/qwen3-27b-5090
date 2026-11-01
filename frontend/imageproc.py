@@ -34,7 +34,7 @@ class ImageProcessor:
     """preprocessor_config.json of a model directory; __call__ takes RGB PIL images."""
 
     def __init__(self, path):
-        c = json.loads((pathlib.Path(path) / "preprocessor_config.json").read_text())
+        c = json.loads((pathlib.Path(path) / "preprocessor_config.json").read_text(encoding="utf-8"))
         self.patch, self.merge, self.temporal = c["patch_size"], c["merge_size"], c["temporal_patch_size"]
         self.min_pixels = c["size"]["shortest_edge"]
         # (transformers fuses rescale into normalize: (x - mean / rescale) / (std / rescale), in float32)

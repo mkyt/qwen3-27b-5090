@@ -45,7 +45,7 @@ _fingerprints = {}
 
 
 def fingerprint(path):
-    """What gives a model directory's token ids their meaning (vocabulary, merges and added tokens of tokenizer.json)
+    r"""What gives a model directory's token ids their meaning (vocabulary, merges and added tokens of tokenizer.json)
     as a digest: the server keeps the tokenizer it started with, so it starts an engine on other weights (launch.py)
     only if theirs is the same. A fine-tune's tokenizer.json rewritten by another transformers differs in the rest
     (e.g. Huihui's abliterated checkpoint: merges as "a b" strings, a pre-tokenizer pattern without \p{M}, ByteLevel
@@ -54,7 +54,7 @@ def fingerprint(path):
     path = pathlib.Path(path) / "tokenizer.json"
     key = (str(path), path.stat().st_mtime_ns)
     if key not in _fingerprints:
-        tok = json.loads(path.read_text())
+        tok = json.loads(path.read_text(encoding="utf-8"))
         model = tok["model"]
         merges = [m if isinstance(m, str) else " ".join(m) for m in model.get("merges", ())]
         ids = [model.get("type"), model.get("vocab"), merges, tok.get("added_tokens")]
@@ -72,9 +72,9 @@ class Tokenizer:
         self.path, self.template_path = path, pathlib.Path(template or path)
         self.tok = RustTokenizer.from_file(str(path / "tokenizer.json"))
         path = self.template_path
-        config = json.loads((path / "tokenizer_config.json").read_text())
+        config = json.loads((path / "tokenizer_config.json").read_text(encoding="utf-8"))
         template = path / "chat_template.jinja"
-        source = template.read_text() if template.is_file() else config["chat_template"]
+        source = template.read_text(encoding="utf-8") if template.is_file() else config["chat_template"]
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
                                             extensions=[GenerationTag, jinja2.ext.loopcontrols])
         env.filters["tojson"] = tojson
