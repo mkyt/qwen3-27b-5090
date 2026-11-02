@@ -67,7 +67,7 @@ New-Item -ItemType Directory -Force "$app\reference\qwen27b", "$app\scripts", "$
 foreach ($f in "__init__.py", "paths.py", "image_tokens.py") { Copy-Item "reference\qwen27b\$f" "$app\reference\qwen27b\" }
 Copy-Item scripts\download_weights.py, scripts\windows\start_package.py, scripts\windows\update.ps1 "$app\scripts\"
 Copy-Item engine\build\q27.dll "$app\engine\build\"
-Set-Content -Encoding ascii -NoNewline (Join-Path $app "VERSION") $Version  # (update.ps1 compares it with the release)
+Set-Content -Encoding ascii -NoNewline -Path (Join-Path $app "VERSION") -Value $Version  # (update.ps1 compares it with the release)
 Get-ChildItem -Recurse -Directory -Filter __pycache__ $app | Remove-Item -Recurse -Force
 Copy-Item LICENSE $dst
 Copy-Item scripts\windows\start.cmd, scripts\windows\update.cmd, scripts\windows\settings.example.ini $dst
