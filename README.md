@@ -161,9 +161,9 @@ first in either case.
 - **Freeing disk space:** each update leaves the previous image behind, without a name.
   `docker image prune` deletes such images, including those of other projects, and asks first.
 
-The [Windows package](#windows-native) has no image: quit the tray app, delete `python\` and `app\` in its folder, and
-unzip the zip of the new [release](https://github.com/mkyt/qwen3-27b-5090/releases) over the folder. The settings and the
-weights stay ([docs/configuration.md](docs/configuration.md#updating)).
+The [Windows package](#windows-native) has no image: run `update.cmd` in its folder (from v0.3.1), which downloads the
+latest [release](https://github.com/mkyt/qwen3-27b-5090/releases), quits the tray app and replaces the program. The
+settings and the weights stay ([docs/configuration.md](docs/configuration.md#updating), also by hand).
 
 ### Windows (native)
 
@@ -172,7 +172,7 @@ The same engine and server also run on Windows itself, without WSL2 or Docker, a
 is bit-identical to Linux on the golden set. The package, `qwen3-27b-5090-<version>-windows-x64.zip` (44 MB,
 attached to the [releases](https://github.com/mkyt/qwen3-27b-5090/releases) from the first versioned one;
 `scripts/windows/package.ps1` builds it from a checkout), holds `q27.dll`, the embeddable Python from python.org with the server's packages, and
-the tray app `qwen3-27b-tray.exe` and `start.cmd`. It needs no VC++ redistributable, CUDA toolkit or administrator rights.
+the tray app `qwen3-27b-tray.exe`, `start.cmd` and `update.cmd`. It needs no VC++ redistributable, CUDA toolkit or administrator rights.
 
 Unzip it anywhere and run `qwen3-27b-tray.exe`: an icon appears in the notification area, its color and tooltip show
 the state, and its menu starts and stops the server, changes its settings, opens the stats page and the log, and sets

@@ -390,9 +390,22 @@ path if the folder moved.
 
 ### Updating
 
-Quit the tray app, delete `python\` and `app\` (files of the old version must not stay among the new ones), and unzip the
-new package over the folder (the zip's name has the version, the folder in it does not). `settings.ini`, the weights
-and the log stay.
+From v0.3.1, run `update.cmd` in the package's folder. It downloads the latest release's zip (an interrupted download
+resumes when run again), checks its SHA-256, quits the tray app of this folder, replaces `python\`, `app\` and the
+files next to them, and starts the tray app again if it was running. `settings.ini`, the weights and the log stay. If a
+step fails, the old version is put back. A server started with `start.cmd` has to be closed by hand.
+
+| Command | |
+| --- | --- |
+| `update.cmd` | The latest release (nothing to do when `app\VERSION` already has its version) |
+| `update.cmd -Check` | Only show the installed version and the latest release's |
+| `update.cmd -Tag v0.3.1` | That release, also an older one |
+| `update.cmd -Force` | Install again when the version is the same |
+| `update.cmd -Zip <file>` | A zip already downloaded (not checked against a SHA-256) |
+
+By hand (and from v0.3.0, which has no `update.cmd`): quit the tray app, delete `python\` and `app\` (files of the old
+version must not stay among the new ones), and unzip the new package over the folder (the zip's name has the version,
+the folder in it does not).
 
 ## Development switches
 

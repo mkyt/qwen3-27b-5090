@@ -81,6 +81,10 @@ jobs:
           if ($LASTEXITCODE) { throw "smoke test failed" }
           $tray = Start-Process "dist\qwen3-27b-5090-windows-x64\qwen3-27b-tray.exe" -ArgumentList "--check" -Wait -PassThru
           if ($tray.ExitCode) { throw "the tray app does not find the package ($($tray.ExitCode))" }
+          $errs = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "$app\scripts\update.ps1"), [ref]$null, [ref]$errs)
+          if ($errs) { throw "update.ps1: $errs" }
+          if ((Get-Content "$app\VERSION") -ne $env:VERSION) { throw "app\VERSION is not $env:VERSION" }
           (Get-FileHash -Algorithm SHA256 "dist\$env:PKG.zip").Hash.ToLower() + "  $env:PKG.zip" | Set-Content -Encoding ascii "dist\$env:PKG.zip.sha256"
       - uses: actions/upload-artifact@v7
         with:

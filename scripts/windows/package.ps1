@@ -1,6 +1,6 @@
 <#
 Builds the Windows package dist\qwen3-27b-5090-<version>-windows-x64.zip: q27.dll, the embeddable Python (python.org) with the
-server's packages, the server, the tray app (windows\tray) and start.cmd (scripts\windows\start.cmd). Like the serving image, it holds no compiler,
+server's packages, the server, the tray app (windows\tray), start.cmd and update.cmd (scripts\windows). Like the serving image, it holds no compiler,
 CUDA toolkit or PyTorch: the GPU driver is the only requirement. The version in the zip's name is that of
 `git describe --tags --match v*` (v0.3.0 on a tag, v0.3.0-3-g6767c0c after it) unless -Version gives one; the folder
 in the zip has none, so a new zip unzips over the folder of the previous one.
@@ -65,11 +65,12 @@ foreach ($d in "bench\draft-vocab", "engine\python", "frontend") {
 Remove-Item -Recurse -Force (Join-Path $app "frontend\tests")
 New-Item -ItemType Directory -Force "$app\reference\qwen27b", "$app\scripts", "$app\engine\build" | Out-Null
 foreach ($f in "__init__.py", "paths.py", "image_tokens.py") { Copy-Item "reference\qwen27b\$f" "$app\reference\qwen27b\" }
-Copy-Item scripts\download_weights.py, scripts\windows\start_package.py "$app\scripts\"
+Copy-Item scripts\download_weights.py, scripts\windows\start_package.py, scripts\windows\update.ps1 "$app\scripts\"
 Copy-Item engine\build\q27.dll "$app\engine\build\"
+Set-Content -Encoding ascii -NoNewline (Join-Path $app "VERSION") $Version  # (update.ps1 compares it with the release)
 Get-ChildItem -Recurse -Directory -Filter __pycache__ $app | Remove-Item -Recurse -Force
 Copy-Item LICENSE $dst
-Copy-Item scripts\windows\start.cmd, scripts\windows\settings.example.ini $dst
+Copy-Item scripts\windows\start.cmd, scripts\windows\update.cmd, scripts\windows\settings.example.ini $dst
 Copy-Item windows\tray\build\qwen3-27b-tray.exe $dst
 
 $zip = Join-Path $Out "qwen3-27b-5090-$Version-windows-x64.zip"
