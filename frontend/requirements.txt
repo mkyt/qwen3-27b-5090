@@ -3,6 +3,5 @@
 # Installed with --no-deps (Dockerfile): every package the server imports is listed, dependencies included.
 jinja2==3.1.6
 markupsafe==3.0.4
-numpy==2.5.3
 pillow==12.3.0
 tokenizers==0.23.2

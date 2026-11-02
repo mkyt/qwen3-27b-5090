@@ -25,7 +25,7 @@ starts. A request waiting for room rather than one suspended later keeps its tur
 Messages (pickled tuples). In: ("submit", rid, request), ("cancel", rid), ("config", changes, n), ("stop",).
 Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids]), ("done", rid, finish, info),
 ("prefilled", rid, info: the prompt side of "done"'s info after a prefill ends, for a request a stop string ends),
-("error", rid, message), ("metrics", dict), ("config", settings, n: the change answered, or None),
+("error", rid, message[, HTTP status: 400 for an image that cannot be decoded]), ("metrics", dict), ("config", settings, n: the change answered, or None),
 ("memory", the pools: once after "ready"), ("stats", snapshot: the requests, KV pool and device memory, every STATS_INTERVAL s while busy),
 ("event", rid, kind, text: an admission wait, a preemption, an engine error).
 """
@@ -52,6 +52,10 @@ def step_ms(n):
     return 11.1 + 1.36 * n
 
 
+class ImageError(Exception):
+    """An image of the request cannot be decoded (the client's error: 400)."""
+
+
 def log(msg):
     print(f"[sched] {msg}", file=sys.stderr, flush=True)
 
@@ -65,7 +69,8 @@ class Seq:
         self.max_new = req["max_new"]
         self.temperature, self.top_k, self.top_p = req["temperature"], req["top_k"], req["top_p"]
         self.rng = random.Random(req.get("seed"))
-        self.images = req.get("images")  # (spans [(start, gh, gw)], pixel arrays) or None
+        self.images = req.get("images")  # (spans [(start, gh, gw)], [(encoded image, resized size, norm)]) or None
+        self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), started on arrival
         self.arrival = now
         self.out = []            # generated tokens (EOS excluded)
         self.eng_ids = self.prompt  # what the engine runs (prompt + earlier output after a preemption)
@@ -134,6 +139,7 @@ class Scheduler:
         self.cur = None          # the sequence in the engine's working state (may be finished)
         self.credit = 0.0        # decode time owed to decoding requests by the prefills (DECODE_SHARE)
         self.history = collections.deque(maxlen=64)  # recent sequences (prompt + output) as int32 bytes
+        self.decoder = None      # threads that decode images (prefetch)
         self.m = collections.Counter()
         self.last_metrics = self.last_stats = 0.0
         self.cache_full = False  # every state slot of the prefix cache allocated (poll)
@@ -185,9 +191,29 @@ class Scheduler:
         starts = [i for i, t in enumerate(s.prompt) if t == self.im_start]
         s.marks = (starts[1:2] or [0]) + (starts[-2:-1] or [0]) + (starts[-1:] or [0])
         s.est_cached = s.reusable
+        if s.images:
+            self.prefetch(s)
         self.by_id[rid] = s
         self.waiting.append(s)
         self.m["q27:requests_total"] += 1
+
+    def prefetch(self, s):
+        """Starts decoding the images that lie past the reusable prefix, which begin() will likely encode, on
+        threads while the request waits (images inside the prefix are decoded only if the cache misses them)."""
+        import imageproc
+
+        if self.decoder is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self.decoder = ThreadPoolExecutor(2, thread_name_prefix="image")
+        for i, ((start, gh, gw), (raw, size, _)) in enumerate(zip(*s.images)):
+            if start + gh * gw > s.reusable:
+                s.decoding[i] = self.decoder.submit(imageproc.rgb, raw, size)
+
+    def drop_decoding(self, s):
+        for f in s.decoding.values():
+            f.cancel()
+        s.decoding.clear()
 
     def cancel(self, rid):
         s = self.by_id.get(rid)
@@ -400,6 +426,13 @@ class Scheduler:
                 self.suspend(victim)
                 if victim is s:
                     return None
+            except ImageError as e:  # (an image the server could read the size of but not decode)
+                log(f"{s.rid}: {e}")
+                self.send("error", s.rid, str(e), 400)
+                self.finish(s, "error", save=False, notify=False)
+                self.engine.reset()
+                self.cur = None
+                return None
             except RuntimeError as e:
                 msg = str(e)
                 if "check failed" not in msg:  # a CUDA error: the context is unusable, restart the process
@@ -450,15 +483,25 @@ class Scheduler:
                 f"waited {time.time() - s.arrival:.2f} s, checkpoints at {s.at}")
             self.send("start", s.rid, {"cached": cached})
         if s.images:
-            spans, pixels = s.images
+            import imageproc
+
+            spans, srcs = s.images
             self.engine.mm_set(spans)
-            t0, encoded = time.time(), 0
+            t0, encoded, waited = time.time(), 0, 0.0
             for i, (start, gh, gw) in enumerate(spans):
                 if start + gh * gw > cached:  # (images inside the restored prefix need no embeddings)
-                    self.engine.mm_encode(i, pixels[i])
+                    raw, size, norm = srcs[i]
+                    t1, f = time.time(), s.decoding.pop(i, None)
+                    try:
+                        rgb = f.result() if f is not None else imageproc.rgb(raw, size)
+                    except Exception as e:  # noqa: BLE001 - any decoder error is the client's
+                        raise ImageError(f"cannot decode image: {e}") from e
+                    waited += time.time() - t1
+                    self.engine.mm_encode_rgb(i, rgb, norm)
                     encoded += 1
+            self.drop_decoding(s)  # (the pixels are not kept: a suspended request that needs them decodes again)
             log(f"{s.rid}: images {len(spans)} ({sum(gh * gw for _, gh, gw in spans)} tokens), encoded {encoded} "
-                f"in {time.time() - t0:.3f} s")
+                f"in {time.time() - t0:.3f} s ({waited:.3f} s decoding or waiting for it)")
 
     def prefill_turn(self, s):
         self.load(s)
@@ -599,6 +642,7 @@ class Scheduler:
         if s.dead:
             return
         s.dead = True
+        self.drop_decoding(s)
         if s in self.alive:
             self.alive.remove(s)
         self.by_id.pop(s.rid, None)

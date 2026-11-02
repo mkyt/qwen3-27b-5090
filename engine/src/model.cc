@@ -1095,7 +1095,7 @@ void Model::mm_set(const int32_t* spans, int n) {
   Q27_CUDA(cudaStreamSynchronize(s_));
 }
 
-void Model::mm_encode(int i, const float* pixels) {
+void Model::mm_encode(int i, const VisionPixels& pixels) {
   Q27_CHECK(opt_.vision && i >= 0 && i < int(mm_spans_.size()), "mm_encode: no such image");
   const MmSpan& sp = mm_spans_[i];
   const int gh = sp.gh * vdims::kMerge, gw = sp.gw * vdims::kMerge;

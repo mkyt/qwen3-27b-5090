@@ -39,12 +39,14 @@ SIGNATURES = {
     "q27_has_vision": ([P], I),
     "q27_mm_set": ([P, P, I], I),
     "q27_mm_encode": ([P, I, P], I),
+    "q27_mm_encode_rgb": ([P, I, P, P], I),
     "q27_mm_embeds": ([P, I, P], I),
     "q27_mm_put": ([P, I, P], I),
     "q27_debug_kv": ([P, I, I, I, P], I),
     "q27_debug_ssm": ([P, I, P], I),
     "q27t_skinny_bf16": ([I, I, I, P, P, P, P, SZ], I),
     "q27t_gemm_bf16": ([I, I, I, P, P, P], I),
+    "q27t_vision_pixels": ([P, P, P, I, I, P], I),
     "q27t_gemm_bf16_ex": ([I, I, I, P, P, F, P, F, P], I),
     "q27t_gdn_verify": ([P, I, I, P, P, P, P, P, P] + [P] * 8 + [P, P, P, P, P, P, I, P, F, P, P, F, I], I),
     "q27t_topk_rows": ([P, I, I, I, P, P], I),
@@ -358,6 +360,11 @@ class Engine:
 
         pv = np.ascontiguousarray(np.asarray(pixel_values, dtype=np.float32))
         self._check(lib().q27_mm_encode(self.h, i, pv.ctypes.data), "q27_mm_encode")
+
+    def mm_encode_rgb(self, i, rgb, norm):
+        """Runs the vision tower on image i from the resized image: rgb [32 * gh][32 * gw][3] uint8 bytes, norm
+        mean[3] + std[3] (the server's image processor; normalized and arranged into patches on the device)."""
+        self._check(lib().q27_mm_encode_rgb(self.h, i, rgb, (ctypes.c_float * 6)(*norm)), "q27_mm_encode_rgb")
 
     def mm_embeds(self, i, rows):
         """Embeddings of image i as a uint16 (BF16 bits) numpy array [rows, 5120]."""

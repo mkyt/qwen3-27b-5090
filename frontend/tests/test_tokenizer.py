@@ -1,6 +1,7 @@
 """The API server's tokenizer, chat template and image processor (tokenizer.py, imageproc.py) against transformers'
 (skipped where transformers or the checkpoint is missing): the same prompt text, ids, decoded text and image grids."""
 
+import io
 import json
 import pathlib
 import sys
@@ -13,10 +14,13 @@ sys.path.insert(0, str(ROOT / "frontend"))
 sys.path.insert(0, str(ROOT / "reference"))
 
 from chat import normalize_messages, template_kwargs  # noqa: E402
+import imageproc  # noqa: E402
 from imageproc import ImageProcessor  # noqa: E402
 from tokenizer import Tokenizer  # noqa: E402
 
 transformers = pytest.importorskip("transformers")
+torch = pytest.importorskip("torch")
+from qwen27b.vision import patchify  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -109,7 +113,12 @@ def test_images_match_transformers(model):
     for img in images:
         for max_pixels in (1 << 20, 4194304):
             size = {"shortest_edge": 65536, "longest_edge": max_pixels}
-            pv, grids = mine([img], max_pixels)
+            rw, rh = mine.size(img.size, max_pixels)
+            grids = [mine.grid((rw, rh))]
+            buf = io.BytesIO()
+            img.save(buf, "PNG")  # (lossless: what the server receives)
+            x = torch.frombuffer(bytearray(imageproc.rgb(buf.getvalue(), (rw, rh))), dtype=torch.uint8).view(rh, rw, 3)
+            pv = patchify(x, mine.norm[:3], mine.norm[3:], mine.patch, mine.merge, mine.temporal).numpy()
             a = pil(images=[img], size=size, return_tensors="np")
             b = tv(images=[img], size=size, return_tensors="np")
             assert a["image_grid_thw"].tolist() == b["image_grid_thw"].tolist() == [list(g) for g in grids]

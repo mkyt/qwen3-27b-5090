@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
-# The serving image: libq27.so built in the CUDA devel image, then plain Ubuntu with the CUDA runtime library
-# (libcudart, the engine's only CUDA dependency; the driver comes from the NVIDIA container runtime), Python and the
-# server's packages (frontend/requirements.txt). No compiler or PyTorch at runtime (dev/Dockerfile has those, for
-# development). (On the nvidia/cuda base image it was 1.21 GB, 456 MB of it the forward-compatibility driver
-# package, which GeForce GPUs cannot use.) Published as ghcr.io/mkyt/qwen3-27b-5090 (.github/workflows/image.yml); built here by
+# The serving image: libq27.so built in the CUDA devel image, then a distroless base (glibc and libstdc++ only, no
+# shell or package manager) with the CUDA runtime library (libcudart, the engine's only CUDA dependency; the driver
+# comes from the NVIDIA container runtime), Python and the server's packages (frontend/requirements.txt). No compiler
+# or PyTorch at runtime (dev/Dockerfile has those, for development). (On the nvidia/cuda base image it was 1.21 GB,
+# 456 MB of it the forward-compatibility driver package, which GeForce GPUs cannot use; on ubuntu:24.04 with numpy, 350 MB.)
+# Nothing is stripped: the standalone Python and the wheels' libraries were edited after linking (patchelf), and
+# strip, which trusts the section headers, broke the interpreter (empty dynamic symbol names).
+# Published as ghcr.io/mkyt/qwen3-27b-5090 (.github/workflows/image.yml); built here by
 # `docker compose up -d --build serve`.
 
 FROM ghcr.io/astral-sh/uv:0.12.13@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 AS uv
@@ -24,7 +27,8 @@ RUN --mount=type=cache,target=/build \
 # Python and the packages, without uv itself in the image. --no-deps: requirements.txt lists every package the server
 # imports (tokenizers' huggingface_hub, with httpx, hf_xet and others, is never used: the server reads tokenizer.json).
 # The standalone Python's parts the server does not need go: the embedding library (the interpreter is static),
-# Tcl/Tk, IDLE, ensurepip and pip, headers, manuals.
+# Tcl/Tk, IDLE, ensurepip and pip, headers, manuals, the test suite; and from the packages their tests, type stubs,
+# Pillow's Tk binding.
 FROM ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c AS python
 COPY --from=uv /uv /usr/local/bin/
 ENV UV_PYTHON_INSTALL_DIR=/opt/python \
@@ -39,9 +43,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
            bin/idle3* bin/pip* bin/2to3* bin/pydoc3* bin/python3*-config \
            lib/python3.12/idlelib lib/python3.12/tkinter lib/python3.12/turtledemo lib/python3.12/ensurepip \
            lib/python3.12/lib2to3 lib/python3.12/pydoc_data lib/python3.12/site-packages/pip* \
-           lib/python3.12/lib-dynload/_tkinter* lib/python3.12/config-3.12*
+           lib/python3.12/lib-dynload/_tkinter* lib/python3.12/config-3.12* \
+           lib/python3.12/test lib/python3.12/unittest lib/python3.12/lib-dynload/*_test* lib/python3.12/lib-dynload/xx* \
+ && cd /opt/venv/lib/python3.12/site-packages \
+ && rm -rf PIL/_imagingtk.* \
+ && find . -depth -type d -name tests -exec rm -rf {} + \
+ && find . -name '*.pyi' -delete
 
-FROM ubuntu:24.04@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c
+FROM gcr.io/distroless/cc-debian13@sha256:58e12be899275afaa05f1b03051ab19037ed7f252528e57a3a9ad7e220a62578
 COPY --from=python /opt/python /opt/python
 COPY --from=python /opt/venv /opt/venv
 COPY --from=build /usr/local/cuda/lib64/libcudart.so.13* /opt/q27/

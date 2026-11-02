@@ -148,10 +148,11 @@ class Model {
   // frontend derives them from the image, so the prefix cache tells images apart) at positions
   // start .. start + gh * gw - 1, gh x gw the merged grid. mm_set (after reset / prefix_begin, before the
   // forward call) gives the request's images: spans [n][3] = (start, gh, gw), ascending. mm_encode runs
-  // the vision tower on image i (pixels [4 * gh * gw][1536] fp32, host) into its embedding rows; images
-  // whose positions the restored prefix covers need no encoding. mm_embeds copies them out (tests).
+  // the vision tower on image i (its pixels in host memory: VisionPixels, 2 gh x 2 gw patches) into its
+  // embedding rows; images whose positions the restored prefix covers need no encoding. mm_embeds copies them
+  // out (tests).
   void mm_set(const int32_t* spans, int n);
-  void mm_encode(int i, const float* pixels);
+  void mm_encode(int i, const VisionPixels& pixels);
   void mm_embeds(int i, bf16* out);
   void mm_put(int i, const bf16* in);  // replaces image i's embeddings (tests: another vision tower)
   bool has_vision() const { return opt_.vision != 0; }

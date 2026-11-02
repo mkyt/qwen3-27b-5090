@@ -57,10 +57,22 @@ size_t vision_ws_bytes(int max_patches, VisionMode mode);
 // kFp8 at load: w [rows][cols] BF16 (device) -> e4m3 q and the per-row scale amax / 448.
 void vision_quant_fp8(const bf16* w, int rows, int cols, uint8_t* q, float* scale, cudaStream_t s);
 
-// Encodes one image: pixels [gh * gw][1536] fp32 in host memory (the image processor's pixel_values,
-// patches in 2x2 merge-block order), gh x gw the patch grid (both even). Writes [gh * gw / 4][5120] BF16
-// to out (device memory or a UVA pointer to pinned host memory). Synchronous with respect to `pixels`.
-void vision_encode(const VisionWeights& w, const float* pixels, int gh, int gw, bf16* out, void* ws,
+// One image's pixels in host memory, either the image processor's pixel_values (patches: [gh * gw][1536] fp32,
+// 2x2 merge-block order) or the resized image itself (rgb: [gh * 16][gw * 16][3] uint8), which the device
+// normalizes as the processor does, (x - mean) / std in fp32 per channel, and arranges into the same patches.
+struct VisionPixels {
+  const float* patches = nullptr;
+  const uint8_t* rgb = nullptr;
+  float mean[3] = {}, std[3] = {};
+};
+
+// The BF16 patches [gh * gw][1536] of px into out (device), through tmp (device, tmp_bytes) in chunks.
+// Synchronous with respect to the host memory of px.
+void vision_pixels(const VisionPixels& px, int gh, int gw, bf16* out, void* tmp, size_t tmp_bytes, cudaStream_t s);
+
+// Encodes one image: px of the gh x gw patch grid (both even). Writes [gh * gw / 4][5120] BF16 to out
+// (device memory or a UVA pointer to pinned host memory). Synchronous with respect to the host memory of px.
+void vision_encode(const VisionWeights& w, const VisionPixels& px, int gh, int gw, bf16* out, void* ws,
                    size_t ws_bytes, cudaStream_t s);
 
 }  // namespace q27

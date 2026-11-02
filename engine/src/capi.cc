@@ -33,6 +33,13 @@ int guard(F&& f) {
 
 float g_last_us = 0.f;
 
+VisionPixels rgb_pixels(const uint8_t* rgb, const float* norm) {
+  VisionPixels px;
+  px.rgb = rgb;
+  for (int c = 0; c < 3; c++) px.mean[c] = norm[c], px.std[c] = norm[3 + c];
+  return px;
+}
+
 // The kernel wrappers launch on this stream (a real stream: PDL applies and launches can be captured).
 cudaStream_t ts() {
   static cudaStream_t s = [] {
@@ -297,13 +304,21 @@ int q27_device_memory(void* m, int64_t* out) {
 }
 
 // Images (P4-12): spans [n][3] = (start, gh, gw) of the request (after q27_reset / q27_prefix_begin), the
-// vision tower on image i (pixels [4 * gh * gw][1536] fp32), its embeddings [gh * gw][5120] BF16 (tests).
+// vision tower on image i (pixels [4 * gh * gw][1536] fp32, or the resized image [32 * gh][32 * gw][3] uint8
+// with norm = mean[3], std[3]: VisionPixels), its embeddings [gh * gw][5120] BF16 (tests).
 int q27_has_vision(void* m) { return static_cast<Model*>(m)->has_vision() ? 1 : 0; }
 int q27_mm_set(void* m, const int32_t* spans, int n) {
   return guard([&] { static_cast<Model*>(m)->mm_set(spans, n); });
 }
 int q27_mm_encode(void* m, int i, const float* pixels) {
-  return guard([&] { static_cast<Model*>(m)->mm_encode(i, pixels); });
+  return guard([&] {
+    VisionPixels px;
+    px.patches = pixels;
+    static_cast<Model*>(m)->mm_encode(i, px);
+  });
+}
+int q27_mm_encode_rgb(void* m, int i, const uint8_t* rgb, const float* norm) {
+  return guard([&] { static_cast<Model*>(m)->mm_encode(i, rgb_pixels(rgb, norm)); });
 }
 int q27_mm_embeds(void* m, int i, bf16* out) {
   return guard([&] { static_cast<Model*>(m)->mm_embeds(i, out); });
@@ -330,6 +345,20 @@ int q27_profile_dump(void* m) {
 
 // ---------------------------------------------------------------- kernels (tests)
 
+// The BF16 patches [gh * gw][1536] (out, device) of host pixels: fp32 patches, or with rgb the image and norm.
+int q27t_vision_pixels(const float* patches, const uint8_t* rgb, const float* norm, int gh, int gw, bf16* out) {
+  return kernel([&] {
+    VisionPixels px = rgb ? rgb_pixels(rgb, norm) : VisionPixels{};
+    px.patches = patches;
+    constexpr size_t kTmp = size_t(4) << 20;  // (small: several chunks or bands for the larger test images)
+    static void* tmp = [] {
+      void* x;
+      Q27_CUDA(cudaMalloc(&x, kTmp));
+      return x;
+    }();
+    vision_pixels(px, gh, gw, out, tmp, kTmp, ts());
+  });
+}
 int q27t_rmsnorm(const float* x, const bf16* w, int T, int D, float eps, int zc, float* out) {
   return kernel([&] { rmsnorm(x, w, T, D, eps, zc != 0, out, ts()); });
 }

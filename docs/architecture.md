@@ -87,10 +87,11 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
   between 4.3 and 6.5 GiB from one start to the next.) PyTorch is used only by the reference model and the tests.
   The server does not use it either, nor transformers: the tokenizer is `tokenizers` on the checkpoint's
   `tokenizer.json`, the chat template renders with jinja2 as transformers sets it up, and images are
-  preprocessed with PIL and numpy (`frontend/requirements.txt`; `frontend/tests/test_tokenizer.py` compares
-  prompts, ids and image grids with transformers). The serving image (`Dockerfile`) is therefore 350 MB: Ubuntu, the
-  CUDA runtime library, `libq27.so`, Python and those packages (1.21 GB on the nvidia/cuda base image, 456 MB of it
-  the forward-compatibility driver package, which GeForce GPUs do not use).
+  resized with PIL and normalized on the GPU (`frontend/requirements.txt`; `frontend/tests/test_tokenizer.py` compares
+  prompts, ids and image grids with transformers). The serving image (`Dockerfile`) is therefore 180 MB (a 45 MB
+  download): a distroless base (glibc and libstdc++), the CUDA runtime library, `libq27.so`, Python and those
+  packages (1.21 GB on the nvidia/cuda base image, 456 MB of it the forward-compatibility driver package, which
+  GeForce GPUs do not use; 350 MB on ubuntu:24.04).
 - **The scheduler is Python.** A speculative step takes 12 to 25 ms; the scheduler's decisions take microseconds by
   comparison, and the engine queues the next step before the host reads the previous one ([§6](#6-a-decode-step)).
 
@@ -308,8 +309,15 @@ takes 47 ms (43 ms with the weights in VRAM, `VISION=bf16`); outputs are bit-ide
 `VISION=fp8` keeps E4M3 weights (per-row scales) in VRAM: 0.43 GiB, slightly less accurate, faster only for small
 images.
 
-- The image processor (resizing, patching) is the checkpoint's own in the server, so the inputs match the
-  reference.
+- The image processor is the checkpoint's own, so the inputs match the reference. The server reads only each
+  image's size from its header (enough for the grid and the token ids) and passes the encoded image on; the engine
+  process decodes and resizes (PIL bicubic, as transformers' PIL backend, on 8 threads with the same pixels as one
+  call) only the images it has to encode, starting while the request waits. A chat client resends the whole
+  history every turn: the images in a cached prefix cost nothing then (a follow-up turn with three 12 MP photos in
+  its history: 1.2 s before, 55 ms). The engine normalizes the resized uint8 RGB ((x - mean) / std in
+  fp32) and arranges the patches (2x2 merge blocks, repeated over the temporal patch) on the GPU, bit-identical to
+  the processor's fp32 `pixel_values` rounded to BF16. A 2048 x 2048 image is 12 MB to send instead of 100 MB of
+  fp32 patches, and the 0.3 s that numpy took for those on the CPU is gone.
 - Image tokens enter the prompt as out-of-vocabulary ids derived from the image's content. The prefix cache, which
   compares token ids, therefore distinguishes images without any change and skips encoding images that are already
   in a cached prefix. The embeddings are written to a pinned host table that the embedding gather reads.

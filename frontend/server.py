@@ -70,7 +70,8 @@ class ApiError(Exception):
 
 
 class Images:
-    """Image inputs (P4-12): data URLs (or http(s) URLs) -> pixel_values of the checkpoint's image processor."""
+    """Image inputs (P4-12): data URLs (or http(s) URLs) -> the image token ids and, for the engine process, the
+    encoded images with their resized size (it decodes only those it has to encode: imageproc.py)."""
 
     MAX_BYTES = 32 << 20
 
@@ -116,25 +117,23 @@ class Images:
         else:
             raise ApiError(400, "images must be data URLs (data:image/...;base64,...) or http(s) URLs")
         try:
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            with Image.open(io.BytesIO(raw)) as img:  # (the header only)
+                size = img.size
         except Exception as e:  # noqa: BLE001 - any decoder error is the client's
             raise ApiError(400, f"cannot decode image: {e}") from e
-        return raw, img
+        return raw, size
 
     def prepare(self, ids, urls, pad_id):
-        """(ids with each image's pad expanded to its token ids, [(start, gh, gw)], [pixel_values per image])."""
+        """(ids with each image's pad expanded to its token ids, [(start, gh, gw)], [(encoded image, resized
+        (width, height), norm) per image] for imageproc.rgb and q27_mm_encode_rgb)."""
         from qwen27b.image_tokens import expand_image_pads, image_token_ids
 
-        raws, imgs = zip(*(self.load(u) for u in urls))
-        pv, grids = self.proc(imgs, self.max_pixels)
-        grids = [list(g) for g in grids]
+        raws, sizes = zip(*(self.load(u) for u in urls))
+        sizes = [self.proc.size(s, self.max_pixels) for s in sizes]
+        grids = [list(self.proc.grid(s)) for s in sizes]
         keys = [raw + repr((g, self.max_pixels)).encode() for raw, g in zip(raws, grids)]
         ids, spans = expand_image_pads(ids, grids, pad_id, fill=lambda i, n: image_token_ids(keys[i], n))
-        out, r = [], 0
-        for t, h, w in grids:
-            out.append(pv[r:r + t * h * w])
-            r += t * h * w
-        return ids, [(s.start, s.gh, s.gw) for s in spans], out
+        return ids, [(s.start, s.gh, s.gw) for s in spans], [(raw, s, self.proc.norm) for raw, s in zip(raws, sizes)]
 
 
 # ---------------------------------------------------------------- the engine process

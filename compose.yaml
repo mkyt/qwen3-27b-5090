@@ -39,7 +39,7 @@ services:
       CUDA_VISIBLE_DEVICES: ""
     profiles: [dev]
   serve:
-    # libq27.so, the server and its four Python packages; the code is in the image (`--build` after a change).
+    # libq27.so, the server and its three Python packages; the code is in the image (`--build` after a change).
     # SERVE_TAG: a published version (`docker compose pull serve`), latest by default.
     build: .
     image: ghcr.io/mkyt/qwen3-27b-5090:${SERVE_TAG:-latest}

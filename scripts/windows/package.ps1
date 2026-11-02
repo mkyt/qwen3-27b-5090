@@ -48,7 +48,6 @@ $site = Join-Path $dst "python\Lib\site-packages"
 & $Python -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --platform win_amd64 `
   --implementation cp --python-version "$($ver[0]).$($ver[1])" --target $site -r frontend\requirements.txt
 if ($LASTEXITCODE) { throw "pip install failed" }
-if (Test-Path "$site\bin") { Remove-Item -Recurse -Force "$site\bin" }  # (numpy's f2py launcher)
 
 # The server: what the serving image copies (Dockerfile), the weight download and q27.dll
 $app = Join-Path $dst "app"

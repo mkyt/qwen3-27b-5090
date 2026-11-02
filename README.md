@@ -86,7 +86,7 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 - A recent NVIDIA driver for CUDA 13 (tested with 617.42), and one of:
   - **Linux or WSL2** with Docker and the NVIDIA Container Toolkit, or
   - **Windows** (64-bit, native): nothing else, the [Windows package](#windows-native) brings its own Python.
-- About 25 GB of disk for the weights; 350 MB for the serving image or 44 MB for the Windows package (the development
+- About 25 GB of disk for the weights; 180 MB for the serving image (a 45 MB download) or 44 MB for the Windows package (the development
   image, for the tests and benchmarks, is 20 GB). At least 16 GB of host RAM: the engine pins about 8 GB (the
   embedding table, the prefix cache, the vision tower).
 - To download the weights on Linux: Python 3.10+ (standard library only) or [uv](https://docs.astral.sh/uv/) for
@@ -96,7 +96,7 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 
 ```bash
 scripts/download-weights.sh                 # gdnfp4 weights and the draft model into ./hf (23 GB)
-docker compose pull serve                   # the serving image from ghcr.io (350 MB)
+docker compose pull serve                   # the serving image from ghcr.io (45 MB download)
 docker compose up -d serve                  # serves 127.0.0.1:8000
 docker compose logs -f serve                # wait for "engine ready"; the log shows the memory plan
 ```
@@ -111,9 +111,9 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 To get a newer version later, see [Updating](#updating).
 
 The serving image ([Dockerfile](Dockerfile), published by [a workflow](.github/workflows/image.yml)) compiles the
-engine in the CUDA devel image and keeps only the result on plain Ubuntu: the CUDA runtime library (the driver comes
-from the NVIDIA Container Toolkit), `libq27.so`, Python and the server's four packages (`frontend/requirements.txt`:
-tokenizers, jinja2, numpy, pillow). No compiler, PyTorch or transformers. `docker compose up -d --build serve` builds it from the checkout instead (about 2 minutes the first
+engine in the CUDA devel image and keeps only the result on a distroless base (glibc and libstdc++): the CUDA runtime library (the driver comes
+from the NVIDIA Container Toolkit), `libq27.so`, Python and the server's three packages (`frontend/requirements.txt`:
+tokenizers, jinja2, pillow). No compiler, PyTorch or transformers. `docker compose up -d --build serve` builds it from the checkout instead (about 2 minutes the first
 time, then only the engine sources that changed), e.g. after changing the code.
 
 `scripts/serve.sh up` does the same and waits until the server answers (`up --idle`: the server only, no VRAM until
@@ -130,7 +130,7 @@ Docker keeps using the image it already has until you ask for a newer one: `dock
 
 ```bash
 git pull                      # the newest compose.yaml and scripts
-docker compose pull serve     # download the newest image (350 MB at most)
+docker compose pull serve     # download the newest image (45 MB at most)
 docker compose up -d serve    # replace the running container with one from the new image
 docker compose logs -f serve  # wait for "engine ready", then Ctrl+C (the server keeps running)
 ```
@@ -320,7 +320,7 @@ scripts/      weight download, end-to-end tests, benchmarks, quality evaluations
 windows/tray/ the tray app of the Windows package (Win32, C++)
 tools/        memory plan / roofline calculator, draft vocabulary builder
 micro/        microbenchmarks of the GPU (bandwidth, MMA peaks, PCIe)
-Dockerfile    the serving image (libq27.so, the server and four Python packages; 350 MB, ghcr.io/mkyt/qwen3-27b-5090)
+Dockerfile    the serving image (libq27.so, the server and three Python packages; 180 MB, ghcr.io/mkyt/qwen3-27b-5090)
 dev/          the development image (CUDA, PyTorch for the reference and the tests)
 bench/        golden prompts, draft vocabulary, test images
 docs/         architecture, decisions, configuration, benchmarks

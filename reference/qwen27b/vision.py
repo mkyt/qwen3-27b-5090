@@ -58,6 +58,17 @@ class VisionConfig:
         return self.in_channels * self.temporal_patch * self.patch * self.patch
 
 
+def patchify(rgb: torch.Tensor, mean, std, patch: int = 16, merge: int = 2, temporal: int = 2):
+    """The image processor's pixel_values [gh * gw, 3 * temporal * patch * patch] fp32 of a resized image
+    (rgb [H, W, 3] uint8, H and W multiples of patch * merge): (x - mean) / std per channel in fp32, patches in
+    2x2 merge-block order, each repeated over the temporal patch."""
+    x = (rgb.permute(2, 0, 1).float() - torch.tensor(mean)[:, None, None]) / torch.tensor(std)[:, None, None]
+    c, gh, gw = x.shape[0], x.shape[1] // patch, x.shape[2] // patch
+    x = x.reshape(c, gh // merge, merge, patch, gw // merge, merge, patch).permute(1, 4, 2, 5, 0, 3, 6)
+    x = x[:, :, :, :, :, None].expand(*x.shape[:5], temporal, patch, patch)
+    return x.reshape(gh * gw, c * temporal * patch * patch).contiguous()
+
+
 def patch_coords(gh: int, gw: int, merge: int = 2):
     """(row, col) of each patch in the processor's order: 2x2 merge blocks row-major, row-major inside."""
     idx = torch.arange(gh * gw)
