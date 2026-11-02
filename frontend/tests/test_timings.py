@@ -1,7 +1,6 @@
 """llama.cpp's `timings` object of the API server (no engine needed)."""
 
 import pathlib
-import queue
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -64,23 +63,43 @@ def test_verify_step_counts_drafts_as_llama_cpp():
 
 
 def stopped(*msgs):
-    gen = generation(10, 0, 1, None)
-    gen.q = queue.Queue()
-    for m in msgs:
-        gen.q.put(m)
+    gen = generation(10, 0, 0, None)
+    gen.prefilled, gen.toks, gen.first_tok = None, [], None
+    for m in msgs:  # (as Generation.__iter__ takes them)
+        if m[0] == "prefilled":
+            gen.prefilled, gen.toks = m[1], gen.toks[-1:]
+        else:
+            gen.tokens += m[2]
+            gen.toks.append((m[1], m[2]))
+            gen.first_tok = gen.first_tok or m[1]
+    gen._stopped_timings()
     return gen
 
 
-def test_await_done_reads_the_report_after_a_stop_string():
-    gen = stopped(("tok", "r", [1, 2]), ("done", "r", "cancelled", done()))
-    gen._await_done()
-    assert gen.timings == done() and gen.tokens == 1  # (what the cancel overtook is not part of the answer)
+def prefilled(drafted=0, accepted=0, block=7):
+    return ("prefilled", {"ttft": 0.2, "prefill_s": 0.1, "computed_tokens": 900, "drafted": drafted,
+                          "draft_accepted": accepted, "draft_block": block})
 
 
-def test_await_done_gives_up_without_a_report():
-    gen = stopped(("error", "r", "failed", 500))
-    gen._await_done()
-    assert gen.timing_fields == {}
-    gen = stopped()
-    gen._await_done(timeout=0.01)
-    assert gen.timing_fields == {}
+def test_stop_string_timings_without_waiting_for_the_engine():
+    # the prefill's token at t=10.0, then verify steps of 3 and 1 tokens: 2 steps, 14 drafts, 2 accepted
+    gen = stopped(("tok", 10.0, 1), prefilled(), ("tok", 10.5, 3), ("tok", 11.0, 1))
+    assert dict(gen.timings, total=round(gen.timings["total"], 9)) == {
+        "computed_tokens": 900, "prefill_s": 0.1, "ttft": 0.2, "total": 1.2, "drafted": 14, "draft_accepted": 2}
+    t = gen.timing_fields["timings"]
+    assert t["predicted_n"] == 5 and abs(t["predicted_ms"] - 1000) < 1e-6
+
+
+def test_stop_string_timings_after_a_preemption():
+    # preempted after 2 steps: the new prefill's info has the drafts so far, the decode time runs from the first token
+    gen = stopped(("tok", 10.0, 1), prefilled(), ("tok", 10.5, 3), ("tok", 11.0, 1),
+                  ("tok", 13.0, 1), prefilled(drafted=14, accepted=2), ("tok", 13.5, 2))
+    assert (gen.timings["drafted"], gen.timings["draft_accepted"]) == (21, 3)
+    assert abs(gen.timings["total"] - 3.7) < 1e-9
+
+
+def test_stop_string_timings_without_drafts_or_reports():
+    gen = stopped(("tok", 10.0, 1), prefilled(block=0), ("tok", 10.5, 1))
+    assert (gen.timings["drafted"], gen.timings["draft_accepted"]) == (0, 0)
+    assert "draft_n" not in gen.timing_fields["timings"]
+    assert stopped(("tok", 10.0, 1)).timing_fields == {}  # (no "prefilled" yet)

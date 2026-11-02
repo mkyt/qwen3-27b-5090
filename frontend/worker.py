@@ -24,6 +24,7 @@ starts. A request waiting for room rather than one suspended later keeps its tur
 
 Messages (pickled tuples). In: ("submit", rid, request), ("cancel", rid), ("config", changes, n), ("stop",).
 Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids]), ("done", rid, finish, info),
+("prefilled", rid, info: the prompt side of "done"'s info after a prefill ends, for a request a stop string ends),
 ("error", rid, message), ("metrics", dict), ("config", settings, n: the change answered, or None),
 ("memory", the pools: once after "ready"), ("stats", snapshot: the requests, KV pool and device memory, every STATS_INTERVAL s while busy),
 ("event", rid, kind, text: an admission wait, a preemption, an engine error).
@@ -482,6 +483,12 @@ class Scheduler:
         s.last_run = time.time()
         s.prefill_s += dt
         s.computed += s.fed - fed0
+        if s.phase == DECODE and not s.dead:
+            # The server answers a request its stop string ends with this and its own count of the steps after
+            # it, rather than wait for "done", which follows the cancel only after the engine's next step.
+            self.send("prefilled", s.rid, {"ttft": s.first_token - s.arrival, "prefill_s": s.prefill_s,
+                                           "computed_tokens": s.computed, "drafted": s.drafted,
+                                           "draft_accepted": s.draft_accepted, "draft_block": self.draft_block if self.spec else 0})
         self.m["q27:prefill_tokens_total"] += s.fed - fed0
         if any(o.phase == DECODE for o in self.alive if o is not s):
             self.credit += self.share * dt

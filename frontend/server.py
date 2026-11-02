@@ -467,6 +467,9 @@ class Generation:
         self.prompt_tokens = len(ids)
         self.finish, self.stop_sequence, self.cached = None, None, 0
         self.tokens, self.timings = 0, None
+        # For _stopped_timings: the last "prefilled" info, (arrival time, tokens) of the prefill's "tok" and those after
+        # it, and when the first token came.
+        self.prefilled, self.toks, self.first_tok = None, [], None
         req = dict(ids=ids, max_new=max_new, images=images, **sampling)
         self.rid, self.q = server.engine.submit(req)
         self.detok = Detokenizer(server.tok, server.tok_lock)
@@ -513,8 +516,12 @@ class Generation:
                 kind = msg[0]
                 if kind == "start":
                     self.cached = msg[2]["cached"]
+                elif kind == "prefilled":
+                    self.prefilled, self.toks = msg[2], self.toks[-1:]  # (it follows the prefill's token)
                 elif kind == "tok":
                     self.tokens += len(msg[2])
+                    self.toks.append((time.time(), len(msg[2])))
+                    self.first_tok = self.first_tok or self.toks[-1][0]
                     self.text += self.detok.add(msg[2])
                     piece = self._release()
                     if piece:
@@ -533,24 +540,25 @@ class Generation:
                     raise ApiError(msg[3] if len(msg) > 3 else 500, msg[2],
                                    "overloaded_error" if (len(msg) > 3 and msg[3] == 503) else "api_error")
             if self.timings is None:
-                self._await_done()
+                self._stopped_timings()
         except BaseException:
             if self.finish is None:
                 self.cancel()
             raise
 
-    def _await_done(self, timeout=1.0):
-        """A stop string ended the request: the engine's report follows the cancel, within a turn."""
-        end = time.time() + timeout
-        try:
-            while (left := end - time.time()) > 0:
-                msg = self.q.get(timeout=left)
-                if msg[0] == "done":
-                    self.timings = msg[3]
-                if msg[0] in ("done", "error"):
-                    return
-        except queue.Empty:
-            pass
+    def _stopped_timings(self):
+        """A stop string ended the request. The engine's report follows the cancel only after its next step, which
+        the response does not wait for (a closed-loop client would lose that much decode time per request): the
+        timings are the prompt side the engine sent after the prefill ("prefilled") and the verify steps since then,
+        one "tok" each, timed here."""
+        p, toks = self.prefilled, self.toks
+        if p is None or not toks:
+            return
+        steps = len(toks) - 1  # (the first is the prefill's token)
+        accepted = sum(n for _, n in toks[1:]) - steps if p["draft_block"] else 0  # (a step: accepted drafts + 1)
+        self.timings = {"computed_tokens": p["computed_tokens"], "prefill_s": p["prefill_s"], "ttft": p["ttft"],
+                        "total": p["ttft"] + toks[-1][0] - self.first_tok,
+                        "drafted": p["drafted"] + steps * p["draft_block"], "draft_accepted": p["draft_accepted"] + accepted}
 
     @property
     def usage(self):
