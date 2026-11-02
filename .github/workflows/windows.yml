@@ -1,6 +1,7 @@
-# Builds the Windows package (scripts/windows/package.ps1): qwen3-27b-5090-windows-x64.zip, a workflow artifact from
-# main when the code in it changes, and an asset of the GitHub Release of a v* tag (with its SHA-256). The runner has no
-# GPU: the engine compiles, the GPU tests are run before tagging.
+# Builds the Windows package (scripts/windows/package.ps1): qwen3-27b-5090-<version>-windows-x64.zip (v0.3.0 on a tag,
+# v0.3.0-3-g6767c0c on main after it), a workflow artifact from main when the code in it changes, and an asset of the
+# GitHub Release of a v* tag (with its SHA-256). The runner has no GPU: the engine compiles, the GPU tests are run
+# before tagging.
 name: windows
 
 on:
@@ -29,7 +30,17 @@ jobs:
   package:
     runs-on: windows-2025
     steps:
+      # (all the history and tags: git describe names the version)
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Version
+        shell: pwsh
+        run: |
+          $v = git describe --tags --match "v*" --always
+          if ($LASTEXITCODE -or -not $v) { throw "git describe failed" }
+          "VERSION=$v" >> $env:GITHUB_ENV
+          "PKG=qwen3-27b-5090-$v-windows-x64" >> $env:GITHUB_ENV
       # (pip downloads the package's wheels; it does not need to be the package's Python)
       - uses: actions/setup-python@v7
         with:
@@ -59,7 +70,7 @@ jobs:
           set "CUDA_PATH=%CUDA_DIR%"
           set "CUDACXX=%CUDA_DIR%\bin\nvcc.exe"
           set "PATH=%CUDA_DIR%\bin;%PATH%"
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\package.ps1 -Python python || exit /b 1
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\package.ps1 -Python python -Version %VERSION% || exit /b 1
       # The package loads: q27.dll through ctypes in its own Python, with the C API all there (no GPU needed).
       - name: Smoke test
         shell: pwsh
@@ -70,13 +81,13 @@ jobs:
           if ($LASTEXITCODE) { throw "smoke test failed" }
           $tray = Start-Process "dist\qwen3-27b-5090-windows-x64\qwen3-27b-tray.exe" -ArgumentList "--check" -Wait -PassThru
           if ($tray.ExitCode) { throw "the tray app does not find the package ($($tray.ExitCode))" }
-          (Get-FileHash -Algorithm SHA256 dist\qwen3-27b-5090-windows-x64.zip).Hash.ToLower() + "  qwen3-27b-5090-windows-x64.zip" | Set-Content -Encoding ascii dist\qwen3-27b-5090-windows-x64.zip.sha256
+          (Get-FileHash -Algorithm SHA256 "dist\$env:PKG.zip").Hash.ToLower() + "  $env:PKG.zip" | Set-Content -Encoding ascii "dist\$env:PKG.zip.sha256"
       - uses: actions/upload-artifact@v7
         with:
-          name: qwen3-27b-5090-windows-x64
+          name: ${{ env.PKG }}
           path: |
-            dist/qwen3-27b-5090-windows-x64.zip
-            dist/qwen3-27b-5090-windows-x64.zip.sha256
+            dist/${{ env.PKG }}.zip
+            dist/${{ env.PKG }}.zip.sha256
           retention-days: 30
       - name: Release asset
         if: startsWith(github.ref, 'refs/tags/v')
@@ -86,4 +97,4 @@ jobs:
         run: |
           gh release view $env:GITHUB_REF_NAME 2>$null
           if ($LASTEXITCODE) { gh release create $env:GITHUB_REF_NAME --verify-tag --generate-notes }
-          gh release upload $env:GITHUB_REF_NAME dist\qwen3-27b-5090-windows-x64.zip dist\qwen3-27b-5090-windows-x64.zip.sha256 --clobber
+          gh release upload $env:GITHUB_REF_NAME "dist\$env:PKG.zip" "dist\$env:PKG.zip.sha256" --clobber

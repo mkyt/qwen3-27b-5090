@@ -169,9 +169,9 @@ weights stay ([docs/configuration.md](docs/configuration.md#updating)).
 
 The same engine and server also run on Windows itself, without WSL2 or Docker, and as fast: decode measured
 326.6 / 1,393 tok/s (one / eight requests) natively against 325.4 / 1,386 under WSL2 on the same day, and the output
-is bit-identical to Linux on the golden set. The package, `qwen3-27b-5090-windows-x64.zip` (44 MB, attached to the
-[releases](https://github.com/mkyt/qwen3-27b-5090/releases) from the first versioned one; `scripts/windows/package.ps1`
-builds it from a checkout), holds `q27.dll`, the embeddable Python from python.org with the server's packages, and
+is bit-identical to Linux on the golden set. The package, `qwen3-27b-5090-<version>-windows-x64.zip` (44 MB,
+attached to the [releases](https://github.com/mkyt/qwen3-27b-5090/releases) from the first versioned one;
+`scripts/windows/package.ps1` builds it from a checkout), holds `q27.dll`, the embeddable Python from python.org with the server's packages, and
 the tray app `qwen3-27b-tray.exe` and `start.cmd`. It needs no VC++ redistributable, CUDA toolkit or administrator rights.
 
 Unzip it anywhere and run `qwen3-27b-tray.exe`: an icon appears in the notification area, its color and tooltip show

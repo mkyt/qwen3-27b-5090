@@ -1,21 +1,28 @@
 <#
-Builds the Windows package dist\qwen3-27b-5090-windows-x64.zip: q27.dll, the embeddable Python (python.org) with the
+Builds the Windows package dist\qwen3-27b-5090-<version>-windows-x64.zip: q27.dll, the embeddable Python (python.org) with the
 server's packages, the server, the tray app (windows\tray) and start.cmd (scripts\windows\start.cmd). Like the serving image, it holds no compiler,
-CUDA toolkit or PyTorch: the GPU driver is the only requirement.
+CUDA toolkit or PyTorch: the GPU driver is the only requirement. The version in the zip's name is that of
+`git describe --tags --match v*` (v0.3.0 on a tag, v0.3.0-3-g6767c0c after it) unless -Version gives one; the folder
+in the zip has none, so a new zip unzips over the folder of the previous one.
 
 Run on Windows in a shell with MSVC and the CUDA toolkit (vcvars64.bat, then CUDA_PATH and CUDACXX), CMake and Ninja
 (those of Visual Studio do), and a CPython with pip, whose pip downloads the wheels for the package's Python:
-    powershell -ExecutionPolicy Bypass -File scripts\windows\package.ps1 [-Python python] [-PythonVersion 3.14.10]
+    powershell -ExecutionPolicy Bypass -File scripts\windows\package.ps1 [-Python python] [-PythonVersion 3.14.10] [-Version v0.3.0]
 #>
 param(
   [string]$Python = "python",
   [string]$PythonVersion = "3.14.10",
+  [string]$Version = "",
   [string]$Out = "dist"
 )
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $root
 $name = "qwen3-27b-5090-windows-x64"
+if (-not $Version) {
+  $Version = git describe --tags --match "v*" --always
+  if ($LASTEXITCODE -or -not $Version) { throw "git describe failed (give -Version)" }
+}
 $dst = Join-Path $Out $name
 $ver = $PythonVersion.Split(".")
 $tag = $ver[0] + $ver[1]
@@ -65,7 +72,7 @@ Copy-Item LICENSE $dst
 Copy-Item scripts\windows\start.cmd, scripts\windows\settings.example.ini $dst
 Copy-Item windows\tray\build\qwen3-27b-tray.exe $dst
 
-$zip = Join-Path $Out "$name.zip"
+$zip = Join-Path $Out "qwen3-27b-5090-$Version-windows-x64.zip"
 if (Test-Path $zip) { Remove-Item $zip }
 # (Windows' bsdtar, by its path: Git's GNU tar may come first in PATH and makes no zip. A zip with forward
 # slashes, unlike Compress-Archive in PowerShell 5.1.)

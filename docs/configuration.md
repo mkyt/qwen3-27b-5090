@@ -391,7 +391,8 @@ path if the folder moved.
 ### Updating
 
 Quit the tray app, delete `python\` and `app\` (files of the old version must not stay among the new ones), and unzip the
-new package over the folder. `settings.ini`, the weights and the log stay.
+new package over the folder (the zip's name has the version, the folder in it does not). `settings.ini`, the weights
+and the log stay.
 
 ## Development switches
 
