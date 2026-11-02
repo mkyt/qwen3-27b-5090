@@ -40,6 +40,7 @@ constexpr UINT WM_APP_EXITED = WM_APP + 3;   // the thread that runs the server 
 constexpr UINT WM_APP_AGAIN = WM_APP + 4;    // another start of the app
 constexpr UINT WM_APP_SETTINGS = WM_APP + 5; // an answer for the settings window
 
+// (update.ps1 quits the tray of its package with WM_COMMAND ID_QUIT to WINDOW_CLASS: change both together)
 enum MenuId { ID_STATUS = 1, ID_TOGGLE, ID_UI, ID_LOG, ID_LOGON, ID_QUIT, ID_LOG_FOLDER, ID_SETTINGS };
 
 constexpr DWORD POLL_MS = 2000;
