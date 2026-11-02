@@ -86,7 +86,7 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 - A recent NVIDIA driver for CUDA 13 (tested with 617.42), and one of:
   - **Linux or WSL2** with Docker and the NVIDIA Container Toolkit, or
   - **Windows** (64-bit, native): nothing else, the [Windows package](#windows-native) brings its own Python.
-- About 25 GB of disk for the weights; 180 MB for the serving image (a 45 MB download) or 44 MB for the Windows package (the development
+- About 25 GB of disk for the weights; 180 MB for the serving image (a 45 MB download) or 28 MB for the Windows package (the development
   image, for the tests and benchmarks, is 20 GB). At least 16 GB of host RAM: the engine pins about 8 GB (the
   embedding table, the prefix cache, the vision tower).
 - To download the weights on Linux: Python 3.10+ (standard library only) or [uv](https://docs.astral.sh/uv/) for
@@ -169,7 +169,7 @@ settings and the weights stay ([docs/configuration.md](docs/configuration.md#upd
 
 The same engine and server also run on Windows itself, without WSL2 or Docker, and as fast: decode measured
 326.6 / 1,393 tok/s (one / eight requests) natively against 325.4 / 1,386 under WSL2 on the same day, and the output
-is bit-identical to Linux on the golden set. The package, `qwen3-27b-5090-<version>-windows-x64.zip` (44 MB,
+is bit-identical to Linux on the golden set. The package, `qwen3-27b-5090-<version>-windows-x64.zip` (28 MB,
 attached to the [releases](https://github.com/mkyt/qwen3-27b-5090/releases) from the first versioned one;
 `scripts/windows/package.ps1` builds it from a checkout), holds `q27.dll`, the embeddable Python from python.org with the server's packages, and
 the tray app `qwen3-27b-tray.exe`, `start.cmd` and `update.cmd`. It needs no VC++ redistributable, CUDA toolkit or administrator rights.
