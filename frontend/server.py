@@ -809,9 +809,14 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as e:
             return self._error(400, f"bad JSON: {e}")
         path = self.path.split("?")[0].rstrip("/")
-        if DUMP_DIR:  # (debug: the requests as clients send them)
-            name = f"{time.strftime('%H%M%S')}-{time.time_ns() % 10**9:09d}{path.replace('/', '_')}.json"
-            (pathlib.Path(DUMP_DIR) / name).write_text(json.dumps(body, ensure_ascii=False, indent=1), encoding="utf-8")
+        if DUMP_DIR:  # (debug: the requests as clients send them; a failed write does not fail the request)
+            name = f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}{path.replace('/', '_')}.json"
+            try:
+                d = pathlib.Path(DUMP_DIR)
+                d.mkdir(parents=True, exist_ok=True)
+                (d / name).write_text(json.dumps(body, ensure_ascii=False, indent=1), encoding="utf-8")
+            except OSError as e:
+                log(f"API_DUMP_DIR: {e}")
         routes = {"/v1/chat/completions": self.chat, "/v1/completions": self.completions, "/v1/responses": self.responses_api,
                   "/v1/messages": self.messages, "/v1/messages/count_tokens": self.count_tokens,
                   "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency,

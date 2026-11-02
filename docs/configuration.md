@@ -125,7 +125,7 @@ everywhere above.
 | `ENGINE_AUTOSTART` | 1 | 0: the server starts with the engine stopped (no VRAM in use). Requests get 503 until it is started at `/ui` or with `POST /admin/engine`; with `ENGINE_IDLE_UNLOAD_S` above 0, the first generation request loads it instead |
 | `ENGINE_IDLE_UNLOAD_S` | 0 | Seconds without a request after which the engine stops and frees its VRAM; the next generation request loads it again and waits for it ([Unloading when idle](#unloading-when-idle)). 0: off, the engine stays ready |
 | `STATS_SAMPLE_S` | 1 | Seconds between the GPU samples (NVML: utilization, power, clocks, temperature, memory) of the stats page `/ui`; the last 10 minutes are kept. 0: no sampling (the page still shows requests, VRAM and the log) |
-| `API_DUMP_DIR` | unset | Debugging: write the body of every POST to this directory (to see what a client sends; may contain personal data) |
+| `API_DUMP_DIR` | unset | Debugging: write the body of every POST to this directory, created if missing (to see what a client sends; may contain personal data). In the Windows package, a full path in `settings.ini` |
 
 ### Attention numerics
 
