@@ -678,6 +678,12 @@ def stops_of(value):
     return [value] if isinstance(value, str) else [s for s in value if isinstance(s, str)]
 
 
+class HTTPServer(ThreadingHTTPServer):
+    # The default listen backlog of 5 refuses a burst of 6+ connections at once on Windows (llama-swap 502, issue #7).
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class Handler(BaseHTTPRequestHandler):
     srv: Server = None
     protocol_version = "HTTP/1.1"
@@ -1396,8 +1402,7 @@ def main():
                           idle_unload=max(0.0, args.idle_unload))
     HUB.engine_idle = engine.idle_state
     Handler.srv = Server(engine, tok, args.max_tokens, launch)
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.daemon_threads = True
+    server = HTTPServer((args.host, args.port), Handler)
 
     def stop(*_):
         log("stopping")
