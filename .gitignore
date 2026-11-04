@@ -2,6 +2,8 @@
 /hf
 # Build outputs, scratch files and local weight copies
 /cache/
+# `nix build .#x` output symlink (recreated on each build)
+result
 /engine/build/
 /windows/tray/build/
 __pycache__/
