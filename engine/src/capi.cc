@@ -199,13 +199,26 @@ int q27_forward_topk(void* m, const int32_t* ids, int n, int k, int32_t* out_ids
   });
 }
 
-// Runs n tokens and samples the next one (temperature <= 0: greedy; presence / frequency: Model::forward_sample).
+// Runs n tokens and samples the next one (temperature <= 0: greedy; presence / frequency: Model::forward_sample;
+// logprobs >= 0: q27_logprobs answers with that many top entries).
 int q27_forward_sample(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
-                       float min_p, float presence, float frequency, int32_t* out) {
+                       float min_p, float presence, float frequency, int logprobs, int32_t* out) {
   return guard([&] {
     *out = static_cast<Model*>(m)->forward_sample(ids, n, temperature, top_k, top_p, uniform, min_p, presence,
-                                                  frequency);
+                                                  frequency, logprobs);
   });
+}
+
+// Logprobs of the tokens the last q27_forward_sample / q27_spec_begin / q27_spec_step returned (lane -1), or of
+// lane z of the last q27_spec_step_lanes (Model::logprobs): returns their count (0: none were asked for), lp[8] the
+// tokens' own, top_id / top_lp [8][20] the top entries (the first *top of each are set: as many as were asked for).
+int q27_logprobs(void* m, int lane, int* top, float* lp, int32_t* top_id, float* top_lp) {
+  const Logprobs& l = static_cast<Model*>(m)->logprobs(lane);
+  *top = l.n ? l.top : 0;
+  memcpy(lp, l.lp, sizeof l.lp);
+  memcpy(top_id, l.top_id, sizeof l.top_id);
+  memcpy(top_lp, l.top_lp, sizeof l.top_lp);
+  return l.n;
 }
 
 // The running sequence's output so far as its penalty counts (Model::penalty_init).
@@ -215,10 +228,13 @@ int q27_penalty_init(void* m, const int32_t* ids, int n) {
 
 // Speculative decoding: prompt + first token, then steps of 1..8 new tokens (out[8]; returns the count).
 int q27_spec_begin(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, uint64_t seed,
-                   float uniform, int max_new, float min_p, float presence, float frequency, int32_t* out) {
+                   float uniform, int max_new, float min_p, float presence, float frequency, int logprobs,
+                   int32_t* out) {
   return guard([&] {
+    Q27_CHECK(logprobs <= kMaxTopLogprobs, "spec_begin: at most 20 top logprobs");
     SpecSampling smp{temperature, top_k, top_p, 0};  // paths 0: Q27_SPEC_PATHS
     smp.min_p = min_p, smp.pen.presence = presence, smp.pen.frequency = frequency;
+    smp.logprobs = logprobs < 0 ? -1 : logprobs;
     *out = static_cast<Model*>(m)->spec_begin(ids, n, smp, seed, uniform, max_new);
   });
 }

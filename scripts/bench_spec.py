@@ -57,7 +57,7 @@ def chat_ids(tok, text):
 
 
 def run_spec(eng, ids, max_tokens, temperature, top_k, top_p, seed, **more):
-    """more: min_p, presence, frequency (penalties: the counts start empty)."""
+    """more: min_p, presence, frequency (penalties: the counts start empty), logprobs."""
     t0 = time.perf_counter()
     if more.get("presence") or more.get("frequency"):
         eng.penalty_init([])
@@ -93,6 +93,7 @@ def main():
     ap.add_argument("--min-p", type=float, default=0.0)
     ap.add_argument("--presence", type=float, default=0.0, help="presence penalty")
     ap.add_argument("--frequency", type=float, default=0.0, help="frequency penalty")
+    ap.add_argument("--logprobs", type=int, default=-1, help="top logprobs per token (0..20; -1: none)")
     ap.add_argument("--prompts", default="code,json,prose")
     ap.add_argument("--check-greedy", type=int, default=0, metavar="N")
     ap.add_argument("--label", default="spec")
@@ -137,7 +138,8 @@ def main():
                 ms = []
                 for n in names:
                     eng.reset()
-                    out, steps, _, dt = run_spec(eng, ids[n], min(args.max_tokens, 400), 0.0, 1, 1.0, 0)
+                    out, steps, _, dt = run_spec(eng, ids[n], min(args.max_tokens, 400), 0.0, 1, 1.0, 0,
+                                                 **({"logprobs": args.logprobs} if args.logprobs >= 0 else {}))
                     ms.append(1000 * dt / max(steps, 1))
                 res[cfg].append(statistics.mean(ms))
                 print(f"round {r} {cfg:50s} {res[cfg][-1]:.3f} ms/step", flush=True)
@@ -177,7 +179,8 @@ def main():
             if args.profile:
                 eng.profile_dump()  # drop the prompt
             out, steps, ttft, dt = run_spec(eng, ids, args.max_tokens, args.temperature, args.top_k, args.top_p, rep,
-                                            min_p=args.min_p, presence=args.presence, frequency=args.frequency)
+                                            min_p=args.min_p, presence=args.presence, frequency=args.frequency,
+                                            logprobs=args.logprobs)
             if args.profile:
                 print(f"--- profile {name}#{rep}", file=sys.stderr, flush=True)
                 eng.profile_dump()

@@ -327,8 +327,28 @@ struct Penalty {
 // Samples one token per row from softmax(logits / temperature) restricted to top_k (1..64), min_p (the
 // tokens at least min_p times as likely as the top one) and top_p. temperature <= 0 means greedy.
 // `uniform` holds one U(0,1) number per row. pen (optional): penalties first, and the token is counted.
+// Log-probabilities of output tokens (OpenAI logprobs): the raw distribution of the row a token came from
+// (log-softmax of the logits, before the temperature, the penalties and the cuts), the token's own value and the
+// row's n most likely entries (n = the request's top_logprobs). One per step (up to 8 tokens: a speculative step).
+constexpr int kMaxTopLogprobs = 20;
+constexpr int kLogprobTokens = 8;  // (kSpecBlock)
+struct Logprobs {
+  int32_t n;    // tokens
+  int32_t top;  // top entries per token
+  float lp[kLogprobTokens];
+  int32_t top_id[kLogprobTokens][kMaxTopLogprobs];
+  float top_lp[kLogprobTokens][kMaxTopLogprobs];
+};
+// Where sample() puts the logprobs of its token (T = 1): n top entries (n < 0: none), the row's raw sorted list
+// through scratch tv / ti [kMaxTopLogprobs], the result to *out (mapped host memory).
+struct LogprobSink {
+  int n = -1;
+  float* tv = nullptr;
+  int32_t* ti = nullptr;
+  Logprobs* out = nullptr;
+};
 void sample(const float* logits, int T, int V, float temperature, int top_k, float top_p, const float* uniform,
-            int32_t* out, cudaStream_t s, float min_p = 0.f, Penalty pen = {});
+            int32_t* out, cudaStream_t s, float min_p = 0.f, Penalty pen = {}, LogprobSink lp = {});
 // counts[ids[i]] += delta for i < n (the penalty counts of a sequence's output).
 void count_tokens(uint32_t* counts, const int32_t* ids, int n, int delta, cudaStream_t s);
 

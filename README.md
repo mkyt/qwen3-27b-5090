@@ -215,7 +215,13 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
 Sampling: `temperature`, `top_k`, `top_p`, `min_p`, `presence_penalty` and `frequency_penalty` (OpenAI's, -2 to 2;
 the model card suggests `presence_penalty` 1.5 for non-thinking use), and `seed`. The penalties apply to the 64 most
 likely tokens of each step. Accepted but without effect: `response_format`, `repetition_penalty`, `tool_choice` other
-than `auto` / `none`. `n > 1` and `logprobs` are rejected.
+than `auto` / `none`. `n > 1` is rejected.
+
+Logprobs: chat completions take `logprobs: true` and `top_logprobs` (0 to 20), completions `logprobs` (0 to 20), also
+when streaming. The values are the model's raw log-probabilities (before the temperature, penalties and top-k / top-p,
+as vLLM's default `raw_logprobs`). As in vLLM, chat's `logprobs.content` covers every generated token, the reasoning
+and tool calls included; tokens of a stop string that ends the text are left out. `bytes` holds a token's own UTF-8
+bytes, which can end inside a character (its `token` then shows U+FFFD). Not for the Responses and Anthropic APIs.
 
 ## Configuration
 

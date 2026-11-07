@@ -23,7 +23,7 @@ for each number of requests decoding together). With nothing running, the first 
 starts. A request waiting for room rather than one suspended later keeps its turn and its KV.
 
 Messages (pickled tuples). In: ("submit", rid, request), ("cancel", rid), ("config", changes, n), ("stop",).
-Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids]), ("done", rid, finish, info),
+Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids][, logprobs: per id (logprob, [(id, logprob)])]), ("done", rid, finish, info),
 ("prefilled", rid, info: the prompt side of "done"'s info after a prefill ends, for a request a stop string ends),
 ("error", rid, message[, HTTP status: 400 for an image that cannot be decoded]), ("metrics", dict), ("config", settings, n: the change answered, or None),
 ("memory", the pools: once after "ready"), ("stats", snapshot: the requests, KV pool and device memory, every STATS_INTERVAL s while busy),
@@ -70,6 +70,7 @@ class Seq:
         self.temperature, self.top_k, self.top_p = req["temperature"], req["top_k"], req["top_p"]
         self.min_p = req.get("min_p", 0.0)
         self.presence, self.frequency = req.get("presence_penalty", 0.0), req.get("frequency_penalty", 0.0)
+        self.logprobs = req.get("logprobs", -1)  # top logprobs per token (0..20; -1: none)
         self.rng = random.Random(req.get("seed"))
         self.images = req.get("images")  # (spans [(start, gh, gw)], [(encoded image, resized size, norm)]) or None
         self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), started on arrival
@@ -516,7 +517,7 @@ class Scheduler:
             seed = s.rng.getrandbits(63)
             if s.presence or s.frequency:
                 self.engine.penalty_init(s.out)  # (after a preemption the earlier output counts too)
-            extra = dict(min_p=s.min_p, presence=s.presence, frequency=s.frequency)
+            extra = dict(min_p=s.min_p, presence=s.presence, frequency=s.frequency, logprobs=s.logprobs)
             if self.spec:
                 tok = self.engine.spec_begin(rest, s.temperature, s.top_k, s.top_p, seed=seed,
                                              uniform=s.rng.random(), max_new=left, **extra)
@@ -526,7 +527,7 @@ class Scheduler:
             s.phase = DECODE
             if s.first_token is None:
                 s.first_token = time.time()
-            self.emit(s, [tok])
+            self.emit(s, [tok], self.engine.logprobs() if s.logprobs >= 0 else None)
         dt = time.time() - t0
         s.last_run = time.time()
         s.prefill_s += dt
@@ -558,10 +559,11 @@ class Scheduler:
                 self.count_draft(s, toks)
             else:
                 toks = [self.engine.forward_sample([s.out[-1]], s.temperature, s.top_k, s.top_p, s.rng.random(),
-                                                   min_p=s.min_p, presence=s.presence, frequency=s.frequency)]
+                                                   min_p=s.min_p, presence=s.presence, frequency=s.frequency,
+                                                   logprobs=s.logprobs)]
             step = max(step * 0.8, time.time() - ts)
             s.steps += 1
-            self.emit(s, toks)
+            self.emit(s, toks, self.engine.logprobs() if s.logprobs >= 0 else None)
             if last:
                 break
             self.report()
@@ -585,10 +587,10 @@ class Scheduler:
             new = self.engine.spec_step_lanes(lanes)
             self.m["q27:spec_verify_calls_total"] += len(seqs)
             self.m["q27:batched_steps_total"] += 1
-            for s, toks in zip(seqs, new):
+            for z, (s, toks) in enumerate(zip(seqs, new)):
                 s.steps += 1
                 self.count_draft(s, toks)
-                self.emit(s, toks)
+                self.emit(s, toks, self.engine.logprobs(z) if s.logprobs >= 0 else None)
             if any(s.dead for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0):
                 break
         dt = time.time() - t0
@@ -604,8 +606,9 @@ class Scheduler:
         s.drafted += self.draft_block
         s.draft_accepted += len(toks) - 1
 
-    def emit(self, s, toks):
-        """Tokens of a step: stops at EOS and at max_new; the rest goes to the server."""
+    def emit(self, s, toks, logprobs=None):
+        """Tokens of a step: stops at EOS and at max_new; the rest goes to the server (with their logprobs, when the
+        request asked for them)."""
         out, finish = [], None
         for t in toks:
             if t in self.eos:
@@ -618,7 +621,10 @@ class Scheduler:
         if out:
             s.out += out
             self.m["q27:generation_tokens_total"] += len(out)
-            self.send("tok", s.rid, out)
+            if logprobs is None:
+                self.send("tok", s.rid, out)
+            else:
+                self.send("tok", s.rid, out, logprobs[:len(out)])
         if finish:
             self.finish(s, finish)
 

@@ -221,6 +221,14 @@ from an anchor and verifies all 8 rows in one forward of the target.
   highest logits of a row (one small kernel that re-sorts them), and top-k is taken from those. Requests without
   penalties run the same kernels and graphs as before (`scripts/penalty_test.py` checks the tokens against a host
   implementation and speculative against plain decoding).
+- **Logprobs from the verify rows.** With `logprobs` the step also writes, for each token it outputs, the raw
+  log-softmax of the row the token came from (before the temperature, penalties and cuts, as vLLM's default) and
+  that row's top entries (up to 20). A small kernel after the accept step computes the log-sum-exp of the accepted
+  rows only; the top entries come from the sorted lists the sampler takes anyway (a longer list when more are asked
+  for, or a copy made before the penalties re-sort them). The results go to mapped host memory by step parity like
+  the tokens, so pipelined steps do not overwrite them. Requests without logprobs run the same kernels and graphs
+  (`scripts/logprobs_test.py` checks the values against the decode path's log-softmax and speculative against plain
+  decoding, `scripts/batch_test.py check --logprobs` batched lanes against each alone).
 - **Stops at EOS and `max_tokens`.** A step never commits tokens past them, so the end of a generation is a clean
   prefix of the next turn's prompt ([§9](#9-prefix-cache)).
 

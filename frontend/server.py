@@ -458,7 +458,11 @@ class Detokenizer:
 class Generation:
     """One request on the engine. Iterating yields text pieces; afterwards finish ("stop" | "length"),
     stop_sequence, usage and timings are set. Stop strings are matched here (text that may still start one
-    is held back) and cancel the request; so does a closed connection (ClientGone)."""
+    is held back) and cancel the request; so does a closed connection (ClientGone).
+
+    With sampling["logprobs"] >= 0 the engine sends each token's logprobs: take_logprobs() gives those of the tokens
+    whose text has been yielded so far (a token is out with the piece its text starts in; the tokens of a stop string
+    that cut the text are not), as (text offset, token id, logprob, [(id, logprob)])."""
 
     def __init__(self, server, ids, max_new, sampling, stop=(), images=None, sock=None, keepalive=None):
         self.server, self.sock, self.keepalive = server, sock, keepalive
@@ -470,15 +474,26 @@ class Generation:
         # it, and when the first token came.
         self.prefilled, self.toks, self.first_tok = None, [], None
         req = dict(ids=ids, max_new=max_new, images=images, **sampling)
+        self.sampling_logprobs = sampling.get("logprobs", -1)
         self.rid, self.q = server.engine.submit(req)
         self.detok = Detokenizer(server.tok, server.tok_lock)
         self.text, self.sent = "", 0
+        self.lps, self.lp_taken, self.lp_all = [], 0, False
 
     def cancel(self):
         self.server.engine.cancel(self.rid)
 
+    def take_logprobs(self):
+        """The logprobs of the tokens whose text is out since the last call (see the class)."""
+        n = self.lp_taken
+        while n < len(self.lps) and (self.lp_all or self.lps[n][0] < self.sent):
+            n += 1
+        out, self.lp_taken = self.lps[self.lp_taken:n], n
+        return out
+
     def _release(self, final=False):
         """The text that is safe to send (not possibly the start of a stop string)."""
+        cut = False
         if self.stops:
             start = max(0, self.sent - max(map(len, self.stops)))
             hits = [(self.text.find(s, start), s) for s in self.stops]
@@ -488,10 +503,12 @@ class Generation:
                 self.text = self.text[:i]
                 self.finish, self.stop_sequence = "stop", s
                 self.cancel()
-                final = True
+                final = cut = True
             safe = len(self.text) if final else len(self.text) - (max(map(len, self.stops)) - 1)
         else:
             safe = len(self.text)
+        if final and not cut:
+            self.lp_all = True
         if safe > self.sent:
             piece, self.sent = self.text[self.sent:safe], safe
             return piece
@@ -521,7 +538,12 @@ class Generation:
                     self.tokens += len(msg[2])
                     self.toks.append((time.time(), len(msg[2])))
                     self.first_tok = self.first_tok or self.toks[-1][0]
-                    self.text += self.detok.add(msg[2])
+                    if len(msg) > 3:  # (per token: where its text starts)
+                        for t, (lp, top) in zip(msg[2], msg[3]):
+                            self.lps.append((len(self.text), t, lp, top))
+                            self.text += self.detok.add([t])
+                    else:
+                        self.text += self.detok.add(msg[2])
                     piece = self._release()
                     if piece:
                         last = time.time()
@@ -663,6 +685,9 @@ class Server:
         return left
 
 
+MAX_LOGPROBS = 20  # (kMaxTopLogprobs)
+
+
 def sampling_of(body, top_k_key="top_k"):
     temp = body.get("temperature")
     top_p = body.get("top_p")
@@ -680,6 +705,44 @@ def sampling_of(body, top_k_key="top_k"):
     return {"temperature": float(DEFAULTS["temperature"] if temp is None else temp),
             "top_k": int(DEFAULTS["top_k"] if top_k is None else top_k) if (top_k is None or top_k >= 0) else 0,
             "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": body.get("seed"), **extra}
+
+
+def logprobs_of(body, chat):
+    """Top logprobs per token the request asks for (-1: none): chat's logprobs (bool) + top_logprobs, completions'
+    logprobs (the number of top entries). 0..20, as vLLM's default max_logprobs."""
+    lp, top = body.get("logprobs"), body.get("top_logprobs") if chat else None
+    if chat:
+        if lp is not None and not isinstance(lp, bool):
+            raise ApiError(400, "logprobs: true or false is required")
+        if top is not None and (isinstance(top, bool) or not isinstance(top, int)):
+            raise ApiError(400, "top_logprobs: an integer is required")
+        if top and not lp:
+            raise ApiError(400, "top_logprobs requires logprobs: true")
+        n = (top or 0) if lp else -1
+    else:
+        if lp is not None and (isinstance(lp, bool) or not isinstance(lp, int)):
+            raise ApiError(400, "logprobs: an integer is required")
+        n = -1 if lp is None else lp
+    given = top if chat else lp
+    if given is not None and not 0 <= given <= MAX_LOGPROBS:
+        raise ApiError(400, f"{'top_logprobs' if chat else 'logprobs'}: must be in [0, {MAX_LOGPROBS}], got {given}")
+    return n
+
+
+def chat_logprobs(tok, entries):
+    """OpenAI chat's logprobs.content entries."""
+    def item(i, lp):
+        text, b = tok.piece(i)
+        return {"token": text, "logprob": max(lp, -9999.0), "bytes": list(b)}
+    return [dict(item(i, lp), top_logprobs=[item(j, v) for j, v in top]) for _, i, lp, top in entries]
+
+
+def completion_logprobs(tok, entries, offset=0):
+    """OpenAI completions' logprobs object (text_offset: offset + where each token's text starts)."""
+    return {"tokens": [tok.piece(i)[0] for _, i, _, _ in entries],
+            "token_logprobs": [max(lp, -9999.0) for _, _, lp, _ in entries],
+            "top_logprobs": [{tok.piece(j)[0]: max(v, -9999.0) for j, v in top} for _, _, _, top in entries],
+            "text_offset": [offset + o for o, _, _, _ in entries]}
 
 
 def stops_of(value):
@@ -864,8 +927,7 @@ class Handler(BaseHTTPRequestHandler):
     def chat(self, body):
         if (body.get("n") or 1) != 1:
             raise ApiError(400, "n > 1 is not supported")
-        if body.get("logprobs") or body.get("top_logprobs"):
-            raise ApiError(400, "logprobs are not supported")
+        nlp = logprobs_of(body, chat=True)
         kwargs = template_kwargs(body, self.srv.thinking_default)
         thinking = kwargs.get("enable_thinking", True) is not False
         tools = body.get("tools") or None
@@ -878,8 +940,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "max_tokens must be positive")
         stream = bool(body.get("stream"))
         keep = (lambda: self._keepalive_comment()) if stream else None
-        gen = Generation(self.srv, ids, min(max_new, left), sampling_of(body), stops_of(body.get("stop")), images,
-                         self.connection, keep)
+        gen = Generation(self.srv, ids, min(max_new, left), dict(sampling_of(body), logprobs=nlp),
+                         stops_of(body.get("stop")), images, self.connection, keep)
         parser = OutputParser(thinking, tools if parse_tools else None)
         rid, created, model = f"chatcmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
         single_call = body.get("parallel_tool_calls") is False
@@ -893,6 +955,7 @@ class Handler(BaseHTTPRequestHandler):
             (reasoning if kind == "reasoning" else content if kind == "content" else calls).append(v)
         if single_call:
             calls = calls[:1]
+        lps = {"content": chat_logprobs(self.srv.tok, gen.take_logprobs())} if nlp >= 0 else None
         msg = {"role": "assistant", "content": "".join(content) or (None if calls else "")}
         if thinking:
             msg["reasoning_content"] = msg["reasoning"] = "".join(reasoning)
@@ -901,7 +964,7 @@ class Handler(BaseHTTPRequestHandler):
             msg["tool_calls"] = [openai_call(c) for c in calls]
             finish = "tool_calls"
         self._json(200, {"id": rid, "object": "chat.completion", "created": created, "model": model,
-                         "choices": [{"index": 0, "message": msg, "finish_reason": finish, "logprobs": None,
+                         "choices": [{"index": 0, "message": msg, "finish_reason": finish, "logprobs": lps,
                                       "stop_reason": gen.stop_sequence}],
                          "usage": gen.usage, **gen.timing_fields})
 
@@ -912,15 +975,24 @@ class Handler(BaseHTTPRequestHandler):
     def _chat_stream(self, gen, parser, rid, created, model, body, single_call):
         self._sse_start()
 
+        want_lp = gen.sampling_logprobs >= 0
+        pending = []  # logprobs of the text out of the generation the chunks have not carried yet
+
         def chunk(delta, finish=None, **extra):
+            lps = None
+            if want_lp:
+                pending.extend(gen.take_logprobs())
+                lps = {"content": chat_logprobs(self.srv.tok, pending)} if pending else None
+                pending.clear()
             self._sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
-                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": None}], **extra})
+                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": lps}], **extra})
 
         chunk({"role": "assistant", "content": ""})
         ncalls = 0
 
         def send(events):
             nonlocal ncalls
+            sent = False
             for kind, v in events:
                 if kind == "reasoning":
                     chunk({"reasoning_content": v, "reasoning": v})
@@ -929,6 +1001,13 @@ class Handler(BaseHTTPRequestHandler):
                 elif not (single_call and ncalls):
                     chunk({"tool_calls": [openai_call(v, ncalls)]})
                     ncalls += 1
+                else:
+                    continue
+                sent = True
+            if want_lp and not sent:  # (text the parser holds or drops: its tokens still go out, as vLLM sends them)
+                pending.extend(gen.take_logprobs())
+                if pending:
+                    chunk({})
 
         try:
             for piece in gen:
@@ -960,17 +1039,19 @@ class Handler(BaseHTTPRequestHandler):
         left = self.srv.limit(len(ids))
         max_new = min(body.get("max_tokens") or 16, left)
         stream = bool(body.get("stream"))
-        gen = Generation(self.srv, ids, max_new, sampling_of(body), stops_of(body.get("stop")), None,
-                         self.connection, (lambda: self._keepalive_comment()) if stream else None)
+        nlp = logprobs_of(body, chat=False)
+        gen = Generation(self.srv, ids, max_new, dict(sampling_of(body), logprobs=nlp), stops_of(body.get("stop")),
+                         None, self.connection, (lambda: self._keepalive_comment()) if stream else None)
         rid, created, model = f"cmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
+        lps = (lambda: completion_logprobs(self.srv.tok, gen.take_logprobs())) if nlp >= 0 else (lambda: None)
         if stream:
             self._sse_start()
             for piece in gen:
                 self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
-                           "choices": [{"index": 0, "text": piece, "finish_reason": None, "logprobs": None}]})
+                           "choices": [{"index": 0, "text": piece, "finish_reason": None, "logprobs": lps()}]})
             include_usage = (body.get("stream_options") or {}).get("include_usage")
             self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
-                       "choices": [{"index": 0, "text": "", "finish_reason": gen.finish, "logprobs": None}],
+                       "choices": [{"index": 0, "text": "", "finish_reason": gen.finish, "logprobs": lps()}],
                        **({} if include_usage else gen.timing_fields)})
             if include_usage:
                 self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
@@ -980,7 +1061,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         text = "".join(gen)
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": model,
-                         "choices": [{"index": 0, "text": text, "finish_reason": gen.finish, "logprobs": None}],
+                         "choices": [{"index": 0, "text": text, "finish_reason": gen.finish, "logprobs": lps()}],
                          "usage": gen.usage, **gen.timing_fields})
 
     # ------------------------------------------------------------ Anthropic messages

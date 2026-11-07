@@ -125,3 +125,16 @@ def test_images_match_transformers(model):
             np.testing.assert_allclose(pv, a["pixel_values"], rtol=0, atol=1e-6)
             assert np.abs(pv - b["pixel_values"]).max() <= 2 / 127.5 + 1e-6
             assert (pv != b["pixel_values"]).mean() < 0.01
+
+
+def test_token_pieces(toks):
+    """A token's bytes (logprobs) joined are the text's UTF-8, also where a token ends inside a character; a token
+    alone reads as transformers decodes it."""
+    ours, hf = toks
+    text = "\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8\u3001 \U0001f98a \u3068 code:\n\tdef f(x): return x ** 2  # ok\n<think>\n</think>"
+    ids = ours.encode(text)
+    assert b"".join(ours.piece(i)[1] for i in ids) == text.encode("utf-8")
+    assert any(len(ours.piece(i)[1].decode("utf-8", errors="ignore")) < len(ours.piece(i)[0]) or
+               "�" in ours.piece(i)[0] for i in ids)  # (some token ends inside a character)
+    for i in ids:
+        assert ours.piece(i)[0] == hf.decode([i])

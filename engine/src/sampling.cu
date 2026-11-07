@@ -259,13 +259,14 @@ __device__ int pick(const float* p, int n, float mass, float u, const int32_t* i
 // L: the merged list's length (k, or 64 with penalties); k: the sampler's top-k.
 __global__ void __launch_bounds__(32) merge_sample_kernel(const Pick* cand, int nseg, int L, int k, float temperature,
                                                           float top_p, float min_p, Penalty pen, const float* uniform,
-                                                          int32_t* out) {
+                                                          int32_t* out, LogprobSink lp) {
   pdl_trigger();
   pdl_wait();
   const int row = blockIdx.x, lane = threadIdx.x;
   __shared__ float sv[kMaxK];
   __shared__ int si[kMaxK];
   merge_lists(cand + int64_t(row) * nseg * L, nseg, L, sv, si);
+  if (lane < lp.n) lp.tv[lane] = sv[lane], lp.ti[lane] = si[lane];  // (the raw list, before the penalties)
   if (pen.counts) penalize_list(sv, si, L, pen, nullptr, 0);
   if (lane != 0) return;
   int tok = si[0];
@@ -458,18 +459,23 @@ __global__ void spec_advance_kernel(int32_t* pos, const int32_t* ncommit, int32_
 
 // Block (r, z): row r of lane z (node r of trees[z]).
 __global__ void __launch_bounds__(32) penalize_rows_kernel(float* tv, int32_t* ti, int ld, int rows, PenaltyLanes pl,
-                                                           const SpecTree* trees) {
+                                                           const SpecTree* trees, float* raw_v, int32_t* raw_i) {
   pdl_trigger();
   pdl_wait();
   const int r = blockIdx.x, z = blockIdx.y, lane = threadIdx.x;
   const Penalty& pen = pl.pen[z];
   const SpecTree& tr = trees[z];
-  if (!pen.counts || r >= tr.n) return;
+  if (r >= tr.n) return;
+  float* v = tv + int64_t(z * rows + r) * ld;
+  int32_t* id = ti + int64_t(z * rows + r) * ld;
+  if (raw_v && lane < kMaxTopLogprobs) {
+    const int64_t o = int64_t(z * rows + r) * kMaxTopLogprobs + lane;
+    raw_v[o] = v[lane], raw_i[o] = id[lane];
+  }
+  if (!pen.counts) return;
   __shared__ float sv[kMaxK];
   __shared__ int si[kMaxK];
   __shared__ int32_t path[kSpecBlock];
-  float* v = tv + int64_t(z * rows + r) * ld;
-  int32_t* id = ti + int64_t(z * rows + r) * ld;
   for (int i = lane; i < kMaxK; i += 32) sv[i] = v[i], si[i] = id[i];
   const int d = tr.depth[r];
   if (lane < d) path[lane] = tr.tok[tr.path[r][lane + 1]];
@@ -491,6 +497,51 @@ __global__ void count_out_kernel(uint32_t* counts, const SpecOut* so, int delta)
   if (int(threadIdx.x) < so->n) atomicAdd(counts + so->tok[threadIdx.x], uint32_t(delta));
 }
 
+// Block-wide: the logprobs of token tok in row x (V logits) and the row's top n (tv / ti: its raw sorted list) into
+// entry i of out. One pass of an online log-sum-exp.
+__device__ void logprob_row(const float* x, int V, int tok, const float* tv, const int32_t* ti, int n, Logprobs* out,
+                            int i) {
+  float m = -INFINITY, s = 0.f;
+  for (int j = threadIdx.x; j < V; j += blockDim.x) {
+    const float v = x[j];
+    if (v > m) s = s * expf(m - v) + 1.f, m = v;
+    else s += expf(v - m);
+  }
+  const float mx = block_best(Pick{m, int(threadIdx.x)}).v;
+  const float lse = mx + logf(block_sum(m == -INFINITY ? 0.f : s * expf(m - mx)));
+  if (threadIdx.x == 0) out->lp[i] = x[tok] - lse;
+  if (int(threadIdx.x) < n) out->top_id[i][threadIdx.x] = ti[threadIdx.x], out->top_lp[i][threadIdx.x] = tv[threadIdx.x] - lse;
+}
+
+// sample() with logprobs: the token of row 0 (*tok) and the raw list merge_sample_kernel kept.
+__global__ void __launch_bounds__(kThreads) sample_logprobs_kernel(const float* logits, int V, const int32_t* tok,
+                                                                   LogprobSink lp) {
+  pdl_trigger();
+  pdl_wait();
+  if (threadIdx.x == 0) lp.out->n = 1, lp.out->top = lp.n;
+  logprob_row(logits, V, *tok, lp.tv, lp.ti, lp.n, lp.out, 0);
+}
+
+// Block (i, z): output token i of lane z (see spec_logprobs).
+__global__ void __launch_bounds__(kThreads) spec_logprobs_kernel(const float* logits, int V, const float* tv,
+                                                                 const int32_t* ti, int ld, int rows, LogprobLanes ln,
+                                                                 const SpecTree* trees, const int32_t* cpath,
+                                                                 const int32_t* ncommit, const int32_t* ids,
+                                                                 Logprobs* out, const int32_t* par) {
+  pdl_trigger();
+  pdl_wait();
+  const int i = blockIdx.x, z = blockIdx.y, n = lane_sel(ln.n, z);
+  if (n < 0) return;
+  const int nc = ncommit[z];
+  Logprobs* o = out + 2 * z + par[z];
+  if (i == 0 && threadIdx.x == 0) o->n = nc, o->top = n;
+  if (i >= nc) return;
+  const int32_t* cp = cpath + kSpecBlock * z;
+  const int64_t row = int64_t(z) * rows + cp[i];
+  const int tok = i + 1 < nc ? trees[z].tok[cp[i + 1]] : ids[kSpecBlock * z];
+  logprob_row(logits + row * V, V, tok, tv + row * ld, ti + row * ld, n, o, i);
+}
+
 Pick* g_cand = nullptr;  // candidate lists, kSampleMaxRows rows (allocated on the first, eager call)
 constexpr int kSampleMaxRows = std::max(kTreeMax, kMaxBatchRows);  // (a tree, or a batched step)
 
@@ -504,17 +555,20 @@ void logsoftmax_topk(const float* logits, int T, int V, int k, int32_t* ids, flo
 }
 
 void sample(const float* logits, int T, int V, float temperature, int top_k, float top_p, const float* uniform,
-            int32_t* out, cudaStream_t s, float min_p, Penalty pen) {
+            int32_t* out, cudaStream_t s, float min_p, Penalty pen, LogprobSink lp) {
   if (top_k <= 0 || top_k > kMaxK) top_k = kMaxK;  // candidates are capped at 64
   if (T == 0) return;
+  Q27_CHECK(lp.n < 0 || (T == 1 && lp.n <= kMaxTopLogprobs && lp.tv && lp.ti && lp.out), "sample: logprobs out of range");
   const int k = temperature <= 0.f ? 1 : top_k;
-  const int L = pen.counts ? kMaxK : k;  // (penalties pick the top k from the 64 highest logits)
+  // (penalties pick the top k from the 64 highest logits; the longer list's first k are the same)
+  const int L = pen.counts ? kMaxK : std::max(k, lp.n);
   const int nseg = int(ceil_div(V, kSeg));
   Q27_CHECK(nseg <= 32 * kMaxLists && T <= kSampleMaxRows, "sample: vocabulary or rows out of range");
   if (!g_cand) Q27_CUDA(cudaMalloc(&g_cand, sizeof(Pick) * kSampleMaxRows * 32 * kMaxLists * kMaxK));
   launch_pdl(topk_segments_kernel, dim3(nseg, T), dim3(32), 0, s, logits, V, L, g_cand);
   launch_pdl(merge_sample_kernel, dim3(T), dim3(32), 0, s, static_cast<const Pick*>(g_cand), nseg, L, k, temperature,
-             top_p, min_p, pen, uniform, out);
+             top_p, min_p, pen, uniform, out, lp);
+  if (lp.n >= 0) launch_pdl(sample_logprobs_kernel, dim3(1), dim3(kThreads), 0, s, logits, V, out, lp);
 }
 
 void count_tokens(uint32_t* counts, const int32_t* ids, int n, int delta, cudaStream_t s) {
@@ -544,9 +598,19 @@ void spec_accept(int32_t* ids, int32_t* block_ids, const float* tv, const int32_
 }
 
 void penalize_rows(float* tv, int32_t* ti, int ld, int rows, int n, const PenaltyLanes& pl, const SpecTree* trees,
-                   cudaStream_t s) {
+                   cudaStream_t s, float* raw_v, int32_t* raw_i) {
   Q27_CHECK(ld == kMaxK && rows <= kTreeMax && n >= 1 && n <= kMaxLanes, "penalize_rows: out of range");
-  launch_pdl(penalize_rows_kernel, dim3(rows, n), dim3(32), 0, s, tv, ti, ld, rows, pl, trees);
+  launch_pdl(penalize_rows_kernel, dim3(rows, n), dim3(32), 0, s, tv, ti, ld, rows, pl, trees, raw_v, raw_i);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void spec_logprobs(int n, const float* logits, int V, const float* tv, const int32_t* ti, int ld, int rows,
+                   const LogprobLanes& ln, const SpecTree* trees, const int32_t* cpath, const int32_t* ncommit,
+                   const int32_t* ids, Logprobs* out, const int32_t* par, cudaStream_t s) {
+  Q27_CHECK(n >= 1 && n <= kMaxLanes, "spec_logprobs: 1..8 lanes");
+  for (int z = 0; z < n; z++) Q27_CHECK(ln.n[z] <= std::min(ld, kMaxTopLogprobs), "spec_logprobs: top entries out of range");
+  launch_pdl(spec_logprobs_kernel, dim3(kSpecBlock, n), dim3(kThreads), 0, s, logits, V, tv, ti, ld, rows, ln, trees,
+             cpath, ncommit, ids, out, par);
   Q27_CUDA(cudaGetLastError());
 }
 

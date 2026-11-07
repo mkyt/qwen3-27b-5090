@@ -17,6 +17,7 @@ document (the longest golden prompt, repeated and rotated per sequence so no two
     docker compose --profile dev run --rm dev python scripts/batch_test.py check
     docker compose --profile dev run --rm dev python scripts/batch_test.py check --seqs 8
     docker compose --profile dev run --rm dev python scripts/batch_test.py check --penalties   # min_p, presence / frequency
+    docker compose --profile dev run --rm dev python scripts/batch_test.py check --logprobs    # and logprobs (some lanes)
     docker compose --profile dev run --rm dev python scripts/batch_test.py bench --steps 200
     docker compose --profile dev run --rm dev python scripts/batch_test.py bench --ctx 32768 --max-tokens 262144
 """
@@ -42,10 +43,10 @@ NAMES = ["code", "json", "prose", "ja"]
 
 
 def begin(eng, rest, smp, seed, uniform=0.5, prior=()):
-    """spec_begin with smp = (temperature, top_k, top_p[, min_p, presence, frequency]); prior: the output so far
-    (the penalty counts)."""
+    """spec_begin with smp = (temperature, top_k, top_p[, min_p, presence, frequency[, logprobs]]); prior: the output
+    so far (the penalty counts)."""
     t, k, p, *more = smp
-    extra = dict(zip(("min_p", "presence", "frequency"), more))
+    extra = dict(zip(("min_p", "presence", "frequency", "logprobs"), more))
     if extra.get("presence") or extra.get("frequency"):
         eng.penalty_init(list(prior))
     return eng.spec_begin(rest, t, k, p, seed=seed, uniform=uniform, **extra)
@@ -57,18 +58,44 @@ def start(eng, ids, smp, seed):
     return begin(eng, ids, smp, seed, random.Random(seed).random())
 
 
-def solo(eng, ids, smp, seed, n):
+def solo(eng, ids, smp, seed, n, lps=None):
     out = [start(eng, ids, smp, seed)]
+    if lps is not None:
+        lps += eng.logprobs()
     while len(out) < n:
         out += eng.spec_step(ahead=False)
+        if lps is not None:
+            lps += eng.logprobs()
     eng.reset()
     return out[:n]
+
+
+def lp_diff(ref, out, n):
+    """The largest difference of the tokens' logprobs and their top entries' (by id; an entry missing from the other
+    list counts when it is not a near tie at its end) over the first n tokens; None when one has fewer."""
+    if len(ref) < n or len(out) < n:
+        return None
+    worst = 0.0
+    for (a, ta), (b, tb) in zip(ref[:n], out[:n]):
+        worst = max(worst, abs(a - b))
+        da, db = dict(ta), dict(tb)
+        if len(da) != len(db):
+            return float("inf")
+        floor = min([*da.values(), *db.values()], default=0.0)
+        for x in da.keys() | db.keys():
+            if x in da and x in db:
+                worst = max(worst, abs(da[x] - db[x]))
+            elif max(da.get(x, floor), db.get(x, floor)) - floor > 1e-3:
+                worst = float("inf")
+    return worst
 
 
 SAMPLINGS = [(0.0, 1, 1.0), (1.0, 20, 0.95), (0.0, 20, 1.0), (0.7, 40, 0.9)]
 # --penalties: min_p and presence / frequency penalties on three of the four (and greedy with penalties).
 PENALTIES = [(0.0, 1, 1.0, 0.0, 1.5, 0.5), (1.0, 20, 0.95, 0.05, 1.5, 0.0), (0.7, 20, 0.8, 0.0, 0.0, 0.0),
              (0.6, 40, 0.9, 0.1, 0.5, 1.0)]
+# --logprobs: the penalties' samplings with logprobs (5, none, 20, 0 top entries).
+LOGPROBS = [smp + (n,) for smp, n in zip(PENALTIES, (5, -1, 20, 0))]
 
 
 def make_cases(tok, n, seed0, samplings=SAMPLINGS):
@@ -81,18 +108,21 @@ def case_name(i):
 
 
 def check(eng, tok, args):
-    cases = make_cases(tok, args.seqs, 100, PENALTIES if args.penalties else SAMPLINGS)
+    cases = make_cases(tok, args.seqs, 100, LOGPROBS if args.logprobs else PENALTIES if args.penalties else SAMPLINGS)
     t0 = time.time()
-    refs = [solo(eng, ids, smp, seed, args.gen) for ids, smp, seed in cases]
+    ref_lps = [[] for _ in cases]
+    refs = [solo(eng, ids, smp, seed, args.gen, ref_lps[i]) for i, (ids, smp, seed) in enumerate(cases)]
     print(f"solo runs {time.time() - t0:.1f} s", flush=True)
     rng = random.Random(args.seed)
     outs = [[] for _ in cases]
+    lps = [[] for _ in cases]
     where = {}  # sequence -> None (running) or its parking area
     for i, (ids, smp, seed) in enumerate(cases):
         if i > 0:
             run = next(j for j, a in where.items() if a is None)
             where[run] = eng.seq_park()
         outs[i].append(start(eng, ids, smp, seed))
+        lps[i] += eng.logprobs()
         where[i] = None
     batched = singles = 0
     while any(len(o) < args.gen for o in outs):
@@ -100,8 +130,9 @@ def check(eng, tok, args):
         if len(live) >= 2 and rng.random() < 0.85:
             lanes = rng.sample(live, rng.randint(2, len(live)))
             new = eng.spec_step_lanes([where[i] for i in lanes])
-            for i, t in zip(lanes, new):
+            for z, (i, t) in enumerate(zip(lanes, new)):
                 outs[i] += t
+                lps[i] += eng.logprobs(z)
             batched += 1
         else:
             i = rng.choice(live)
@@ -111,14 +142,24 @@ def check(eng, tok, args):
                 eng.seq_swap(a)
                 where[run], where[i] = a, None
             outs[i] += eng.spec_step(ahead=rng.random() < 0.5)
+            lps[i] += eng.logprobs()
             singles += 1
     ok = True
     for i, (ref, out) in enumerate(zip(refs, outs)):
         out = out[:args.gen]
         diff = next((k for k, (a, b) in enumerate(zip(ref, out)) if a != b), None)
         ok &= diff is None
+        lp_note = ""
+        if args.logprobs:
+            want = cases[i][1][6] >= 0
+            d = lp_diff(ref_lps[i], lps[i], args.gen) if want else (0.0 if not ref_lps[i] and not lps[i] else None)
+            good = d is not None and d <= args.lp_tol
+            ok &= good
+            lp_note = (f", logprobs {'off' if not want else f'max diff {d:.2e}' if d is not None else 'missing'}"
+                       + ("" if good else " FAIL"))
         print(f"{'ok  ' if diff is None else 'FAIL'} {case_name(i)} {cases[i][1]}: {args.gen} tokens"
-              + ("" if diff is None else f", differs at {diff}: {ref[diff:diff + 8]} vs {out[diff:diff + 8]}"), flush=True)
+              + ("" if diff is None else f", differs at {diff}: {ref[diff:diff + 8]} vs {out[diff:diff + 8]}") + lp_note,
+              flush=True)
     print(f"{batched} batched steps, {singles} single steps", flush=True)
     for i, a in where.items():
         if a is not None:
@@ -257,6 +298,8 @@ def main():
     ap.add_argument("--seqs", type=int, default=4, help="check / kvfull: sequences (2..8)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--penalties", action="store_true", help="check / kvfull: samplings with min_p and penalties")
+    ap.add_argument("--logprobs", action="store_true", help="check: the penalties' samplings with logprobs (some lanes)")
+    ap.add_argument("--lp-tol", type=float, default=2e-3, help="check --logprobs: largest logprob difference")
     ap.add_argument("--steps", type=int, default=200, help="bench: steps per run")
     ap.add_argument("--lanes", default="1,2,3,4")
     ap.add_argument("--reps", type=int, default=2)

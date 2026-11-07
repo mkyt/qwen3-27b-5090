@@ -136,6 +136,9 @@ Model::Model(const Options& opt) : opt_(opt) {
   size_t o_logits = f32("logits", L * kVocab);
   size_t o_tki = act_.add("topk ids", L * 64 * 4), o_tkl = f32("topk logp", L * 64);
   size_t o_u = f32("uniform", 1), o_sm = act_.add("sampled", 4);
+  const int lp_rows = spec ? std::max(kTreeMax, kLaneRows * lanes) : 1;  // (the verify rows, see o_tv)
+  size_t o_lpv = f32("logprobs top values", lp_rows * kMaxTopLogprobs);
+  size_t o_lpi = act_.add("logprobs top ids", size_t(lp_rows) * kMaxTopLogprobs * 4);
   size_t o_sws = act_.add("skinny workspace", kSkinnyWsBytes);
   size_t o_aws = act_.add("attention workspace", kAttnDecodeWsBytes);
   // NVFP4 KV (P7-8): the prefill attention reads the context rounded to E4M3 from here: V only (1 KiB / token)
@@ -286,6 +289,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   logits_ = act_.at<float>(o_logits);
   topk_ids_ = act_.at<int32_t>(o_tki), topk_logp_ = act_.at<float>(o_tkl);
   uniform_ = act_.at<float>(o_u), sampled_ = act_.at<int32_t>(o_sm);
+  lpv_ = act_.at<float>(o_lpv), lpi_ = act_.at<int32_t>(o_lpi);
   skinny_ws_ = act_.at<void>(o_sws);
   attn_ws_ = act_.at<void>(o_aws);
   if (fa_stage_bytes_) fa_stage_ = act_.at<void>(o_fst);
@@ -349,6 +353,8 @@ Model::Model(const Options& opt) : opt_(opt) {
 
   Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&host_io_), sizeof(HostIo), cudaHostAllocMapped));
   Q27_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_io_dev_), host_io_, 0));
+  Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&lp_), (kLpSample + 1) * sizeof(Logprobs), cudaHostAllocMapped));
+  Q27_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void**>(&lp_dev_), lp_, 0));
   configure();
 }
 
@@ -392,6 +398,7 @@ Model::~Model() {
   if (spec_out_) cudaFreeHost(spec_out_);
   if (b_out_) cudaFreeHost(b_out_);
   if (host_io_) cudaFreeHost(host_io_);
+  if (lp_) cudaFreeHost(lp_);
   if (cs_) cudaStreamSynchronize(cs_), cudaStreamDestroy(cs_);
   for (char* m : slot_mem_)
     if (m) cudaFreeHost(m);
@@ -1203,22 +1210,29 @@ void Model::forward_topk(const int32_t* ids, int n, int k,
 }
 
 int32_t Model::forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
-                              float min_p, float presence, float frequency) {
+                              float min_p, float presence, float frequency, int logprobs) {
   Q27_CHECK(n > 0, "forward_sample: no tokens");
+  Q27_CHECK(logprobs <= kMaxTopLogprobs, "forward_sample: at most 20 top logprobs");
   spec_flush();
   const Penalty pen{presence != 0.f || frequency != 0.f ? pen_ : nullptr, presence, frequency};
-  if (n == 1 && graphs_ && !cap_) return decode_step(ids[0], temperature, top_k, top_p, uniform, min_p, pen);
+  const LogprobSink lp{logprobs < 0 ? -1 : logprobs, lpv_, lpi_, lp_dev_ + kLpSample};
+  auto done = [&](int32_t tok) {
+    last_lp_[0].n = 0;
+    if (lp.n >= 0) last_lp_[0] = lp_[kLpSample];
+    return tok;
+  };
+  if (n == 1 && graphs_ && !cap_) return done(decode_step(ids[0], temperature, top_k, top_p, uniform, min_p, pen, lp));
   int last = 0;
   prompt_chunks(ids, n, n, false, &last);
   logits(x_ + size_t(last) * kHidden, 1);
   Q27_CUDA(cudaMemcpyAsync(uniform_, &uniform, 4, cudaMemcpyHostToDevice, s_));
   mark("sample");
-  sample(logits_, 1, kVocab, temperature, top_k, top_p, uniform_, sampled_, s_, min_p, pen);
+  sample(logits_, 1, kVocab, temperature, top_k, top_p, uniform_, sampled_, s_, min_p, pen, lp);
   int32_t out = 0;
   Q27_CUDA(cudaMemcpyAsync(&out, sampled_, 4, cudaMemcpyDeviceToHost, s_));
   Q27_CUDA(cudaStreamSynchronize(s_));
   profile_collect();
-  return out;
+  return done(out);
 }
 
 void Model::penalty_init(const int32_t* ids, int n) {
@@ -1294,7 +1308,7 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
 // runs eagerly (one-time initialization of the kernels); the second captures the graph, which is
 // reused while the sampling parameters stay the same.
 int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform, float min_p,
-                           Penalty pen) {
+                           Penalty pen, LogprobSink lp) {
   Q27_CHECK(pos_ + 1 <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   ensure_pages(pos_ + 1);
   seq_ids_.push_back(id);
@@ -1313,11 +1327,11 @@ int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p
     chunk(decode_memcpy_ ? ids_ : &io->id, 1);
     logits(x_, 1);
     sample(logits_, 1, kVocab, temperature, top_k, top_p, decode_memcpy_ ? uniform_ : &io->uniform,
-           decode_memcpy_ ? sampled_ : &io->out, s_, min_p, pen);
+           decode_memcpy_ ? sampled_ : &io->out, s_, min_p, pen, lp);
   };
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
-  const GraphKey key{temperature, top_k, top_p, min_p, pen.presence, pen.frequency};
+  const GraphKey key{temperature, top_k, top_p, min_p, pen.presence, pen.frequency, lp.n};
   if (!graph_warm_) {
     body();
     graph_warm_ = true;
@@ -1425,7 +1439,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   int32_t first = 0;
   try {
     first = forward_sample(ids, n, smp.temperature, smp.top_k, smp.top_p, uniform, smp.min_p, smp.pen.presence,
-                           smp.pen.frequency);
+                           smp.pen.frequency, smp.logprobs);
   } catch (...) {
     cap_ = nullptr;
     throw;
@@ -1474,15 +1488,25 @@ void Model::spec_body(const SpecSampling& sampling) {
   logits(x_, W);
   mark("accept");
   const int k = smp.temperature <= 0.f ? 1 : std::clamp(smp.top_k <= 0 ? 64 : smp.top_k, 1, 64);
-  const int ld = smp.pen.counts ? 64 : k;  // (penalties: the top k of the 64 highest logits after them)
+  // (penalties: the top k of the 64 highest logits after them; logprobs: the raw top entries, so a longer list,
+  // whose first k are the same)
+  const bool lp = smp.logprobs >= 0;
+  const int ld = smp.pen.counts ? 64 : std::max(k, smp.logprobs);
   topk_rows(logits_, W, kVocab, ld, tv_, ti_, s_);
   if (smp.pen.counts) {
     PenaltyLanes pl;
     pl.pen[0] = smp.pen;
-    penalize_rows(tv_, ti_, ld, W, 1, pl, tree_, s_);
+    penalize_rows(tv_, ti_, ld, W, 1, pl, tree_, s_, lp ? lpv_ : nullptr, lpi_);
   }
   spec_accept(ids_ver_, block_ids_, tv_, ti_, k, ld, draft_->choice, smp, rng_, ncommit_, cpath_, spec_out_dev_,
               hist_, pos_dev_, s_, par_, budget_);
+  if (lp) {
+    LogprobLanes ln;
+    ln.n[0] = smp.logprobs;
+    const bool raw = smp.pen.counts != nullptr;  // (the lists before the penalties)
+    spec_logprobs(1, logits_, kVocab, raw ? lpv_ : tv_, raw ? lpi_ : ti_, raw ? kMaxTopLogprobs : ld, W, ln, tree_,
+                  cpath_, ncommit_, ids_ver_, lp_dev_, par_, s_);
+  }
   if (smp.paths > 1) kv_commit(kv_layers_dev_, kAttnLayers, opt_.kv_type, page_table_, pos_dev_, ncommit_, cpath_, s_);
   mark("draft context");
   draft_->append_ctx(cap_buf_, kSpecBlock, pos_dev_, 0, ncommit_, skinny_ws_, kSkinnyWsBytes, nullptr, 0, s_, cpath_);
@@ -1581,6 +1605,11 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   stat_steps_++, stat_lookup_ += so.src, stat_tokens_ += n;
   set_sbuf(sbuf_host_ ^ 1);  // (the device flipped it in spec_advance)
   for (int i = 0; i < n; i++) out[i] = so.tok[i];
+  last_lp_[0].n = 0;
+  if (smp.logprobs >= 0) {
+    last_lp_[0] = lp_[slot];
+    Q27_CHECK(last_lp_[0].n == n, "spec_step: logprobs of another step");
+  }
   pos_ += n;
   // Fed by this step: the previous last token and the accepted drafts (the new last one is not).
   seq_ids_.push_back(spec_last_);
@@ -1955,11 +1984,17 @@ void Model::batch_body(int n) {
   PenaltyLanes pl;
   for (int z = 0; z < n; z++) pl.pen[z] = bacc_.smp[z].pen;
   const bool pen = std::any_of(pl.pen, pl.pen + n, [](const Penalty& p) { return p.counts != nullptr; });
-  if (pen) K = 64;  // (see spec_body)
+  LogprobLanes ln;
+  for (int z = 0; z < n; z++) ln.n[z] = bacc_.smp[z].logprobs < 0 ? -1 : bacc_.smp[z].logprobs;
+  const bool lp = std::any_of(ln.n, ln.n + n, [](int v) { return v >= 0; });
+  K = pen ? 64 : std::max(K, *std::max_element(ln.n, ln.n + n));  // (see spec_body)
   topk_rows(logits_, W, kVocab, K, tv_, ti_, s_);
-  if (pen) penalize_rows(tv_, ti_, K, kSpecBlock, n, pl, b_tree_, s_);
+  if (pen) penalize_rows(tv_, ti_, K, kSpecBlock, n, pl, b_tree_, s_, lp ? lpv_ : nullptr, lpi_);
   spec_accept_lanes(n, b_ids_, b_blk_, tv_, ti_, K, bacc_, draft_->lane_cand(), b_tree_, draft_->lane_src(), b_rng_,
                     b_nc_, b_cpath_, b_out_dev_, b_pos_, b_par_, b_budget_, s_);
+  if (lp)
+    spec_logprobs(n, logits_, kVocab, pen ? lpv_ : tv_, pen ? lpi_ : ti_, pen ? kMaxTopLogprobs : K, kSpecBlock, ln,
+                  b_tree_, b_cpath_, b_nc_, b_ids_, lp_dev_ + kLpLanes, b_par_, s_);
   mark("draft context");
   draft_->append_ctx_lanes(dl, cap_buf_, b_nc_, b_cpath_, skinny_ws_, kSkinnyWsBytes, s_);
   spec_advance_lanes(n, b_pos_, b_nc_, b_par_, b_rng_, b_budget_, s_);
@@ -2027,6 +2062,11 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     int32_t* o = out + kSpecBlock * z;
     for (int i = 0; i < k; i++) o[i] = so.tok[i];
     counts[z] = k;
+    last_lp_[z].n = 0;
+    if (bacc_.smp[z].logprobs >= 0) {
+      last_lp_[z] = lp_[kLpLanes + 2 * z + bpar_];
+      Q27_CHECK(last_lp_[z].n == k, "spec_step_lanes: logprobs of another step");
+    }
     *r.pos += k;
     // Fed by this step: the previous last token and the accepted drafts (the new last one is not).
     r.ids->push_back(*r.spec_last);

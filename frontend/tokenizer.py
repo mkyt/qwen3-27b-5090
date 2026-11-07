@@ -44,6 +44,22 @@ class GenerationTag(jinja2.ext.Extension):
 _fingerprints = {}
 
 
+def _byte_decoder():
+    """GPT-2's byte-level alphabet (the ByteLevel pre-tokenizer's): character -> byte."""
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {chr(c): b for b, c in zip(bs, cs)}
+
+
+BYTE_DECODER = _byte_decoder()
+
+
 def fingerprint(path):
     r"""What gives a model directory's token ids their meaning (vocabulary, merges and added tokens of tokenizer.json)
     as a digest: the server keeps the tokenizer it started with, so it starts an engine on other weights (launch.py)
@@ -86,6 +102,8 @@ class Tokenizer:
         self.template = env.from_string(source)
         # (transformers passes its special tokens map to the template; kwargs override them)
         self.special = {k: v for k, v in config.items() if k.endswith("_token") and isinstance(v, str)}
+        self.added = set(self.tok.get_added_tokens_decoder())
+        self._pieces = {}
 
     def encode(self, text):
         return self.tok.encode(text, add_special_tokens=False).ids
@@ -95,6 +113,19 @@ class Tokenizer:
 
     def token_id(self, token):
         return self.tok.token_to_id(token)
+
+    def piece(self, i):
+        """(text, UTF-8 bytes) of token i alone (logprobs): its bytes in the byte-level vocabulary, which may end inside a
+        character (the text then has U+FFFD for it, as a decode of the token alone does); an added token's own text."""
+        got = self._pieces.get(i)
+        if got is None:
+            t = self.tok.id_to_token(i) or ""
+            if i in self.added or any(c not in BYTE_DECODER for c in t):
+                b = t.encode("utf-8")
+            else:
+                b = bytes(BYTE_DECODER[c] for c in t)
+            got = self._pieces[i] = (b.decode("utf-8", errors="replace"), b)
+        return got
 
     def render(self, messages, tools=None, add_generation_prompt=True, **kwargs):
         """The prompt text of chat messages (transformers' apply_chat_template with tokenize=False)."""

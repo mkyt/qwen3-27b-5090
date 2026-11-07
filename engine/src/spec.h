@@ -14,6 +14,7 @@ constexpr int kSpecBlock = 8;  // the draft block: the anchor and 7 drafted toke
 constexpr int kSpecSelK = 16;  // selector candidates per position
 constexpr int kTreeMax = 32;   // verify rows: nodes of the draft tree (node 0 is the anchor)
 constexpr int kTreePaths = 4;  // root-to-leaf paths (draft walks)
+static_assert(kSpecBlock == kLogprobTokens, "Logprobs holds one step's tokens");
 
 // The draft tree of a step (written by the selector, read by the verify, accept and commit kernels).
 // K walks through the selector's lattice are merged into a trie: node i has token tok[i] at depth
@@ -42,10 +43,12 @@ struct SpecSampling {
   int32_t stop[2] = {-1, -1};  // end-of-sequence ids: an accepted one ends the step as its last token (not fed)
   float min_p = 0.f;
   Penalty pen;              // presence / frequency; pen.counts is set where the step is built
+  int logprobs = -1;        // top logprobs per output token (0..20; < 0: no logprobs), see Logprobs
   bool penalized() const { return pen.presence != 0.f || pen.frequency != 0.f; }
   bool same(const SpecSampling& o) const {  // (the settings a captured step depends on)
     return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && paths == o.paths &&
-           min_p == o.min_p && pen.presence == o.pen.presence && pen.frequency == o.pen.frequency;
+           min_p == o.min_p && pen.presence == o.pen.presence && pen.frequency == o.pen.frequency &&
+           logprobs == o.logprobs;
   }
 };
 
@@ -118,8 +121,20 @@ void spec_accept(int32_t* ids, int32_t* block_ids, const float* tv, const int32_
 struct PenaltyLanes {
   Penalty pen[kMaxLanes] = {};
 };
+// raw_v / raw_i (optional, logprobs): the first kMaxTopLogprobs entries of every row of the trees (all lanes) as they
+// were before, [rows of the lanes][kMaxTopLogprobs].
 void penalize_rows(float* tv, int32_t* ti, int ld, int rows, int n, const PenaltyLanes& pl, const SpecTree* trees,
-                   cudaStream_t s);
+                   cudaStream_t s, float* raw_v = nullptr, int32_t* raw_i = nullptr);
+// Logprobs of a step's output tokens (after spec_accept, before spec_advance), lane z (n lanes; z = 0 alone) with
+// ln.n[z] top entries (< 0: none): token i < ncommit[z] came from row z * rows + cpath[8 z + i] of the logits
+// ([rows of the lanes][V]) and of the raw sorted lists tv / ti (ld entries per row, >= the top entries); it is the
+// next node's token on the path, the last one ids[8 z] (the bonus). The result goes to out[2 z + par[z]].
+struct LogprobLanes {
+  int n[kMaxLanes] = {-1, -1, -1, -1, -1, -1, -1, -1};
+};
+void spec_logprobs(int n, const float* logits, int V, const float* tv, const int32_t* ti, int ld, int rows,
+                   const LogprobLanes& ln, const SpecTree* trees, const int32_t* cpath, const int32_t* ncommit,
+                   const int32_t* ids, Logprobs* out, const int32_t* par, cudaStream_t s);
 // counts[so->tok[i]] += delta for i < so->n (a dropped step's tokens: delta -1).
 void count_out(uint32_t* counts, const SpecOut* so, int delta, cudaStream_t s);
 // Batched steps (P6-10): the sampling of each lane and the length of its top-k lists (1 when greedy).

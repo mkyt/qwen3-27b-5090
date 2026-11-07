@@ -15,7 +15,7 @@ P, I, I64, F, SZ = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float
 SIGNATURES = {
     "q27_create": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p], P),
     "q27_plan": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p, I64, I64], P),
-    "q27_spec_begin": ([P, P, I, F, I, F, ctypes.c_uint64, F, I, F, F, F, P], I),
+    "q27_spec_begin": ([P, P, I, F, I, F, ctypes.c_uint64, F, I, F, F, F, I, P], I),
     "q27_spec_step": ([P, P], I),
     "q27_spec_step2": ([P, P, I], I),
     "q27_prefill": ([P, P, I, I, I, P], I),
@@ -54,7 +54,8 @@ SIGNATURES = {
     "q27_reset": ([P], I),
     "q27_pos": ([P], I),
     "q27_forward_topk": ([P, P, I, I, P, P], I),
-    "q27_forward_sample": ([P, P, I, F, I, F, F, F, F, F, P], I),
+    "q27_forward_sample": ([P, P, I, F, I, F, F, F, F, F, I, P], I),
+    "q27_logprobs": ([P, I, P, P, P, P], I),
     "q27_penalty_init": ([P, P, I], I),
     "q27_profile_dump": ([P], I),
     "q27_configure": ([P], I),
@@ -210,15 +211,27 @@ class Engine:
         self._check(lib().q27_profile_dump(self.h), "q27_profile_dump")
 
     def forward_sample(self, ids, temperature=0.0, top_k=20, top_p=1.0, uniform=0.5, min_p=0.0, presence=0.0,
-                       frequency=0.0):
+                       frequency=0.0, logprobs=-1):
         """Runs ids and returns the sampled next token (temperature <= 0: greedy). presence / frequency:
-        OpenAI's penalties by the sequence's output counts (penalty_init)."""
+        OpenAI's penalties by the sequence's output counts (penalty_init). logprobs >= 0: the token's logprobs
+        with that many top entries are kept for logprobs()."""
         src = array.array("i", ids)
         out = ctypes.c_int32()
         self._check(lib().q27_forward_sample(self.h, src.buffer_info()[0], len(ids), temperature, top_k, top_p,
-                                             uniform, min_p, presence, frequency, ctypes.byref(out)),
+                                             uniform, min_p, presence, frequency, logprobs, ctypes.byref(out)),
                     "q27_forward_sample")
         return out.value
+
+    def logprobs(self, lane=-1):
+        """Logprobs of the tokens the last forward_sample / spec_begin / spec_step returned (lane -1), or of lane
+        `lane` of the last spec_step_lanes: per token (logprob, [(id, logprob)] of the most likely entries, as many
+        as the sampling asked for), the raw distribution (before the temperature, penalties and cuts). [] when the
+        sampling asked for none."""
+        top = ctypes.c_int()
+        lp, ids, tlp = (ctypes.c_float * 8)(), (ctypes.c_int32 * 160)(), (ctypes.c_float * 160)()
+        n = lib().q27_logprobs(self.h, lane, ctypes.byref(top), lp, ids, tlp)
+        k = top.value
+        return [(lp[i], list(zip(ids[20 * i:20 * i + k], tlp[20 * i:20 * i + k]))) for i in range(n)]
 
     def penalty_init(self, ids):
         """Sets the running sequence's penalty counts to its output so far (ids) before its first sampled
@@ -231,13 +244,13 @@ class Engine:
         return bool(lib().q27_has_draft(self.h))
 
     def spec_begin(self, ids, temperature=0.0, top_k=20, top_p=1.0, seed=0, uniform=0.5, max_new=0, min_p=0.0,
-                   presence=0.0, frequency=0.0):
+                   presence=0.0, frequency=0.0, logprobs=-1):
         """Speculative decoding: runs the prompt and returns the first token (also fills the draft context)."""
         src = array.array("i", ids)
         out = ctypes.c_int32()
         self._check(lib().q27_spec_begin(self.h, src.buffer_info()[0], len(ids), temperature, top_k, top_p,
                                          seed & (2**64 - 1), uniform, max_new, min_p, presence, frequency,
-                                         ctypes.byref(out)), "q27_spec_begin")
+                                         logprobs, ctypes.byref(out)), "q27_spec_begin")
         return out.value
 
     def spec_step(self, ahead=True):
