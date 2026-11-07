@@ -56,6 +56,10 @@ def main():
     ap.add_argument("--weights", default="nvidia", help="weight profile: nvidia | gdnfp4 | quasar | a model directory")
     args = ap.parse_args()
     os.environ.setdefault("Q27_SKINNY_EXACT", "1")
+    # Tree verification (Q27_SPEC_PATHS > 1) runs its attention on CUDA cores, decode and chains on tensor cores: a
+    # different summation order, which W4A4 carries to visibly different distributions. Both on CUDA cores here.
+    if int(os.environ.get("Q27_SPEC_PATHS", "1")) > 1:
+        os.environ.setdefault("Q27_ATTN_TC", "0")
     os.environ.setdefault("MAX_SEQS", "2")  # (a parking area)
 
     from transformers import AutoTokenizer

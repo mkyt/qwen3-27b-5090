@@ -79,6 +79,10 @@ def main():
     # and M > 1, and with W4A4 that shifts the sampled distributions measurably (e.g. P(first token 'The')
     # 0.35 vs 0.41 for the story prompt), which this test would report as a lossy sampler (2026-10-10).
     os.environ.setdefault("Q27_SKINNY_EXACT", "1")
+    # Tree verification (Q27_SPEC_PATHS > 1) runs its attention on CUDA cores, decode and chains on tensor cores: a
+    # different summation order, which W4A4 carries to visibly different distributions. Both on CUDA cores here.
+    if int(os.environ.get("Q27_SPEC_PATHS", "1")) > 1:
+        os.environ.setdefault("Q27_ATTN_TC", "0")
 
     from transformers import AutoTokenizer
 

@@ -428,7 +428,9 @@ and computes plainly.
 
   One caveat: the skinny GEMM splits K differently for one row than for several (it is faster), so a decode row
   and a verify row of the same token can differ in the last bit. Tests that compare across row counts set
-  `Q27_SKINNY_EXACT=1`; the verify rows of a step and the rows of a batch always use the same split.
+  `Q27_SKINNY_EXACT=1`; the verify rows of a step and the rows of a batch always use the same split. Likewise tree
+  verification (`Q27_SPEC_PATHS` > 1) runs its attention on CUDA cores while decode and chains use tensor cores, so
+  the tests set `Q27_ATTN_TC=0` for trees; with it, greedy trees match plain decoding and the chi-square tests pass.
 - **Speculative sampling** is tested statistically (`scripts/spec_sampling_test.py`): the token frequencies with
   and without speculation agree (chi-square tests over 2,000 samples each).
 - **Quality options** (weights, KV cache type, attention numerics) are judged on the BF16 original's distributions
