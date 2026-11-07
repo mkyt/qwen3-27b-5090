@@ -5,6 +5,9 @@ OpenAI: streamed tool calls, include_usage, stop strings, completions. Anthropic
 streaming events), thinking on / off, tool_use -> tool_result turn, stop_sequences, count_tokens, error format.
 tool_choice: a call forced (a named tool, any tool) where the model would answer in text, in the OpenAI chat,
 Anthropic and Responses forms, with thinking on and off.
+structured: response_format (json_schema with thinking on and off, json_object streamed), vLLM structured_outputs
+(choice, regex, completions), Responses text.format, Anthropic output_config.format, JSON or a tool call with tools,
+a bad schema (400), and three masked requests next to a free one giving the text each gives alone.
 Server: requests run at once give the same greedy text as one at a time (switching sequences is exact), a
 closed connection cancels its request, /v1/models and /metrics.
 
@@ -345,18 +348,93 @@ def tool_choice_tests(cl):
           st == 200 and len(calls) == 1 and calls[0]["name"] == "list_dir" and r["status"] == "completed", json.dumps(r)[:400])
 
 
+def structured_tests(cl):
+    """Prompts that would not give the format on their own: the masks make the output follow it."""
+    schema = {"type": "object", "properties": {"city": {"type": "string"}, "population": {"type": "integer"},
+                                               "landmarks": {"type": "array", "items": {"type": "string"}, "maxItems": 3}},
+              "required": ["city", "population", "landmarks"], "additionalProperties": False}
+    q = [{"role": "user", "content": "Tell me about Kyoto in two sentences."}]
+    rf = {"type": "json_schema", "json_schema": {"name": "city", "schema": schema, "strict": True}}
+
+    def fits(text):
+        try:
+            obj = json.loads(text)
+        except (TypeError, ValueError):
+            return False
+        return set(obj) == {"city", "population", "landmarks"} and isinstance(obj["population"], int)
+
+    for thinking in (False, True):
+        st, r = cl.post("/v1/chat/completions", {"messages": q, "response_format": rf, "max_tokens": 4096, "temperature": 0,
+                                                 "chat_template_kwargs": {"enable_thinking": thinking}})
+        msg = r["choices"][0]["message"] if st == 200 else {}
+        check(f"structured: openai json_schema, thinking {'on' if thinking else 'off'}",
+              st == 200 and fits(msg.get("content")) and r["choices"][0]["finish_reason"] == "stop"
+              and (bool(msg.get("reasoning_content")) == thinking), json.dumps(r)[:400])
+    ev = cl.stream("/v1/chat/completions", {"messages": q, "response_format": {"type": "json_object"}, "max_tokens": 1024,
+                                            "temperature": 0.7, "seed": 3, "chat_template_kwargs": {"enable_thinking": False}})
+    text = "".join(c["delta"].get("content") or "" for _, e in ev for c in e.get("choices", []))
+    try:
+        good = isinstance(json.loads(text), dict)
+    except ValueError:
+        good = False
+    check("structured: openai json_object, stream, sampled: a JSON object", good, text[:300])
+    q2 = [{"role": "user", "content": "Is Kyoto the capital of Japan? Explain."}]
+    st, r = cl.post("/v1/chat/completions", {"messages": q2, "structured_outputs": {"choice": ["yes", "no"]}, "max_tokens": 2048,
+                                             "temperature": 0})
+    check("structured: vllm choice", st == 200 and r["choices"][0]["message"]["content"] in ("yes", "no"), json.dumps(r)[:300])
+    st, r = cl.post("/v1/completions", {"prompt": "The date of the Meiji Restoration was", "max_tokens": 32, "temperature": 0,
+                                        "structured_outputs": {"regex": " [0-9]{4}-[0-9]{2}-[0-9]{2}"}})
+    text = r["choices"][0]["text"] if st == 200 else ""
+    check("structured: vllm regex, completions", st == 200 and len(text) == 11 and text[5] == "-" and text[8] == "-", text)
+    st, r = cl.post("/v1/responses", {"input": q[0]["content"], "max_output_tokens": 4096, "temperature": 0,
+                                      "text": {"format": {"type": "json_schema", "name": "city", "schema": schema}}})
+    out = [c["text"] for it in r.get("output", []) if it["type"] == "message" for c in it["content"]] if st == 200 else []
+    check("structured: responses text.format", st == 200 and len(out) == 1 and fits(out[0]), json.dumps(r)[:400])
+    st, r = cl.post("/v1/messages", {"model": "x", "max_tokens": 4096, "temperature": 0, "messages": q,
+                                     "output_config": {"format": {"type": "json_schema", "schema": schema}}})
+    texts = [b["text"] for b in r.get("content", []) if b["type"] == "text"] if st == 200 else []
+    check("structured: anthropic output_config.format", st == 200 and len(texts) == 1 and fits(texts[0]), json.dumps(r)[:400])
+    q3 = [{"role": "user", "content": "Read README.md and tell me what it says."}]
+    st, r = cl.post("/v1/chat/completions", {"messages": q3, "tools": TOOLS, "response_format": rf, "max_tokens": 4096,
+                                             "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}})
+    msg = r["choices"][0]["message"] if st == 200 else {}
+    check("structured: with tools, a tool call or the format",
+          st == 200 and (bool(msg.get("tool_calls")) or fits(msg.get("content"))), json.dumps(r)[:400])
+    st, r = cl.post("/v1/chat/completions", {"messages": q, "max_tokens": 8,
+                                             "response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "nonsense"}}}})
+    check("structured: a bad schema gives 400", st == 400 and "nonsense" in r["error"]["message"], str(r))
+    # Masked and free requests at once (batched steps) give the greedy text each gives alone.
+    bodies = [{"messages": q, "response_format": rf, "max_tokens": 256, "temperature": 0,
+               "chat_template_kwargs": {"enable_thinking": False}},
+              {"messages": [{"role": "user", "content": "Write a haiku about Kyoto."}], "max_tokens": 128, "temperature": 0,
+               "chat_template_kwargs": {"enable_thinking": False}},
+              {"messages": q2, "structured_outputs": {"choice": ["yes", "no"]}, "max_tokens": 64, "temperature": 0,
+               "chat_template_kwargs": {"enable_thinking": False}},
+              {"messages": [{"role": "user", "content": "List five fruits."}], "response_format": {"type": "json_object"},
+               "max_tokens": 256, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}]
+
+    def text_of(b):
+        st, r = cl.post("/v1/chat/completions", b)
+        return r["choices"][0]["message"]["content"] if st == 200 else f"error {st}"
+    alone = [text_of(b) for b in bodies]
+    with cf.ThreadPoolExecutor(len(bodies)) as ex:
+        together = list(ex.map(text_of, bodies))
+    check("structured: 3 masked + 1 free at once give the text of each alone", alone == together,
+          json.dumps([a[:80] for a in alone]) + " vs " + json.dumps([t[:80] for t in together]))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", default="http://127.0.0.1:8000")
-    ap.add_argument("--only", default="openai,anthropic,tool_choice,concurrency,cancel")
+    ap.add_argument("--only", default="openai,anthropic,tool_choice,structured,concurrency,cancel")
     args = ap.parse_args()
     cl = Client(args.base_url)
     st, models = cl.get("/v1/models")
     m = json.loads(models)["data"][0]
     check("/v1/models", st == 200 and m["id"] == "qwen3.8-27b" and m["max_model_len"] > 0, f"{m['id']} {m['max_model_len']}")
     for part in args.only.split(","):
-        {"openai": openai_tests, "anthropic": anthropic_tests, "tool_choice": tool_choice_tests, "concurrency": concurrency_tests,
-         "cancel": cancel_tests}[part](cl)
+        {"openai": openai_tests, "anthropic": anthropic_tests, "tool_choice": tool_choice_tests,
+         "structured": structured_tests, "concurrency": concurrency_tests, "cancel": cancel_tests}[part](cl)
     print("PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
     sys.exit(1 if FAILS else 0)
 

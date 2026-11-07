@@ -66,9 +66,11 @@ class Model {
                     const std::function<void(int pos, const int32_t* ids, const float* logp)>& cb);
   // Runs ids[0..n) and samples the token after the last one. presence / frequency: penalties (Penalty) by
   // the running sequence's output counts, which this and the speculative steps keep (see penalty_init).
-  // logprobs >= 0: the token's logprobs with that many top entries (see logprobs()).
+  // logprobs >= 0: the token's logprobs with that many top entries (see logprobs()). masked: the logits are masked by
+  // row 0 of mask_rows() first.
   int32_t forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
-                         float min_p = 0.f, float presence = 0.f, float frequency = 0.f, int logprobs = -1);
+                         float min_p = 0.f, float presence = 0.f, float frequency = 0.f, int logprobs = -1,
+                         bool masked = false);
   // The logprobs of the tokens the last forward_sample / spec_begin / spec_step returned (lane -1), or of lane z of
   // the last spec_step_lanes; n = 0 when that sequence's sampling has none (SpecSampling::logprobs).
   const Logprobs& logprobs(int lane = -1) const { return last_lp_[lane < 0 ? 0 : lane]; }
@@ -91,6 +93,22 @@ class Model {
   // ahead (default): launch the next step before returning this one (Q27_SPEC_PIPELINE); false when
   // the caller will not continue right away (another sequence runs next), so no step is wasted.
   int spec_step(int32_t* out, bool ahead = true);
+  // Grammar masks (structured output): kMaskRows bitmasks of kMaskWords words in pinned host memory that the
+  // host writes (bit t % 32 of word t / 32: token t allowed); row 8 z + i masks verify row i of lane z (z = 0 alone).
+  // A sequence begun with SpecSampling::masked steps in two calls: spec_draft drafts the step and returns its verify
+  // tokens (chain[8]: the last token, then the 7 drafted ones; such a sequence verifies a chain), the host writes the
+  // mask of each row (the grammar after the row's tokens), and spec_step verifies and accepts with them (no step is
+  // launched ahead). spec_draft_lanes is the same for spec_step_lanes (chain [n][8]; lanes without masks need it too
+  // when one lane has them).
+  static constexpr int kMaskWords = (dims::kVocab + 31) / 32;
+  static constexpr int kMaskRows = kMaxLanes * kSpecBlock;
+  uint32_t* mask_rows() const { return mask_host_; }
+  void spec_draft(int32_t* chain);
+  void spec_draft_lanes(const int32_t* lanes, int n, int32_t* chain);
+  // Masks a decoding sequence (area -1: the running one, else a parked one) from its next step on, as if begun with
+  // SpecSampling::masked (the grammar starts after the reasoning; its end, stop[2], no longer ends a step); a step
+  // launched ahead is dropped.
+  void spec_set_masked(int area);
   bool has_draft() const { return draft_ != nullptr; }
   // Counters since the last call: verify steps, steps that used the lookup chain, tokens produced.
   void spec_stats(int64_t* out);
@@ -187,7 +205,9 @@ class Model {
                             bool ring);
   int prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last);
   bool evict_checkpoint();           // the least recently used one; false when there is none
-  void spec_body(const SpecSampling& smp);
+  void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
+  void spec_part(const SpecSampling& smp, int part);      // a masked step's part, captured by its settings
+  cudaGraphExec_t capture(const std::function<void()>& body);
   void spec_flush();  // replays the last verify's commits into the GDN / conv states
   void set_sbuf(int b);  // host side of the GDN state buffer switch
   int spec_rows(const SpecSampling& smp) const { return 1 + (kSpecBlock - 1) * std::max(1, smp.paths); }
@@ -195,7 +215,7 @@ class Model {
   bool fused(int T) const;
   bf16* cap_for(int layer) const;
   int32_t decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform, float min_p, Penalty pen,
-                      LogprobSink lp);
+                      LogprobSink lp, bool masked);
   // Penalty counts [vocab]: the running sequence's (-1), or parking area a's.
   uint32_t* pen_counts(int a = -1) const { return pen_ + size_t(a + 1) * dims::kVocab; }
   void logits(const float* x_rows, int rows);  // final norm + lm_head into logits_
@@ -323,6 +343,7 @@ class Model {
   int batch_n_ = 0;                  // set while chunk() runs a batched verify
   std::vector<int32_t> blanes_;      // the lanes of the batch (-1: the running sequence)
   bool batch_pending_ = false;       // a step ran: its commits are replayed when the batch ends
+  bool b_drafted_ = false;           // spec_draft_lanes drafted the step spec_step_lanes verifies next
   int bpar_ = 0;                     // the lanes' step parity (they step together)
   bool bwarm_ = false;
   AcceptLanes bacc_;                 // the lanes' sampling (chains) and top-k list lengths
@@ -338,8 +359,9 @@ class Model {
     std::vector<int32_t> lanes;
     int sbuf;
     AcceptLanes acc;
-    cudaGraphExec_t exec;
+    cudaGraphExec_t exec;  // (masked lanes: the draft part)
     uint64_t used;
+    cudaGraphExec_t exec2 = nullptr;  // masked lanes: the rest
   };
   std::vector<BatchGraph> bgraphs_;
   struct LaneRef {  // the host state of a lane's sequence
@@ -351,7 +373,12 @@ class Model {
   LaneRef lane_ref(int z);
   void batch_enter(const int32_t* lanes, int n);
   void batch_exit();                 // replays the pending commits, gives the lanes their step scalars back
-  void batch_body(int n);            // one step of the lanes (captured)
+  void batch_body(int n, int part = 0);  // one step of the lanes (captured; part: as spec_body's)
+  bool batch_masked() const;
+  struct BatchGraph;
+  BatchGraph& batch_graph(int n);
+  void batch_prepare(const int32_t* lanes, int n);
+  bool batch_part(int n, int part);
   GdnSpec gdn_spec_lanes(int gdn_layer) const;
   struct Region {
     void* dev;
@@ -398,9 +425,10 @@ class Model {
     float top_p;
     float min_p, presence, frequency;
     int logprobs;
+    bool masked;
     bool operator==(const GraphKey& o) const {
       return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && min_p == o.min_p &&
-             presence == o.presence && frequency == o.frequency && logprobs == o.logprobs;
+             presence == o.presence && frequency == o.frequency && logprobs == o.logprobs && masked == o.masked;
     }
   } graph_key_{};
   cudaGraphExec_t graph_exec_ = nullptr;
@@ -412,8 +440,9 @@ class Model {
     GraphKey key;
     SpecSampling smp;
     int sbuf;
-    cudaGraphExec_t exec;
+    cudaGraphExec_t exec;  // (masked steps: the draft part)
     uint64_t used;
+    cudaGraphExec_t exec2 = nullptr;  // masked steps: the rest
   };
   std::vector<CachedGraph> dgraphs_, sgraphs_;
   uint64_t graph_clock_ = 0;
@@ -470,6 +499,10 @@ class Model {
   SpecSampling spec_key_{};
   SpecSampling spec_smp_{};
   int32_t stop_[2] = {-1, -1};  // generation_config.json eos_token_id
+  uint32_t* mask_host_ = nullptr;  // pinned [kMaskRows][kMaskWords] (mask_rows)
+  uint32_t* mask_dev_ = nullptr;   // the device copy of the rows a step uses
+  int32_t* draft_host_ = nullptr;  // pinned [kMaxLanes][8]: spec_draft's verify tokens
+  bool spec_drafted_ = false;      // spec_draft drafted the step spec_step verifies next
 };
 
 }  // namespace q27

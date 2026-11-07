@@ -214,7 +214,15 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
 
 Sampling: `temperature`, `top_k`, `top_p`, `min_p`, `presence_penalty` and `frequency_penalty` (OpenAI's, -2 to 2;
 the model card suggests `presence_penalty` 1.5 for non-thinking use), and `seed`. The penalties apply to the 64 most
-likely tokens of each step. Accepted but without effect: `response_format`, `repetition_penalty`. `n > 1` is rejected.
+likely tokens of each step. Accepted but without effect: `repetition_penalty`. `n > 1` is rejected.
+
+Structured output: the output follows a JSON schema, any JSON object, a regex, a choice or a grammar, by masking the
+tokens the format does not allow at each step: OpenAI chat `response_format` (`json_object`, `json_schema`; enforced
+whether or not `strict` is set), the Responses API's `text.format`, vLLM's `structured_outputs` (`json`, `regex`,
+`choice`, `grammar` in Lark or GBNF; chat and completions) and Anthropic's `output_config.format` (or
+`output_format`). With thinking on, the format applies after the reasoning; with tools and `tool_choice: auto` the
+model may call a tool instead. A format that cannot be compiled is a 400. Grammars by
+[llguidance](https://github.com/guidance-ai/llguidance); a speculative step then costs about 0.35 ms (2.5%) more.
 
 Tool choice: `tool_choice` forces a call in all three APIs: a named tool (OpenAI `{"type": "function", ...}`, Anthropic
 `{"type": "tool", "name": ...}`) gives one call of it, any tool (`required`, Anthropic `any`) at least one call. The

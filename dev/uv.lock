@@ -242,6 +242,23 @@ wheels = [
 ]
 
 [[package]]
+name = "llguidance"
+version = "1.9.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/2e/3b0e13c1e01d5598708a6e7b77c55f3ae9c6c4e242a50a239f03ee800630/llguidance-1.9.1.tar.gz", hash = "sha256:3ba1b37585d07f50bb73e06dca6d45c88c9d5801789c071c8ff784c9dbcc5c46", size = 1196000, upload-time = "2026-09-30T19:13:37.491Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/48/b5/001504a719e61c8227158bed8c640ad35a58fa5416864c4ad4211d36a8f2/llguidance-1.9.1-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:367da91f0db6b494e1d4916e6ab3e3db3eb73f178fda6be32681c026af99f775", size = 3212609, upload-time = "2026-09-30T19:13:22.273Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/6e/f4acb8bd966e3533ebc888eeb7854482ece71668e002401a41bbfe37dd07/llguidance-1.9.1-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:a942487cd6221b793df3a11450881a6c9d25a45460a900c56d99b682633c45fe", size = 3141060, upload-time = "2026-09-30T19:13:23.717Z" },
+    { url = "https://files.pythonhosted.org/packages/60/d1/a32019fec392f9072bf8193310d9676407e8027c5239690cc4e429e69935/llguidance-1.9.1-cp39-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:31b75c9f6e09d000d062ef7e4eb3bcb3759fc1eda5619be50fdd8a830b0e8bdf", size = 2897765, upload-time = "2026-09-30T19:13:25.551Z" },
+    { url = "https://files.pythonhosted.org/packages/46/c3/b50a05a16af0a84f5a9a6fb4707006d3fc377d1b446599d23ac78f3e144c/llguidance-1.9.1-cp39-abi3-manylinux_2_31_x86_64.whl", hash = "sha256:dfac6021d9c4c5ef16b3a1d336c05ca5e8208ff30dec29d1c63ebcafbee3a346", size = 3071973, upload-time = "2026-09-30T19:13:27.331Z" },
+    { url = "https://files.pythonhosted.org/packages/79/d0/247dfe7b68ef71274255ab807f49f4684df9e8e899236a9cf62778f15186/llguidance-1.9.1-cp39-abi3-manylinux_2_34_i686.whl", hash = "sha256:9892220b2698f58193ef54a886e5f3d5eb2a60d510db49ca4c492b46ebb786fd", size = 3311113, upload-time = "2026-09-30T19:13:29.207Z" },
+    { url = "https://files.pythonhosted.org/packages/da/c2/d52e40712d77906d938907eabbe5c6130fe64a90d4c207fc40ccdc63cc5b/llguidance-1.9.1-cp39-abi3-manylinux_2_39_riscv64.whl", hash = "sha256:dd5c87df5e60a7d8f54f46bfd5e11abb10f93636712ace09a8c1d2a0c4aeade0", size = 3617784, upload-time = "2026-09-30T19:13:30.907Z" },
+    { url = "https://files.pythonhosted.org/packages/27/93/6584ee3f527ef885e3055d8f90f8acf2670fb93ae36f6a3fc6fb54c46b4e/llguidance-1.9.1-cp39-abi3-win32.whl", hash = "sha256:cc7d1024c3df780a5eb14d30744539e8a1aa6d94c5dabf7605c82c0567d45a51", size = 2613922, upload-time = "2026-09-30T19:13:32.742Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/e7/650aa5e6615399255cc0342bccba16c6f636ca57c5d15df0e59bb65a1302/llguidance-1.9.1-cp39-abi3-win_amd64.whl", hash = "sha256:8aaa55958adb4871016700e9140543ccbd9d6b5136d0a1756a114af706cc50c1", size = 2884987, upload-time = "2026-09-30T19:13:34.614Z" },
+    { url = "https://files.pythonhosted.org/packages/83/4a/889f5c7d1ab5f89ae1b3ec1c3ef20358717bed0ca4ca20fa35ce0c705d2d/llguidance-1.9.1-cp39-abi3-win_arm64.whl", hash = "sha256:0ab9d2681c0fcb4389f3c1c79697f1e724771d74d366bb5a22edae155252dfed", size = 2730962, upload-time = "2026-09-30T19:13:36.092Z" },
+]
+
+[[package]]
 name = "markdown-it-py"
 version = "4.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -558,6 +575,7 @@ version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
     { name = "httpx" },
+    { name = "llguidance" },
     { name = "numpy" },
     { name = "pillow" },
     { name = "pytest" },
@@ -570,6 +588,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx" },
+    { name = "llguidance", specifier = "==1.9.1" },
     { name = "numpy", specifier = "==2.5.3" },
     { name = "pillow" },
     { name = "pytest" },

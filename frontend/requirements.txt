@@ -2,6 +2,7 @@
 # transformers. The versions are those of the dev image (dev/uv.lock), which the tests compare with transformers.
 # Installed with --no-deps (Dockerfile): every package the server imports is listed, dependencies included.
 jinja2==3.1.6
+llguidance==1.9.1
 markupsafe==3.0.4
 pillow==12.3.0
 tokenizers==0.23.2

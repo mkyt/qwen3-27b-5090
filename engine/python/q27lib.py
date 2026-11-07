@@ -15,7 +15,11 @@ P, I, I64, F, SZ = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float
 SIGNATURES = {
     "q27_create": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p], P),
     "q27_plan": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p, I64, I64], P),
-    "q27_spec_begin": ([P, P, I, F, I, F, ctypes.c_uint64, F, I, F, F, F, I, P], I),
+    "q27_spec_begin": ([P, P, I, F, I, F, ctypes.c_uint64, F, I, F, F, F, I, P, I, I], I),
+    "q27_spec_draft": ([P, P], I),
+    "q27_spec_set_masked": ([P, I], I),
+    "q27_spec_draft_lanes": ([P, P, I, P], I),
+    "q27_mask_rows": ([P, P, P], P),
     "q27_spec_step": ([P, P], I),
     "q27_spec_step2": ([P, P, I], I),
     "q27_prefill": ([P, P, I, I, I, P], I),
@@ -54,7 +58,7 @@ SIGNATURES = {
     "q27_reset": ([P], I),
     "q27_pos": ([P], I),
     "q27_forward_topk": ([P, P, I, I, P, P], I),
-    "q27_forward_sample": ([P, P, I, F, I, F, F, F, F, F, I, P], I),
+    "q27_forward_sample": ([P, P, I, F, I, F, F, F, F, F, I, P, I], I),
     "q27_logprobs": ([P, I, P, P, P, P], I),
     "q27_penalty_init": ([P, P, I], I),
     "q27_profile_dump": ([P], I),
@@ -158,6 +162,7 @@ class Engine:
 
     def _create(self, fn, model_dir, max_tokens, prefill_chunk, kv_fp8, draft, kv_dtype, *extra):
         self.max_tokens = max_tokens
+        self._masks = None
         if draft and "Q27_DRAFT_VOCAB" not in os.environ and os.path.exists(DRAFT_VOCAB):
             os.environ["Q27_DRAFT_VOCAB"] = os.path.abspath(DRAFT_VOCAB)
         if os.environ.get("Q27_DRAFT_VOCAB") == "none":
@@ -211,16 +216,29 @@ class Engine:
         self._check(lib().q27_profile_dump(self.h), "q27_profile_dump")
 
     def forward_sample(self, ids, temperature=0.0, top_k=20, top_p=1.0, uniform=0.5, min_p=0.0, presence=0.0,
-                       frequency=0.0, logprobs=-1):
+                       frequency=0.0, logprobs=-1, masked=False):
         """Runs ids and returns the sampled next token (temperature <= 0: greedy). presence / frequency:
         OpenAI's penalties by the sequence's output counts (penalty_init). logprobs >= 0: the token's logprobs
-        with that many top entries are kept for logprobs()."""
+        with that many top entries are kept for logprobs(). masked: only the tokens row 0 of the grammar masks
+        allows (mask_row)."""
         src = array.array("i", ids)
         out = ctypes.c_int32()
         self._check(lib().q27_forward_sample(self.h, src.buffer_info()[0], len(ids), temperature, top_k, top_p,
-                                             uniform, min_p, presence, frequency, logprobs, ctypes.byref(out)),
-                    "q27_forward_sample")
+                                             uniform, min_p, presence, frequency, logprobs, ctypes.byref(out),
+                                             int(masked)), "q27_forward_sample")
         return out.value
+
+    def mask_row(self, i):
+        """Grammar masks (structured output): (address, bytes) of row i of the pinned bitmasks the engine reads (bit
+        t % 32 of 32-bit word t / 32: token t allowed). Row 8 z + j masks verify row j of lane z of a step (z = 0
+        alone); forward_sample and spec_begin use row 0. Write them before the call that reads them."""
+        if self._masks is None:
+            words, rows = ctypes.c_int(), ctypes.c_int()
+            base = lib().q27_mask_rows(self.h, ctypes.byref(words), ctypes.byref(rows))
+            self._masks = (base, 4 * words.value, rows.value)
+        base, size, rows = self._masks
+        assert 0 <= i < rows
+        return base + i * size, size
 
     def logprobs(self, lane=-1):
         """Logprobs of the tokens the last forward_sample / spec_begin / spec_step returned (lane -1), or of lane
@@ -244,14 +262,38 @@ class Engine:
         return bool(lib().q27_has_draft(self.h))
 
     def spec_begin(self, ids, temperature=0.0, top_k=20, top_p=1.0, seed=0, uniform=0.5, max_new=0, min_p=0.0,
-                   presence=0.0, frequency=0.0, logprobs=-1):
-        """Speculative decoding: runs the prompt and returns the first token (also fills the draft context)."""
+                   presence=0.0, frequency=0.0, logprobs=-1, masked=False, until=None):
+        """Speculative decoding: runs the prompt and returns the first token (also fills the draft context).
+        masked: grammar masks (mask_row; row 0 for the first token); each step is then spec_draft + spec_step.
+        until: a token that ends a step as its last one (the end of the reasoning, before a forced output or a
+        grammar; spec_set_masked clears it)."""
         src = array.array("i", ids)
         out = ctypes.c_int32()
         self._check(lib().q27_spec_begin(self.h, src.buffer_info()[0], len(ids), temperature, top_k, top_p,
                                          seed & (2**64 - 1), uniform, max_new, min_p, presence, frequency,
-                                         logprobs, ctypes.byref(out)), "q27_spec_begin")
+                                         logprobs, ctypes.byref(out), int(masked), -1 if until is None else until),
+                    "q27_spec_begin")
         return out.value
+
+    def spec_draft(self):
+        """A masked sequence's step, first part: drafts it and returns its 8 verify tokens (the last token, then the
+        7 drafted ones). Write mask rows 0..7 (the grammar after each row's tokens), then spec_step verifies."""
+        out = (ctypes.c_int32 * 8)()
+        self._check(lib().q27_spec_draft(self.h, out), "q27_spec_draft")
+        return list(out)
+
+    def spec_set_masked(self, area=None):
+        """Grammar masks for a decoding sequence (None: the running one, else a parking area) from its next step on,
+        as spec_begin(masked=True) would have set (a step launched ahead is dropped)."""
+        self._check(lib().q27_spec_set_masked(self.h, -1 if area is None else area), "q27_spec_set_masked")
+
+    def spec_draft_lanes(self, lanes):
+        """spec_draft for a batched step with masked lanes (spec_step_lanes follows): per lane its 8 verify tokens."""
+        n = len(lanes)
+        src = (ctypes.c_int32 * n)(*[-1 if a is None else a for a in lanes])
+        out = (ctypes.c_int32 * (8 * n))()
+        self._check(lib().q27_spec_draft_lanes(self.h, src, n, out), "q27_spec_draft_lanes")
+        return [list(out[8 * z:8 * z + 8]) for z in range(n)]
 
     def spec_step(self, ahead=True):
         """One draft + verify step; returns the new tokens (1..8). ahead=False: the next step is not launched

@@ -40,15 +40,21 @@ struct SpecSampling {
   int top_k = 20;
   float top_p = 1.f;
   int paths = 1;            // draft walks merged into the tree (1: a chain)
-  int32_t stop[2] = {-1, -1};  // end-of-sequence ids: an accepted one ends the step as its last token (not fed)
+  // stop[0..1]: end-of-sequence ids: an accepted one ends the step as its last token (not fed). stop[2]: a token that
+  // also ends the step as its last one (the next step's anchor; -1: none): the end of the reasoning while the host
+  // waits for it (a forced tool call or a grammar follows it, see Model::spec_begin).
+  int32_t stop[3] = {-1, -1, -1};
   float min_p = 0.f;
   Penalty pen;              // presence / frequency; pen.counts is set where the step is built
   int logprobs = -1;        // top logprobs per output token (0..20; < 0: no logprobs), see Logprobs
+  // Grammar masks (structured output): the verify rows' logits are masked by the host's bitmasks (Model::mask_rows)
+  // before the top-k, so a step is drafted first and verified after the host has written them (Model::spec_draft).
+  bool masked = false;
   bool penalized() const { return pen.presence != 0.f || pen.frequency != 0.f; }
   bool same(const SpecSampling& o) const {  // (the settings a captured step depends on)
     return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && paths == o.paths &&
            min_p == o.min_p && pen.presence == o.pen.presence && pen.frequency == o.pen.frequency &&
-           logprobs == o.logprobs;
+           logprobs == o.logprobs && masked == o.masked && stop[2] == o.stop[2];
   }
 };
 

@@ -308,7 +308,7 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
   // An accepted end-of-sequence token ends the step like a bonus token: the sequence then holds exactly
   // the tokens before it (a prefix cache checkpoint at the end of the generation matches the next turn).
   // So does reaching the token budget (the caller's max_tokens): the sequence never holds tokens past it.
-  auto stop = [&](int t) { return t == smp.stop[0] || t == smp.stop[1]; };
+  auto stop = [&](int t) { return t == smp.stop[0] || t == smp.stop[1] || t == smp.stop[2]; };
   const int limit = budget ? max(1, *budget) : kSpecBlock;  // tokens this step may output
   if (smp.temperature <= 0.f) {
     for (;;) {
@@ -497,6 +497,18 @@ __global__ void count_out_kernel(uint32_t* counts, const SpecOut* so, int delta)
   if (int(threadIdx.x) < so->n) atomicAdd(counts + so->tok[threadIdx.x], uint32_t(delta));
 }
 
+__global__ void mask_logits_kernel(float* logits, int V, const uint32_t* mask, int words, int rows_per_lane,
+                                   uint32_t lanes) {
+  pdl_trigger();
+  pdl_wait();
+  const int row = blockIdx.y;
+  if (!(lanes >> (row / rows_per_lane) & 1u)) return;
+  const uint32_t* m = mask + int64_t(row) * words;
+  float* x = logits + int64_t(row) * V;
+  for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < V; t += gridDim.x * blockDim.x)
+    if (!(m[t >> 5] >> (t & 31) & 1u)) x[t] = -INFINITY;
+}
+
 // Block-wide: the logprobs of token tok in row x (V logits) and the row's top n (tv / ti: its raw sorted list) into
 // entry i of out. One pass of an online log-sum-exp.
 __device__ void logprob_row(const float* x, int V, int tok, const float* tv, const int32_t* ti, int n, Logprobs* out,
@@ -505,7 +517,7 @@ __device__ void logprob_row(const float* x, int V, int tok, const float* tv, con
   for (int j = threadIdx.x; j < V; j += blockDim.x) {
     const float v = x[j];
     if (v > m) s = s * expf(m - v) + 1.f, m = v;
-    else s += expf(v - m);
+    else if (v != -INFINITY) s += expf(v - m);  // (masked tokens: -inf - -inf would be NaN)
   }
   const float mx = block_best(Pick{m, int(threadIdx.x)}).v;
   const float lse = mx + logf(block_sum(m == -INFINITY ? 0.f : s * expf(m - mx)));
@@ -574,6 +586,13 @@ void sample(const float* logits, int T, int V, float temperature, int top_k, flo
 void count_tokens(uint32_t* counts, const int32_t* ids, int n, int delta, cudaStream_t s) {
   if (n <= 0) return;
   launch_pdl(count_tokens_kernel, dim3(std::min(int(ceil_div(n, 256)), 64)), dim3(256), 0, s, counts, ids, n, delta);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void mask_logits(float* logits, int rows, int V, const uint32_t* mask, int words, int rows_per_lane, uint32_t lanes,
+                 cudaStream_t s) {
+  Q27_CHECK(words * 32 >= V, "mask_logits: mask rows shorter than the vocabulary");
+  launch_pdl(mask_logits_kernel, dim3(64, rows), dim3(256), 0, s, logits, V, mask, words, rows_per_lane, lanes);
   Q27_CUDA(cudaGetLastError());
 }
 

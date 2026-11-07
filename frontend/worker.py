@@ -32,6 +32,7 @@ Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids][, logprobs: per i
 
 import array
 import collections
+import ctypes
 import os
 import random
 import sys
@@ -84,6 +85,11 @@ class Seq:
         if self.force is not None and self.force[0] is None:
             self.out, self.force = list(self.force[1]), None
             self.eng_ids, self.unsent = self.prompt + self.out, list(self.out)
+        # Structured output: the llguidance grammar, and the token after which it applies (the end of the
+        # reasoning; None: from the start). matcher: made on arrival (Scheduler.submit); gm: the same once the grammar
+        # applies (every output token after that goes through it, and the engine masks the logits by it).
+        self.grammar, self.grammar_after = req.get("grammar"), req.get("grammar_after")
+        self.matcher = self.gm = None
         self.started = False     # prefix_begin done (the engine holds its state: running or parked)
         self.area = None         # parking area while parked
         self.phase = PREFILL
@@ -153,6 +159,7 @@ class Scheduler:
         self.m = collections.Counter()
         self.last_metrics = self.last_stats = 0.0
         self.cache_full = False  # every state slot of the prefix cache allocated (poll)
+        self.lltok = None        # llguidance's tokenizer (structured output; made with the first grammar)
 
     # ------------------------------------------------------------ messages
 
@@ -181,6 +188,14 @@ class Scheduler:
 
     def submit(self, rid, req):
         s = Seq(rid, req, time.time())
+        if s.grammar is not None:
+            try:
+                s.matcher = self.matcher(s.grammar)
+            except ValueError as e:
+                self.send("error", rid, str(e), 400)
+                return
+            s.gm = s.matcher if s.grammar_after is None else None
+            self.m["q27:structured_requests_total"] += 1
         s.reusable = self.reusable(s.prompt)
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
         # prompt and tools) that no checkpoint holds yet: the later one waits until the earlier one has run
@@ -206,6 +221,20 @@ class Scheduler:
         self.by_id[rid] = s
         self.waiting.append(s)
         self.m["q27:requests_total"] += 1
+
+    def matcher(self, grammar):
+        """An llguidance matcher of a grammar (structured output); ValueError when it cannot be used."""
+        import llguidance
+
+        if self.lltok is None:
+            t0 = time.time()
+            words = self.engine.mask_row(0)[1] * 8  # (the engine's mask rows: one bit per token of its vocabulary)
+            self.lltok = llguidance.LLTokenizer(self.cfg["tokenizer"], n_vocab=words, eos_token=sorted(self.eos))
+            log(f"grammar tokenizer ready ({time.time() - t0:.2f} s)")
+        m = llguidance.LLMatcher(self.lltok, grammar, log_level=0)
+        if m.is_error():
+            raise ValueError(f"the output format cannot be used: {m.get_error()}")
+        return m
 
     def prefetch(self, s):
         """Starts decoding the images that lie past the reusable prefix, which begin() will likely encode, on
@@ -526,10 +555,17 @@ class Scheduler:
             seed = s.rng.getrandbits(63)
             if s.presence or s.frequency:
                 self.engine.penalty_init(s.out)  # (after a preemption the earlier output counts too)
-            extra = dict(min_p=s.min_p, presence=s.presence, frequency=s.frequency, logprobs=s.logprobs)
+            extra = dict(min_p=s.min_p, presence=s.presence, frequency=s.frequency, logprobs=s.logprobs,
+                         masked=s.gm is not None)
+            # A step ends at the end of the reasoning when a forced output or a grammar follows it, so the engine holds
+            # no tokens past it (sampled without the forced tokens, or the masks).
+            until = s.force[0] if s.force is not None else s.grammar_after if s.matcher is not None and s.gm is None \
+                else None
+            if s.gm is not None:
+                write_mask(self.engine, s.gm, 0)
             if self.spec:
                 tok = self.engine.spec_begin(rest, s.temperature, s.top_k, s.top_p, seed=seed,
-                                             uniform=s.rng.random(), max_new=left, **extra)
+                                             uniform=s.rng.random(), max_new=left, until=until, **extra)
             else:
                 tok = self.engine.forward_sample(rest, s.temperature, s.top_k, s.top_p, s.rng.random(), **extra)
             s.fed = len(s.eng_ids)
@@ -565,13 +601,17 @@ class Scheduler:
             last = (others and now + step >= t0 + turn) or self.conn.poll(0)
             ts = time.time()
             if self.spec:
+                if s.gm is not None:
+                    write_masks(self.engine, s.gm, self.engine.spec_draft(), 0, self.eos)
                 toks = self.engine.spec_step(ahead=not last)
                 self.m["q27:spec_verify_calls_total"] += 1
                 self.count_draft(s, toks)
             else:
+                if s.gm is not None:
+                    write_mask(self.engine, s.gm, 0)
                 toks = [self.engine.forward_sample([s.out[-1]], s.temperature, s.top_k, s.top_p, s.rng.random(),
                                                    min_p=s.min_p, presence=s.presence, frequency=s.frequency,
-                                                   logprobs=s.logprobs)]
+                                                   logprobs=s.logprobs, masked=s.gm is not None)]
             step = max(step * 0.8, time.time() - ts)
             s.steps += 1
             self.emit(s, toks, self.engine.logprobs() if s.logprobs >= 0 else None)
@@ -595,6 +635,10 @@ class Scheduler:
         lanes = [None if s is self.cur else s.area for s in seqs]
         n0 = sum(len(s.out) for s in seqs)
         while True:
+            if any(s.gm is not None for s in seqs):  # (structured output: drafted, masked by the grammars, verified)
+                for z, (s, chain) in enumerate(zip(seqs, self.engine.spec_draft_lanes(lanes))):
+                    if s.gm is not None:
+                        write_masks(self.engine, s.gm, chain, 8 * z, self.eos)
             new = self.engine.spec_step_lanes(lanes)
             self.m["q27:spec_verify_calls_total"] += len(seqs)
             self.m["q27:batched_steps_total"] += 1
@@ -619,19 +663,28 @@ class Scheduler:
 
     def emit(self, s, toks, logprobs=None):
         """Tokens of a step: stops at EOS and at max_new, and at the token a forced output follows (force); the rest goes
-        to the server (with their logprobs, when the request asked for them), after forced tokens not sent yet."""
-        out, finish, force = [], None, None
+        to the server (with their logprobs, when the request asked for them), after forced tokens not sent yet.
+        Structured output: the tokens go through the grammar; at the end of the reasoning it starts to apply, and the
+        rest of that step (sampled without the masks) stays only as far as the grammar allows it."""
+        out, finish, force, began, cut = [], None, None, False, False
         for t in toks:
+            if s.gm is not None and not allows(s.gm, t, self.eos):
+                cut = True  # (only right after the grammar began: masked steps output what it allows)
+                break
             if t in self.eos:
                 finish = "stop"
                 break
             out.append(t)
+            if s.gm is not None:
+                s.gm.consume_token(t)
             if len(s.out) + len(out) >= s.max_new:
                 finish = "length"
                 break
             if s.force is not None and t == s.force[0]:
                 force = s.force[1]
                 break
+            if s.matcher is not None and s.gm is None and t == s.grammar_after:
+                s.gm, began = s.matcher, True
         if out:
             s.out += out
             self.m["q27:generation_tokens_total"] += len(out)
@@ -641,6 +694,13 @@ class Scheduler:
             self.finish(s, finish)
         elif force is not None:
             self.force_output(s, force)
+        elif cut:
+            # The engine holds tokens past the grammar's: s runs its prompt + output again from the prefix cache.
+            self.m["q27:grammar_restarts_total"] += 1
+            self.restart(s)
+            s.est_cached = len(s.prompt) - 1
+        elif began and self.spec:
+            self.engine.spec_set_masked(None if s is self.cur else s.area)
 
     def send_toks(self, s, out, logprobs=None):
         """Sends output tokens, after the forced ones not sent yet (their logprob: 0, no top entries)."""
@@ -764,6 +824,36 @@ class Scheduler:
                 "running": len(self.alive), "waiting": len(self.waiting), "blocked": self.blocked,
                 "target_seqs": self.max_seqs, "busy_s": self.m["q27:engine_busy_seconds_total"],
                 "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"]}
+
+
+def allows(m, t, eos):
+    """Whether llguidance matcher m takes token t next (its validate_tokens does not count an end-of-sequence id)."""
+    return m.is_accepting() if t in eos else m.validate_tokens([t]) == 1
+
+
+def write_mask(engine, m, row):
+    """Writes engine mask row `row`: what llguidance matcher m allows next."""
+    addr, size = engine.mask_row(row)
+    m.unsafe_compute_mask_ptr(addr, size)
+
+
+def write_masks(engine, m, chain, row0, eos):
+    """Grammar masks of a speculative step's verify rows row0 .. row0 + 7 (chain: their tokens, Engine.spec_draft; the
+    first, the last output token, has been through matcher m): row i masks by what follows chain[1..i]. Rows past a
+    drafted token the grammar does not allow, or an end-of-sequence id (eos), are left open: that token is rejected,
+    or ends the step. (A matcher that consumed an end-of-sequence id does not roll back to the state before it.)"""
+    k = m.validate_tokens(chain[1:])
+    k = next((i for i, t in enumerate(chain[1:1 + k]) if t in eos), k)
+    for i in range(8):
+        addr, size = engine.mask_row(row0 + i)
+        if i and i <= k:
+            m.consume_token(chain[i])
+        if i <= k:
+            m.unsafe_compute_mask_ptr(addr, size)
+        else:
+            ctypes.memset(addr, 0xFF, size)
+    if k:
+        m.rollback(k)
 
 
 def lcp_bytes(a, b):

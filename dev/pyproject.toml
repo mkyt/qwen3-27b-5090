@@ -13,6 +13,7 @@ dependencies = [
   "numpy==2.5.3",
   "pytest",
   "httpx",
+  "llguidance==1.9.1",  # grammar masks of structured output (frontend)
 ]
 
 [tool.uv]

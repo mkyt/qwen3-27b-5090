@@ -39,6 +39,7 @@ sys.path.insert(0, str(ROOT / "frontend"))
 sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 
+import structured  # noqa: E402
 import worker  # noqa: E402
 from launch import ENGINE_ENV_DEFAULTS, Launch, env_settings, model_dir, set_engine_env  # noqa: E402,F401
 from stats import HUB, request_meta  # noqa: E402
@@ -464,7 +465,8 @@ class Generation:
     whose text has been yielded so far (a token is out with the piece its text starts in; the tokens of a stop string
     that cut the text are not), as (text offset, token id, logprob, [(id, logprob)])."""
 
-    def __init__(self, server, ids, max_new, sampling, stop=(), images=None, sock=None, keepalive=None, force=None):
+    def __init__(self, server, ids, max_new, sampling, stop=(), images=None, sock=None, keepalive=None, force=None,
+                 grammar=None):
         self.server, self.sock, self.keepalive = server, sock, keepalive
         self.stops = [s for s in stop if s]
         self.prompt_tokens = len(ids)
@@ -473,7 +475,7 @@ class Generation:
         # For _stopped_timings: the last "prefilled" info, (arrival time, tokens) of the prefill's "tok" and those after
         # it, and when the first token came.
         self.prefilled, self.toks, self.first_tok = None, [], None
-        req = dict(ids=ids, max_new=max_new, images=images, force=force, **sampling)
+        req = dict(ids=ids, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
         self.sampling_logprobs = sampling.get("logprobs", -1)
         self.rid, self.q = server.engine.submit(req)
         self.detok = Detokenizer(server.tok, server.tok_lock)
@@ -685,6 +687,21 @@ class Server:
         if not thinking:
             return (None, self.encode(text))
         return (self.tok.token_id(THINK_END), self.encode("\n\n" + text))
+
+    def constrain(self, fmt, choice, tools, thinking):
+        """The worker's grammar of an output format ((what, value), structured.*_format; None: free text), or None. It
+        applies after the reasoning; while the model may call tools (tool_choice auto) it may call them instead. A
+        forced tool call has no format."""
+        try:
+            spec = fmt()
+            if spec is None or choice[0] in ("required", "named"):
+                return None
+            calls = ((self.tok.token_id("<tool_call>"), self.tok.token_id("</tool_call>"))
+                     if tools and choice[0] == "auto" else None)
+            g = structured.grammar(spec, lead_ws=thinking, calls=calls)
+        except ValueError as e:
+            raise ApiError(400, str(e)) from None
+        return {"grammar": g, "grammar_after": self.tok.token_id(THINK_END) if thinking else None}
 
     def limit(self, n_prompt, anthropic=False):
         left = self.max_tokens - n_prompt - SPEC_MARGIN
@@ -952,8 +969,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "max_tokens must be positive")
         stream = bool(body.get("stream"))
         keep = (lambda: self._keepalive_comment()) if stream else None
+        grammar = self.srv.constrain(lambda: structured.chat_format(body), choice, tools, thinking)
         gen = Generation(self.srv, ids, min(max_new, left), dict(sampling_of(body), logprobs=nlp),
-                         stops_of(body.get("stop")), images, self.connection, keep, self.srv.force(choice, thinking))
+                         stops_of(body.get("stop")), images, self.connection, keep, self.srv.force(choice, thinking),
+                         grammar)
         parser = OutputParser(thinking, tools if parse_tools else None)
         rid, created, model = f"chatcmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
         single_call = body.get("parallel_tool_calls") is False or choice[0] == "named"
@@ -1052,8 +1071,9 @@ class Handler(BaseHTTPRequestHandler):
         max_new = min(body.get("max_tokens") or 16, left)
         stream = bool(body.get("stream"))
         nlp = logprobs_of(body, chat=False)
+        grammar = self.srv.constrain(lambda: structured.chat_format(body), ("auto", None), None, False)
         gen = Generation(self.srv, ids, max_new, dict(sampling_of(body), logprobs=nlp), stops_of(body.get("stop")),
-                         None, self.connection, (lambda: self._keepalive_comment()) if stream else None)
+                         None, self.connection, (lambda: self._keepalive_comment()) if stream else None, None, grammar)
         rid, created, model = f"cmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
         lps = (lambda: completion_logprobs(self.srv.tok, gen.take_logprobs())) if nlp >= 0 else (lambda: None)
         if stream:
@@ -1099,8 +1119,10 @@ class Handler(BaseHTTPRequestHandler):
         single_call = bool(tc.get("disable_parallel_tool_use")) or choice[0] == "named"
         stream = bool(body.get("stream"))
         keep = (lambda: self._sse({"type": "ping"}, "ping")) if stream else None
+        grammar = self.srv.constrain(lambda: structured.anthropic_format(body), choice, tools, thinking)
         gen = Generation(self.srv, ids, min(body["max_tokens"], left), sampling_of(body),
-                         stops_of(body.get("stop_sequences")), images, self.connection, keep, self.srv.force(choice, thinking))
+                         stops_of(body.get("stop_sequences")), images, self.connection, keep, self.srv.force(choice, thinking),
+                         grammar)
         parser = OutputParser(thinking, tools if parse_tools else None)
         mid, model = f"msg_{gen.rid[4:]}", self._model(body)
         omit = (body.get("thinking") or {}).get("display") == "omitted" if isinstance(body.get("thinking"), dict) else False
@@ -1216,8 +1238,10 @@ class Handler(BaseHTTPRequestHandler):
         choice = tool_choice_of(body.get("tool_choice"), tools)
         parse_tools = bool(tools) and choice[0] != "none"
         stream = bool(body.get("stream"))
+        grammar = self.srv.constrain(lambda: structured.responses_format(body), choice, tools, thinking)
         gen = Generation(self.srv, ids, max_new, sampling_of(body), (), images, self.connection,
-                         (lambda: self._keepalive_comment()) if stream else None, self.srv.force(choice, thinking))
+                         (lambda: self._keepalive_comment()) if stream else None, self.srv.force(choice, thinking),
+                         grammar)
         parser = OutputParser(thinking, tools if parse_tools else None)
         resp = {"id": f"resp_{gen.rid[4:]}", "object": "response", "created_at": int(time.time()), "status": "in_progress",
                 "model": self._model(body), "output": [], "instructions": body.get("instructions"),
@@ -1497,7 +1521,7 @@ def main():
     base = {"prefill_chunk": args.prefill_chunk, "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv),
             "kv_reserve": args.kv_reserve, "decode_share": args.decode_share, "quantum_ms": args.quantum_ms,
             "batch_decode": bool(args.batch_decode), "im_start": tok.token_id("<|im_start|>"),
-            "engine_python": str(ROOT / "engine/python")}
+            "engine_python": str(ROOT / "engine/python"), "tokenizer": str(pathlib.Path(path) / "tokenizer.json")}
     # Images by default with the vision tower in pinned host memory (no KV pool cost); the library default is off.
     launch = Launch(base, dict(env_settings(), weights=args.weights, kv_dtype=args.kv_dtype, spec=args.spec,
                                max_seqs=max(1, min(args.max_seqs, 8)), max_tokens=args.max_tokens),

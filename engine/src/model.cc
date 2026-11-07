@@ -355,6 +355,11 @@ Model::Model(const Options& opt) : opt_(opt) {
   Q27_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_io_dev_), host_io_, 0));
   Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&lp_), (kLpSample + 1) * sizeof(Logprobs), cudaHostAllocMapped));
   Q27_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void**>(&lp_dev_), lp_, 0));
+  // Grammar masks (2 MiB each; outside the plan like the sampler's scratch).
+  Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&mask_host_), size_t(kMaskRows) * kMaskWords * 4, cudaHostAllocDefault));
+  memset(mask_host_, 0xff, size_t(kMaskRows) * kMaskWords * 4);
+  Q27_CUDA(cudaMalloc(reinterpret_cast<void**>(&mask_dev_), size_t(kMaskRows) * kMaskWords * 4));
+  Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&draft_host_), size_t(kMaxLanes) * kSpecBlock * 4, cudaHostAllocDefault));
   configure();
 }
 
@@ -393,9 +398,16 @@ Model::~Model() {
   for (auto e : spec_ev_)
     if (e) cudaEventDestroy(e);
   for (auto* v : {&dgraphs_, &sgraphs_})
-    for (auto& g : *v) cudaGraphExecDestroy(g.exec);
-  for (auto& g : bgraphs_) cudaGraphExecDestroy(g.exec);
+    for (auto& g : *v)
+      for (auto x : {g.exec, g.exec2})
+        if (x) cudaGraphExecDestroy(x);
+  for (auto& g : bgraphs_)
+    for (auto x : {g.exec, g.exec2})
+      if (x) cudaGraphExecDestroy(x);
   if (spec_out_) cudaFreeHost(spec_out_);
+  if (mask_host_) cudaFreeHost(mask_host_);
+  if (mask_dev_) cudaFree(mask_dev_);
+  if (draft_host_) cudaFreeHost(draft_host_);
   if (b_out_) cudaFreeHost(b_out_);
   if (host_io_) cudaFreeHost(host_io_);
   if (lp_) cudaFreeHost(lp_);
@@ -459,10 +471,14 @@ void Model::profile_dump() {
 
 void Model::drop_graphs() {
   for (auto* v : {&dgraphs_, &sgraphs_}) {
-    for (auto& g : *v) Q27_CUDA(cudaGraphExecDestroy(g.exec));
+    for (auto& g : *v)
+      for (auto x : {g.exec, g.exec2})
+        if (x) Q27_CUDA(cudaGraphExecDestroy(x));
     v->clear();
   }
-  for (auto& g : bgraphs_) Q27_CUDA(cudaGraphExecDestroy(g.exec));
+  for (auto& g : bgraphs_)
+    for (auto x : {g.exec, g.exec2})
+      if (x) Q27_CUDA(cudaGraphExecDestroy(x));
   bgraphs_.clear();
   graph_exec_ = nullptr;
   spec_graph_ = nullptr;
@@ -1210,7 +1226,7 @@ void Model::forward_topk(const int32_t* ids, int n, int k,
 }
 
 int32_t Model::forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
-                              float min_p, float presence, float frequency, int logprobs) {
+                              float min_p, float presence, float frequency, int logprobs, bool masked) {
   Q27_CHECK(n > 0, "forward_sample: no tokens");
   Q27_CHECK(logprobs <= kMaxTopLogprobs, "forward_sample: at most 20 top logprobs");
   spec_flush();
@@ -1221,10 +1237,15 @@ int32_t Model::forward_sample(const int32_t* ids, int n, float temperature, int 
     if (lp.n >= 0) last_lp_[0] = lp_[kLpSample];
     return tok;
   };
-  if (n == 1 && graphs_ && !cap_) return done(decode_step(ids[0], temperature, top_k, top_p, uniform, min_p, pen, lp));
+  if (n == 1 && graphs_ && !cap_)
+    return done(decode_step(ids[0], temperature, top_k, top_p, uniform, min_p, pen, lp, masked));
   int last = 0;
   prompt_chunks(ids, n, n, false, &last);
   logits(x_ + size_t(last) * kHidden, 1);
+  if (masked) {
+    Q27_CUDA(cudaMemcpyAsync(mask_dev_, mask_host_, size_t(kMaskWords) * 4, cudaMemcpyHostToDevice, s_));
+    mask_logits(logits_, 1, kVocab, mask_dev_, kMaskWords, 1, 1u, s_);
+  }
   Q27_CUDA(cudaMemcpyAsync(uniform_, &uniform, 4, cudaMemcpyHostToDevice, s_));
   mark("sample");
   sample(logits_, 1, kVocab, temperature, top_k, top_p, uniform_, sampled_, s_, min_p, pen, lp);
@@ -1308,7 +1329,7 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
 // runs eagerly (one-time initialization of the kernels); the second captures the graph, which is
 // reused while the sampling parameters stay the same.
 int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform, float min_p,
-                           Penalty pen, LogprobSink lp) {
+                           Penalty pen, LogprobSink lp, bool masked) {
   Q27_CHECK(pos_ + 1 <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   ensure_pages(pos_ + 1);
   seq_ids_.push_back(id);
@@ -1326,12 +1347,16 @@ int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p
   auto body = [&] {
     chunk(decode_memcpy_ ? ids_ : &io->id, 1);
     logits(x_, 1);
+    if (masked) {
+      Q27_CUDA(cudaMemcpyAsync(mask_dev_, mask_host_, size_t(kMaskWords) * 4, cudaMemcpyHostToDevice, s_));
+      mask_logits(logits_, 1, kVocab, mask_dev_, kMaskWords, 1, 1u, s_);
+    }
     sample(logits_, 1, kVocab, temperature, top_k, top_p, decode_memcpy_ ? uniform_ : &io->uniform,
            decode_memcpy_ ? sampled_ : &io->out, s_, min_p, pen, lp);
   };
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
-  const GraphKey key{temperature, top_k, top_p, min_p, pen.presence, pen.frequency, lp.n};
+  const GraphKey key{temperature, top_k, top_p, min_p, pen.presence, pen.frequency, lp.n, masked};
   if (!graph_warm_) {
     body();
     graph_warm_ = true;
@@ -1381,6 +1406,7 @@ int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p
 
 void Model::spec_flush() {
   batch_exit();
+  spec_drafted_ = false;  // (a drafted masked step only wrote its verify tokens and tree: drafted again)
   if (spec_inflight_) {
     // A step launched ahead (spec_step) is dropped. It began by replaying the last returned step's
     // commit into the other state buffer and the conv state, and flipped sbuf, as a flush would; its
@@ -1439,7 +1465,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   int32_t first = 0;
   try {
     first = forward_sample(ids, n, smp.temperature, smp.top_k, smp.top_p, uniform, smp.min_p, smp.pen.presence,
-                           smp.pen.frequency, smp.logprobs);
+                           smp.pen.frequency, smp.logprobs, smp.masked);
   } catch (...) {
     cap_ = nullptr;
     throw;
@@ -1462,22 +1488,26 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   spec_smp_ = smp;
   std::copy(stop_, stop_ + 2, spec_smp_.stop);
   if (spec_smp_.paths <= 0) spec_smp_.paths = spec_paths_;
+  if (spec_smp_.masked) spec_smp_.paths = 1;  // (the host masks a chain's rows)
   return first;
 }
 
 // One step on the device: draft -> verify (8 rows, features captured) -> accept -> draft context ->
 // position / parity / RNG advance.
-void Model::spec_body(const SpecSampling& sampling) {
+void Model::spec_body(const SpecSampling& sampling, int part) {
   SpecSampling smp = sampling;
   smp.pen.counts = smp.penalized() ? pen_ : nullptr;
   const auto& lm = w_.lm_head;
-  Lookup lk = lookup_;
-  lk.hist = hist_, lk.pos = pos_dev_, lk.best = lk_best_;
-  mark("lookup");
-  if (lk.on) spec_lookup(lk, ids_ver_, s_);
-  mark("draft");
-  draft_->propose(block_ids_, pos_dev_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], smp, rng_, ids_ver_,
-                  aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_);
+  if (part != 2) {
+    Lookup lk = lookup_;
+    lk.hist = hist_, lk.pos = pos_dev_, lk.best = lk_best_;
+    mark("lookup");
+    if (lk.on) spec_lookup(lk, ids_ver_, s_);
+    mark("draft");
+    draft_->propose(block_ids_, pos_dev_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], smp, rng_, ids_ver_,
+                    aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_);
+    if (part == 1) return;
+  }
   const int W = spec_rows(smp);
   verify_paths_ = smp.paths;
   verify_ = true;
@@ -1487,6 +1517,10 @@ void Model::spec_body(const SpecSampling& sampling) {
   cap_ = nullptr;
   logits(x_, W);
   mark("accept");
+  if (smp.masked) {
+    Q27_CUDA(cudaMemcpyAsync(mask_dev_, mask_host_, size_t(W) * kMaskWords * 4, cudaMemcpyHostToDevice, s_));
+    mask_logits(logits_, W, kVocab, mask_dev_, kMaskWords, kSpecBlock, 1u, s_);
+  }
   const int k = smp.temperature <= 0.f ? 1 : std::clamp(smp.top_k <= 0 ? 64 : smp.top_k, 1, 64);
   // (penalties: the top k of the 64 highest logits after them; logprobs: the raw top entries, so a longer list,
   // whose first k are the same)
@@ -1527,7 +1561,12 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   // result is read, so the GPU does not idle between steps. Every input of a step is on the device,
   // so it can start without the host; spec_flush drops it when the caller does not continue.
   int slot = par_host_;  // SpecOut slot of the step returned by this call
-  if (spec_inflight_) {
+  if (smp.masked) {
+    Q27_CHECK(spec_drafted_, "spec_step: a masked sequence's step is drafted first (spec_draft)");
+    spec_drafted_ = false;
+    spec_part(smp, 2);
+    par_host_ ^= 1;
+  } else if (spec_inflight_) {
     Q27_CHECK(same(smp, spec_key_), "spec_step: sampling changed with a step in flight");
     slot = inflight_slot_;
   } else if (!graphs_ || !spec_warm_) {
@@ -1555,7 +1594,8 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
       spec_key_ = smp;
       if (sgraphs_.size() >= size_t(kGraphCache)) {
         auto lru = std::min_element(sgraphs_.begin(), sgraphs_.end(), [](auto& a, auto& b) { return a.used < b.used; });
-        Q27_CUDA(cudaGraphExecDestroy(lru->exec));
+        for (auto x : {lru->exec, lru->exec2})  // (a masked step's entry holds two)
+          if (x) Q27_CUDA(cudaGraphExecDestroy(x));
         sgraphs_.erase(lru);
       }
       sgraphs_.push_back({{}, smp, 0, spec_graph_, ++graph_clock_});
@@ -1564,7 +1604,8 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
     par_host_ ^= 1;
   }
   static const bool dbg_accept = getenv("Q27_DBG_ACCEPT") != nullptr;
-  const bool ahead = allow_ahead && spec_pipeline_ && graphs_ && spec_graph_ && spec_warm_ && same(smp, spec_key_) && !trace &&
+  const bool ahead = allow_ahead && !smp.masked && spec_pipeline_ && graphs_ && spec_graph_ && spec_warm_ &&
+                     same(smp, spec_key_) && !trace &&
                      !prof_.on && !dbg_accept &&
                      pos_ + kSpecBlock + spec_rows(smp) <= max_pages_ * kPageTokens;  // (worst-case position)
   if (ahead) {
@@ -1616,6 +1657,72 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   seq_ids_.insert(seq_ids_.end(), out, out + n - 1);
   spec_last_ = out[n - 1];
   return n;
+}
+
+cudaGraphExec_t Model::capture(const std::function<void()>& body) {
+  cudaGraph_t graph;
+  cudaGraphExec_t exec;
+  trace_clear_launches();
+  Q27_CUDA(cudaStreamBeginCapture(s_, cudaStreamCaptureModeThreadLocal));
+  prof_.capturing = true;
+  prof_.graph.used = 0;
+  body();
+  mark(nullptr);
+  prof_.capturing = false;
+  Q27_CUDA(cudaStreamEndCapture(s_, &graph));
+  Q27_CUDA(cudaGraphInstantiate(&exec, graph, 0));
+  Q27_CUDA(cudaGraphDestroy(graph));
+  return exec;
+}
+
+// The two graphs of a masked step share a cache entry (exec: the draft, exec2: the rest).
+void Model::spec_part(const SpecSampling& smp, int part) {
+  if (!graphs_ || !spec_warm_) {
+    spec_body(smp, part);
+    if (part == 2) spec_warm_ = true;
+    return;
+  }
+  CachedGraph* e = nullptr;
+  for (auto& g : sgraphs_)
+    if (g.smp.same(smp)) e = &g;
+  if (!e) {
+    if (sgraphs_.size() >= size_t(kGraphCache)) {
+      auto lru = std::min_element(sgraphs_.begin(), sgraphs_.end(), [](auto& a, auto& b) { return a.used < b.used; });
+      if (lru->exec == spec_graph_) spec_graph_ = nullptr;
+      for (auto x : {lru->exec, lru->exec2})
+        if (x) Q27_CUDA(cudaGraphExecDestroy(x));
+      sgraphs_.erase(lru);
+    }
+    sgraphs_.push_back({{}, smp, 0, nullptr, 0});
+    e = &sgraphs_.back();
+  }
+  e->used = ++graph_clock_;
+  cudaGraphExec_t& x = part == 1 ? e->exec : e->exec2;
+  if (!x) x = capture([&] { spec_body(smp, part); });
+  Q27_CUDA(cudaGraphLaunch(x, s_));
+}
+
+void Model::spec_draft(int32_t* chain) {
+  Q27_CHECK(draft_ && spec_smp_.masked, "spec_draft: not a masked sequence");
+  batch_exit();
+  const SpecSampling smp = spec_smp_;
+  Q27_CHECK(!spec_inflight_, "spec_draft: a step in flight");
+  Q27_CHECK(pos_ + spec_rows(smp) <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
+  ensure_pages(pos_ + kSpecBlock + spec_rows(smp));  // (KvFull before anything ran)
+  spec_part(smp, 1);
+  Q27_CUDA(cudaMemcpyAsync(draft_host_, ids_ver_, kSpecBlock * 4, cudaMemcpyDeviceToHost, s_));
+  Q27_CUDA(cudaStreamSynchronize(s_));
+  memcpy(chain, draft_host_, kSpecBlock * 4);
+  spec_drafted_ = true;
+}
+
+void Model::spec_set_masked(int area) {
+  batch_exit();
+  SpecSampling& smp = area < 0 ? spec_smp_ : parked_.at(area).smp;
+  Q27_CHECK(area < 0 || parked_[area].used, "spec_set_masked: no such sequence");
+  if (area < 0) spec_flush();
+  smp.masked = true, smp.paths = 1;
+  smp.stop[2] = -1;  // (the reasoning has ended)
 }
 
 void Model::spec_stats(int64_t* out) {
@@ -1925,6 +2032,7 @@ void Model::batch_enter(const int32_t* lanes, int n) {
 void Model::batch_exit() {
   if (!batch_on_) return;
   batch_on_ = false;
+  b_drafted_ = false;
   const int n = int(blanes_.size());
   if (batch_pending_) {  // the last verify's commits: replay-only blocks (conv and recurrent states)
     for (int i = 0; i < kLayers; i++) {
@@ -1960,15 +2068,22 @@ void Model::batch_exit() {
   blanes_.clear();
 }
 
-void Model::batch_body(int n) {
+bool Model::batch_masked() const {
+  return std::any_of(bacc_.smp, bacc_.smp + int(blanes_.size()), [](const SpecSampling& m) { return m.masked; });
+}
+
+void Model::batch_body(int n, int part) {
   const auto& lm = w_.lm_head;
   DraftLanes dl;
   dl.n = n, dl.pos = b_pos_;
   SelectLanes sel;
   for (int z = 0; z < n; z++) dl.ring_k[z] = bring_k_[z], dl.ring_v[z] = bring_v_[z], sel.smp[z] = bacc_.smp[z];
-  mark("draft");
-  draft_->propose_lanes(dl, b_blk_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], sel, b_rng_, b_ids_, b_tree_,
-                        aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, s_);
+  if (part != 2) {
+    mark("draft");
+    draft_->propose_lanes(dl, b_blk_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], sel, b_rng_, b_ids_,
+                          b_tree_, aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, s_);
+    if (part == 1) return;
+  }
   const int W = kLaneRows * n;
   verify_ = true;
   verify_paths_ = 1;
@@ -1980,6 +2095,15 @@ void Model::batch_body(int n) {
   cap_ = nullptr;
   logits(x_, W);
   mark("accept");
+  uint32_t masked = 0;
+  for (int z = 0; z < n; z++)
+    if (bacc_.smp[z].masked) {
+      masked |= 1u << z;
+      const size_t off = size_t(z) * kLaneRows * kMaskWords;
+      Q27_CUDA(cudaMemcpyAsync(mask_dev_ + off, mask_host_ + off, size_t(kLaneRows) * kMaskWords * 4,
+                               cudaMemcpyHostToDevice, s_));
+    }
+  if (masked) mask_logits(logits_, W, kVocab, mask_dev_, kMaskWords, kLaneRows, masked, s_);
   int K = *std::max_element(bacc_.k, bacc_.k + n);
   PenaltyLanes pl;
   for (int z = 0; z < n; z++) pl.pen[z] = bacc_.smp[z].pen;
@@ -2000,52 +2124,83 @@ void Model::batch_body(int n) {
   spec_advance_lanes(n, b_pos_, b_nc_, b_par_, b_rng_, b_budget_, s_);
 }
 
-void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* counts) {
+// The lanes' graph cache entry (the graph holds their state pointers: keyed by the lanes, the running one's state
+// buffer and their sampling), created when missing (the least recently used one goes beyond kGraphCache).
+Model::BatchGraph& Model::batch_graph(int n) {
+  const int sb = std::count(blanes_.begin(), blanes_.end(), -1) ? sbuf_host_ : -1;
+  auto same_acc = [&](const AcceptLanes& a) {
+    for (int z = 0; z < n; z++) {
+      const SpecSampling &x = a.smp[z], &y = bacc_.smp[z];
+      if (!x.same(y)) return false;
+    }
+    return true;
+  };
+  for (auto& g : bgraphs_)
+    if (g.lanes == blanes_ && g.sbuf == sb && same_acc(g.acc)) {
+      g.used = ++graph_clock_;
+      return g;
+    }
+  if (bgraphs_.size() >= size_t(kGraphCache)) {
+    auto lru = std::min_element(bgraphs_.begin(), bgraphs_.end(), [](auto& a, auto& b) { return a.used < b.used; });
+    for (auto x : {lru->exec, lru->exec2})
+      if (x) Q27_CUDA(cudaGraphExecDestroy(x));
+    bgraphs_.erase(lru);
+  }
+  bgraphs_.push_back({blanes_, sb, bacc_, nullptr, ++graph_clock_});
+  return bgraphs_.back();
+}
+
+// batch_enter and the pages for the step's rows (the KV of the verify block at pos .. pos + 7).
+void Model::batch_prepare(const int32_t* lanes, int n) {
   Q27_CHECK(draft_ && max_lanes() > 1, "spec_step_lanes: batched steps need a draft model and MAX_SEQS > 1");
   batch_enter(lanes, n);
-  // Pages for the step's rows (the KV of the verify block at pos .. pos + 7).
   for (int z = 0; z < n; z++) {
     LaneRef r = lane_ref(z);
     Q27_CHECK(*r.pos + kSpecBlock <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
     ensure_pages_of(*r.pages, b_pt_ + size_t(z) * max_pages_, *r.pos + kSpecBlock);
   }
+}
+
+// A batched step with masked lanes in two parts (batch_body: 1 the draft, 2 the rest); returns whether a graph ran.
+bool Model::batch_part(int n, int part) {
+  if (!graphs_ || !bwarm_) {
+    batch_body(n, part);
+    if (part == 2) bwarm_ = true;
+    return false;
+  }
+  BatchGraph& g = batch_graph(n);
+  cudaGraphExec_t& x = part == 1 ? g.exec : g.exec2;
+  if (!x) x = capture([&] { batch_body(n, part); });
+  Q27_CUDA(cudaGraphLaunch(x, s_));
+  return true;
+}
+
+void Model::spec_draft_lanes(const int32_t* lanes, int n, int32_t* chain) {
+  batch_prepare(lanes, n);
+  Q27_CHECK(batch_masked(), "spec_draft_lanes: no masked lane");
+  batch_part(n, 1);
+  Q27_CUDA(cudaMemcpyAsync(draft_host_, b_ids_, size_t(n) * kSpecBlock * 4, cudaMemcpyDeviceToHost, s_));
+  Q27_CUDA(cudaStreamSynchronize(s_));
+  memcpy(chain, draft_host_, size_t(n) * kSpecBlock * 4);
+  b_drafted_ = true;
+}
+
+void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* counts) {
+  batch_prepare(lanes, n);
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
   cudaGraphExec_t exec = nullptr;
-  if (!graphs_ || !bwarm_) {
+  if (batch_masked()) {
+    Q27_CHECK(b_drafted_, "spec_step_lanes: a step with masked lanes is drafted first (spec_draft_lanes)");
+    b_drafted_ = false;
+    if (batch_part(n, 2)) exec = batch_graph(n).exec2;
+  } else if (!graphs_ || !bwarm_) {
     batch_body(n);
     bwarm_ = true;
   } else {
-    // The graph holds the lanes' state pointers: keyed by the lanes (and the running one's state buffer).
-    const int sb = std::count(blanes_.begin(), blanes_.end(), -1) ? sbuf_host_ : -1;
-    auto same_acc = [&](const AcceptLanes& a) {
-      for (int z = 0; z < n; z++) {
-        const SpecSampling &x = a.smp[z], &y = bacc_.smp[z];
-        if (!x.same(y)) return false;
-      }
-      return true;
-    };
-    for (auto& g : bgraphs_)
-      if (g.lanes == blanes_ && g.sbuf == sb && same_acc(g.acc)) exec = g.exec, g.used = ++graph_clock_;
-    if (!exec) {
-      cudaGraph_t graph;
-      trace_clear_launches();
-      Q27_CUDA(cudaStreamBeginCapture(s_, cudaStreamCaptureModeThreadLocal));
-      prof_.capturing = true;
-      prof_.graph.used = 0;
-      batch_body(n);
-      mark(nullptr);
-      prof_.capturing = false;
-      Q27_CUDA(cudaStreamEndCapture(s_, &graph));
-      Q27_CUDA(cudaGraphInstantiate(&exec, graph, 0));
-      Q27_CUDA(cudaGraphDestroy(graph));
-      if (bgraphs_.size() >= size_t(kGraphCache)) {
-        auto lru = std::min_element(bgraphs_.begin(), bgraphs_.end(), [](auto& a, auto& b) { return a.used < b.used; });
-        Q27_CUDA(cudaGraphExecDestroy(lru->exec));
-        bgraphs_.erase(lru);
-      }
-      bgraphs_.push_back({blanes_, sb, bacc_, exec, ++graph_clock_});
-    }
+    BatchGraph& g = batch_graph(n);
+    if (!g.exec) g.exec = capture([&] { batch_body(n); });
+    exec = g.exec;
     Q27_CUDA(cudaGraphLaunch(exec, s_));
   }
   Q27_CUDA(cudaStreamSynchronize(s_));

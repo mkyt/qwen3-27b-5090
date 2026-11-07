@@ -357,6 +357,20 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
   when the tokens the step committed past `</think>` were the forced ones (the model was about to call a tool);
   otherwise the reasoning is computed again from an earlier checkpoint (about 0.1 s per 1,000 tokens). The forced
   tokens are output tokens (usage, logprobs with logprob 0) and go through the same parser.
+- **Structured output** (`response_format`, Responses `text.format`, vLLM `structured_outputs`, Anthropic
+  `output_config.format`): the server compiles the format to an llguidance grammar (a JSON schema, any JSON object,
+  a regex, a choice or a Lark / GBNF grammar; with tools and `tool_choice: auto`, also tool calls) and the scheduler
+  matches every output token against it, from the start or, with thinking, after `</think>`. A masked sequence's
+  speculative step runs in two parts: the draft (a graph of its own), then the host writes one bitmask per verify row
+  (row i: what the grammar allows after the row's path, the drafted tokens it does not allow leave later rows open),
+  and the verify graph copies them to the device and sets the disallowed logits to -inf before the top-k. The target
+  distribution is the masked one (as vLLM: mask, then temperature, penalties and cuts) and the draft's proposals stay
+  as they were, so the accept step stays lossless; a disallowed draft token is always rejected. No step is launched
+  ahead while masked (that saves 0.07 ms per step); the masks cost about 0.07 ms of CPU per step, and the step about
+  0.35 ms more in all. Sequences without a format run the graphs they ran before; in a batched step only the masked
+  lanes' rows are masked. When the reasoning ends, the step's tokens after `</think>` were sampled without the masks:
+  they stay if the grammar allows them (the engine masks from the next step on), else the sequence restarts from the
+  prefix cache before the first one it does not allow. Logprobs are those of the masked logits.
 - Anthropic `thinking` is honored; with `display: omitted`, the reasoning travels in the signature so that the next
   turn's prompt (and the prefix cache) still has it.
 - The server marks message boundaries for the prefix cache and reports, per request, how many tokens came from it.

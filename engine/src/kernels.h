@@ -349,6 +349,11 @@ struct LogprobSink {
 };
 void sample(const float* logits, int T, int V, float temperature, int top_k, float top_p, const float* uniform,
             int32_t* out, cudaStream_t s, float min_p = 0.f, Penalty pen = {}, LogprobSink lp = {});
+// Grammar masks (structured output): row r of logits [rows][V] gets -inf at the tokens whose bit is 0 in row r of
+// mask ([rows][words] bitmasks, bit t % 32 of word t / 32: token t allowed), when bit r / rows_per_lane of lanes is set
+// (other lanes' rows are left).
+void mask_logits(float* logits, int rows, int V, const uint32_t* mask, int words, int rows_per_lane, uint32_t lanes,
+                 cudaStream_t s);
 // counts[ids[i]] += delta for i < n (the penalty counts of a sequence's output).
 void count_tokens(uint32_t* counts, const int32_t* ids, int n, int delta, cudaStream_t s);
 

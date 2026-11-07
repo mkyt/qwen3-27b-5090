@@ -200,13 +200,19 @@ int q27_forward_topk(void* m, const int32_t* ids, int n, int k, int32_t* out_ids
 }
 
 // Runs n tokens and samples the next one (temperature <= 0: greedy; presence / frequency: Model::forward_sample;
-// logprobs >= 0: q27_logprobs answers with that many top entries).
+// logprobs >= 0: q27_logprobs answers with that many top entries; masked: by row 0 of q27_mask_rows).
 int q27_forward_sample(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
-                       float min_p, float presence, float frequency, int logprobs, int32_t* out) {
+                       float min_p, float presence, float frequency, int logprobs, int32_t* out, int masked) {
   return guard([&] {
     *out = static_cast<Model*>(m)->forward_sample(ids, n, temperature, top_k, top_p, uniform, min_p, presence,
-                                                  frequency, logprobs);
+                                                  frequency, logprobs, masked != 0);
   });
+}
+
+// Grammar masks (Model::mask_rows): the pinned host rows the caller writes; *words per row, *rows of them.
+void* q27_mask_rows(void* m, int* words, int* rows) {
+  *words = Model::kMaskWords, *rows = Model::kMaskRows;
+  return static_cast<Model*>(m)->mask_rows();
 }
 
 // Logprobs of the tokens the last q27_forward_sample / q27_spec_begin / q27_spec_step returned (lane -1), or of
@@ -226,15 +232,18 @@ int q27_penalty_init(void* m, const int32_t* ids, int n) {
   return guard([&] { static_cast<Model*>(m)->penalty_init(ids, n); });
 }
 
-// Speculative decoding: prompt + first token, then steps of 1..8 new tokens (out[8]; returns the count).
+// Speculative decoding: prompt + first token, then steps of 1..8 new tokens (out[8]; returns the count). masked: grammar
+// masks (q27_mask_rows, q27_spec_draft); until >= 0: a step ends at that token (SpecSampling::stop[2]).
 int q27_spec_begin(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, uint64_t seed,
                    float uniform, int max_new, float min_p, float presence, float frequency, int logprobs,
-                   int32_t* out) {
+                   int32_t* out, int masked, int until) {
   return guard([&] {
     Q27_CHECK(logprobs <= kMaxTopLogprobs, "spec_begin: at most 20 top logprobs");
     SpecSampling smp{temperature, top_k, top_p, 0};  // paths 0: Q27_SPEC_PATHS
     smp.min_p = min_p, smp.pen.presence = presence, smp.pen.frequency = frequency;
     smp.logprobs = logprobs < 0 ? -1 : logprobs;
+    smp.masked = masked != 0;
+    smp.stop[2] = until;
     *out = static_cast<Model*>(m)->spec_begin(ids, n, smp, seed, uniform, max_new);
   });
 }
@@ -250,6 +259,16 @@ int q27_spec_step2(void* m, int32_t* out, int ahead) {
   int n = -1;
   if (int rc = guard([&] { n = static_cast<Model*>(m)->spec_step(out, ahead != 0); }); rc != 0) return rc;
   return n;
+}
+
+// A masked sequence's step, first part (Model::spec_draft): chain[8] the verify tokens; q27_spec_step verifies.
+int q27_spec_draft(void* m, int32_t* chain) {
+  return guard([&] { static_cast<Model*>(m)->spec_draft(chain); });
+}
+
+// Masks of a decoding sequence from its next step on (Model::spec_set_masked; area -1: the running one).
+int q27_spec_set_masked(void* m, int area) {
+  return guard([&] { static_cast<Model*>(m)->spec_set_masked(area); });
 }
 
 // Prompt chunks before q27_forward_sample / q27_spec_begin (*done: tokens run, see Model::prefill).
@@ -280,6 +299,10 @@ int q27_seq_suspend(void* m, int area) {
 int q27_max_lanes(void* m) { return static_cast<Model*>(m)->max_lanes(); }
 int q27_spec_step_lanes(void* m, const int32_t* lanes, int n, int32_t* out, int32_t* counts) {
   return guard([&] { static_cast<Model*>(m)->spec_step_lanes(lanes, n, out, counts); });
+}
+// Lanes with masks (Model::spec_draft_lanes): chain [n][8].
+int q27_spec_draft_lanes(void* m, const int32_t* lanes, int n, int32_t* chain) {
+  return guard([&] { static_cast<Model*>(m)->spec_draft_lanes(lanes, n, chain); });
 }
 
 int q27_has_draft(void* m) { return static_cast<Model*>(m)->has_draft() ? 1 : 0; }
