@@ -68,6 +68,8 @@ class Seq:
         self.prompt = list(req["ids"])
         self.max_new = req["max_new"]
         self.temperature, self.top_k, self.top_p = req["temperature"], req["top_k"], req["top_p"]
+        self.min_p = req.get("min_p", 0.0)
+        self.presence, self.frequency = req.get("presence_penalty", 0.0), req.get("frequency_penalty", 0.0)
         self.rng = random.Random(req.get("seed"))
         self.images = req.get("images")  # (spans [(start, gh, gw)], [(encoded image, resized size, norm)]) or None
         self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), started on arrival
@@ -512,11 +514,14 @@ class Scheduler:
         else:
             left = s.max_new - len(s.out)
             seed = s.rng.getrandbits(63)
+            if s.presence or s.frequency:
+                self.engine.penalty_init(s.out)  # (after a preemption the earlier output counts too)
+            extra = dict(min_p=s.min_p, presence=s.presence, frequency=s.frequency)
             if self.spec:
                 tok = self.engine.spec_begin(rest, s.temperature, s.top_k, s.top_p, seed=seed,
-                                             uniform=s.rng.random(), max_new=left)
+                                             uniform=s.rng.random(), max_new=left, **extra)
             else:
-                tok = self.engine.forward_sample(rest, s.temperature, s.top_k, s.top_p, s.rng.random())
+                tok = self.engine.forward_sample(rest, s.temperature, s.top_k, s.top_p, s.rng.random(), **extra)
             s.fed = len(s.eng_ids)
             s.phase = DECODE
             if s.first_token is None:
@@ -552,7 +557,8 @@ class Scheduler:
                 self.m["q27:spec_verify_calls_total"] += 1
                 self.count_draft(s, toks)
             else:
-                toks = [self.engine.forward_sample([s.out[-1]], s.temperature, s.top_k, s.top_p, s.rng.random())]
+                toks = [self.engine.forward_sample([s.out[-1]], s.temperature, s.top_k, s.top_p, s.rng.random(),
+                                                   min_p=s.min_p, presence=s.presence, frequency=s.frequency)]
             step = max(step * 0.8, time.time() - ts)
             s.steps += 1
             self.emit(s, toks)

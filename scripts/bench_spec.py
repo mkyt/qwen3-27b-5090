@@ -56,9 +56,12 @@ def chat_ids(tok, text):
     return list(ids["input_ids"]) if not isinstance(ids, list) else ids
 
 
-def run_spec(eng, ids, max_tokens, temperature, top_k, top_p, seed):
+def run_spec(eng, ids, max_tokens, temperature, top_k, top_p, seed, **more):
+    """more: min_p, presence, frequency (penalties: the counts start empty)."""
     t0 = time.perf_counter()
-    out = [eng.spec_begin(ids, temperature, top_k, top_p, seed=seed, uniform=random.Random(seed).random())]
+    if more.get("presence") or more.get("frequency"):
+        eng.penalty_init([])
+    out = [eng.spec_begin(ids, temperature, top_k, top_p, seed=seed, uniform=random.Random(seed).random(), **more)]
     t_first = time.perf_counter()
     steps = 0
     while len(out) < max_tokens and out[-1] not in EOS:
@@ -87,6 +90,9 @@ def main():
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--min-p", type=float, default=0.0)
+    ap.add_argument("--presence", type=float, default=0.0, help="presence penalty")
+    ap.add_argument("--frequency", type=float, default=0.0, help="frequency penalty")
     ap.add_argument("--prompts", default="code,json,prose")
     ap.add_argument("--check-greedy", type=int, default=0, metavar="N")
     ap.add_argument("--label", default="spec")
@@ -170,7 +176,8 @@ def main():
             eng.reset()
             if args.profile:
                 eng.profile_dump()  # drop the prompt
-            out, steps, ttft, dt = run_spec(eng, ids, args.max_tokens, args.temperature, args.top_k, args.top_p, rep)
+            out, steps, ttft, dt = run_spec(eng, ids, args.max_tokens, args.temperature, args.top_k, args.top_p, rep,
+                                            min_p=args.min_p, presence=args.presence, frequency=args.frequency)
             if args.profile:
                 print(f"--- profile {name}#{rep}", file=sys.stderr, flush=True)
                 eng.profile_dump()

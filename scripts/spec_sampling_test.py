@@ -9,7 +9,11 @@ token 3, are compared with a chi-square test of homogeneity (categories with sma
 A wrong acceptance rule or residual shows up as tiny p-values; a lossless sampler gives p-values that
 are uniform on (0, 1) across tests.
 
+--min-p, --presence and --frequency test those settings too (the penalties count the first tokens, so tokens 2 and 3
+are penalized when they repeat them, also on the draft path within a step).
+
     docker compose --profile dev run --rm dev python scripts/spec_sampling_test.py --n 2000
+    docker compose --profile dev run --rm dev python scripts/spec_sampling_test.py --n 2000 --min-p 0.05 --presence 1.5 --frequency 0.5
 """
 
 import argparse
@@ -65,6 +69,9 @@ def main():
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--min-p", type=float, default=0.0)
+    ap.add_argument("--presence", type=float, default=0.0)
+    ap.add_argument("--frequency", type=float, default=0.0)
     ap.add_argument("--prompts", default=",".join(PROMPTS))
     ap.add_argument("--out", default="")
     args = ap.parse_args()
@@ -81,6 +88,8 @@ def main():
     tok = AutoTokenizer.from_pretrained(snapshot(*TARGET))
     eng = Engine(snapshot(*TARGET), max_tokens=1024, draft=snapshot(*DFLASH2))
     smp = (args.temperature, args.top_k, args.top_p)
+    more = dict(min_p=args.min_p, presence=args.presence, frequency=args.frequency)
+    pen = bool(args.presence or args.frequency)
     report = {"args": vars(args), "tests": []}
     for name in args.prompts.split(","):
         ids = tok.apply_chat_template([{"role": "user", "content": PROMPTS[name]}], add_generation_prompt=True,
@@ -92,12 +101,16 @@ def main():
             rng = random.Random(1000003 * s + 7)
             u1, u2, u3 = rng.random(), rng.random(), rng.random()
             eng.reset()
-            a1 = eng.forward_sample(ids, *smp, u1)
-            a2 = eng.forward_sample([a1], *smp, u2)
-            a3 = eng.forward_sample([a2], *smp, u3)
+            if pen:
+                eng.penalty_init([])
+            a1 = eng.forward_sample(ids, *smp, u1, **more)
+            a2 = eng.forward_sample([a1], *smp, u2, **more)
+            a3 = eng.forward_sample([a2], *smp, u3, **more)
             plain.append((a1, a2, a3))
             eng.reset()
-            b = [eng.spec_begin(ids, *smp, seed=s * 7919 + 1, uniform=u1)]
+            if pen:
+                eng.penalty_init([])
+            b = [eng.spec_begin(ids, *smp, seed=s * 7919 + 1, uniform=u1, **more)]
             first = eng.spec_step()
             accepted += len(first) - 1
             b += first

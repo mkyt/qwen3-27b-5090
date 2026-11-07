@@ -15,7 +15,7 @@ P, I, I64, F, SZ = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float
 SIGNATURES = {
     "q27_create": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p], P),
     "q27_plan": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p, I64, I64], P),
-    "q27_spec_begin": ([P, P, I, F, I, F, ctypes.c_uint64, F, I, P], I),
+    "q27_spec_begin": ([P, P, I, F, I, F, ctypes.c_uint64, F, I, F, F, F, P], I),
     "q27_spec_step": ([P, P], I),
     "q27_spec_step2": ([P, P, I], I),
     "q27_prefill": ([P, P, I, I, I, P], I),
@@ -54,7 +54,8 @@ SIGNATURES = {
     "q27_reset": ([P], I),
     "q27_pos": ([P], I),
     "q27_forward_topk": ([P, P, I, I, P, P], I),
-    "q27_forward_sample": ([P, P, I, F, I, F, F, P], I),
+    "q27_forward_sample": ([P, P, I, F, I, F, F, F, F, F, P], I),
+    "q27_penalty_init": ([P, P, I], I),
     "q27_profile_dump": ([P], I),
     "q27_configure": ([P], I),
     "q27_last_error": ([], ctypes.c_char_p),
@@ -98,7 +99,7 @@ SIGNATURES = {
     "q27t_attention": ([P, P, I, I, P, P, I, P, P, P, SZ], I),
     "q27t_attention_decode": ([P, P, I, I, P, P, I, P, P, P, SZ], I),
     "q27t_logsoftmax_topk": ([P, I, I, I, P, P], I),
-    "q27t_sample": ([P, I, I, F, I, F, P, P], I),
+    "q27t_sample": ([P, I, I, F, I, F, P, P, F, P, F, F], I),
 }
 
 _lib = None
@@ -208,24 +209,35 @@ class Engine:
         """Prints the per-op GPU time since the last dump to stderr (needs Q27_PROFILE=1)."""
         self._check(lib().q27_profile_dump(self.h), "q27_profile_dump")
 
-    def forward_sample(self, ids, temperature=0.0, top_k=20, top_p=1.0, uniform=0.5):
-        """Runs ids and returns the sampled next token (temperature <= 0: greedy)."""
+    def forward_sample(self, ids, temperature=0.0, top_k=20, top_p=1.0, uniform=0.5, min_p=0.0, presence=0.0,
+                       frequency=0.0):
+        """Runs ids and returns the sampled next token (temperature <= 0: greedy). presence / frequency:
+        OpenAI's penalties by the sequence's output counts (penalty_init)."""
         src = array.array("i", ids)
         out = ctypes.c_int32()
         self._check(lib().q27_forward_sample(self.h, src.buffer_info()[0], len(ids), temperature, top_k, top_p,
-                                             uniform, ctypes.byref(out)), "q27_forward_sample")
+                                             uniform, min_p, presence, frequency, ctypes.byref(out)),
+                    "q27_forward_sample")
         return out.value
+
+    def penalty_init(self, ids):
+        """Sets the running sequence's penalty counts to its output so far (ids) before its first sampled
+        token; forward_sample and the speculative steps count the tokens they output."""
+        src = array.array("i", ids)
+        self._check(lib().q27_penalty_init(self.h, src.buffer_info()[0], len(ids)), "q27_penalty_init")
 
     @property
     def has_draft(self):
         return bool(lib().q27_has_draft(self.h))
 
-    def spec_begin(self, ids, temperature=0.0, top_k=20, top_p=1.0, seed=0, uniform=0.5, max_new=0):
+    def spec_begin(self, ids, temperature=0.0, top_k=20, top_p=1.0, seed=0, uniform=0.5, max_new=0, min_p=0.0,
+                   presence=0.0, frequency=0.0):
         """Speculative decoding: runs the prompt and returns the first token (also fills the draft context)."""
         src = array.array("i", ids)
         out = ctypes.c_int32()
         self._check(lib().q27_spec_begin(self.h, src.buffer_info()[0], len(ids), temperature, top_k, top_p,
-                                         seed & (2**64 - 1), uniform, max_new, ctypes.byref(out)), "q27_spec_begin")
+                                         seed & (2**64 - 1), uniform, max_new, min_p, presence, frequency,
+                                         ctypes.byref(out)), "q27_spec_begin")
         return out.value
 
     def spec_step(self, ahead=True):

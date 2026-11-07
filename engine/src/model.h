@@ -64,8 +64,13 @@ class Model {
   // the top-k (ids, log-probs) of the next token. k <= 64.
   void forward_topk(const int32_t* ids, int n, int k,
                     const std::function<void(int pos, const int32_t* ids, const float* logp)>& cb);
-  // Runs ids[0..n) and samples the token after the last one.
-  int32_t forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform);
+  // Runs ids[0..n) and samples the token after the last one. presence / frequency: penalties (Penalty) by
+  // the running sequence's output counts, which this and the speculative steps keep (see penalty_init).
+  int32_t forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
+                         float min_p = 0.f, float presence = 0.f, float frequency = 0.f);
+  // The running sequence's output so far, ids[0..n), as the penalty counts (before the first sampled
+  // token of a request with penalties; parked sequences keep theirs).
+  void penalty_init(const int32_t* ids, int n);
 
   // Per-op GPU time (Q27_PROFILE=1): every op records an event when it starts; prints the totals
   // per label since the last dump to stderr and resets them.
@@ -185,7 +190,9 @@ class Model {
   GdnSpec gdn_spec(int gdn_layer) const;
   bool fused(int T) const;
   bf16* cap_for(int layer) const;
-  int32_t decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform);
+  int32_t decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform, float min_p, Penalty pen);
+  // Penalty counts [vocab]: the running sequence's (-1), or parking area a's.
+  uint32_t* pen_counts(int a = -1) const { return pen_ + size_t(a + 1) * dims::kVocab; }
   void logits(const float* x_rows, int rows);  // final norm + lm_head into logits_
   void gdn(int layer, int T);
   void attn(int layer, int T);
@@ -384,8 +391,10 @@ class Model {
     float temperature;
     int top_k;
     float top_p;
+    float min_p, presence, frequency;
     bool operator==(const GraphKey& o) const {
-      return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p;
+      return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && min_p == o.min_p &&
+             presence == o.presence && frequency == o.frequency;
     }
   } graph_key_{};
   cudaGraphExec_t graph_exec_ = nullptr;
@@ -431,6 +440,7 @@ class Model {
   KvLayer* kv_layers_dev_ = nullptr;  // device copy of kv_layers_ (KV commit)
   SpecOut *spec_out_ = nullptr, *spec_out_dev_ = nullptr;  // [2] (by step parity), mapped pinned
   int32_t* hist_ = nullptr;   // committed tokens by position (lookup drafting)
+  uint32_t* pen_ = nullptr;   // penalty counts [1 + parking areas][vocab] (pen_counts)
   uint32_t* lk_best_ = nullptr;
   Lookup lookup_{};           // Q27_LOOKUP (default off), Q27_LOOKUP_MIN, Q27_LOOKUP_AGREE
   int64_t stat_steps_ = 0, stat_lookup_ = 0, stat_tokens_ = 0;

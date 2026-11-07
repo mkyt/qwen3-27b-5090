@@ -212,8 +212,10 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
 - Send the previous turns' reasoning back: the chat template renders it, and the prefix cache only hits when it is there.
 - Images as data URLs or http(s) URLs. No video.
 
-Accepted but without effect: `response_format`, the penalties, `min_p`, `tool_choice` other than `auto` / `none`.
-`n > 1` and `logprobs` are rejected.
+Sampling: `temperature`, `top_k`, `top_p`, `min_p`, `presence_penalty` and `frequency_penalty` (OpenAI's, -2 to 2;
+the model card suggests `presence_penalty` 1.5 for non-thinking use), and `seed`. The penalties apply to the 64 most
+likely tokens of each step. Accepted but without effect: `response_format`, `repetition_penalty`, `tool_choice` other
+than `auto` / `none`. `n > 1` and `logprobs` are rejected.
 
 ## Configuration
 

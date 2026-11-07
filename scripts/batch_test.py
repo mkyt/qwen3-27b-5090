@@ -16,6 +16,7 @@ document (the longest golden prompt, repeated and rotated per sequence so no two
 
     docker compose --profile dev run --rm dev python scripts/batch_test.py check
     docker compose --profile dev run --rm dev python scripts/batch_test.py check --seqs 8
+    docker compose --profile dev run --rm dev python scripts/batch_test.py check --penalties   # min_p, presence / frequency
     docker compose --profile dev run --rm dev python scripts/batch_test.py bench --steps 200
     docker compose --profile dev run --rm dev python scripts/batch_test.py bench --ctx 32768 --max-tokens 262144
 """
@@ -40,11 +41,20 @@ from bench_spec import PROMPTS, chat_ids  # noqa: E402
 NAMES = ["code", "json", "prose", "ja"]
 
 
+def begin(eng, rest, smp, seed, uniform=0.5, prior=()):
+    """spec_begin with smp = (temperature, top_k, top_p[, min_p, presence, frequency]); prior: the output so far
+    (the penalty counts)."""
+    t, k, p, *more = smp
+    extra = dict(zip(("min_p", "presence", "frequency"), more))
+    if extra.get("presence") or extra.get("frequency"):
+        eng.penalty_init(list(prior))
+    return eng.spec_begin(rest, t, k, p, seed=seed, uniform=uniform, **extra)
+
+
 def start(eng, ids, smp, seed):
     """prefix_begin + spec_begin of a new running sequence; returns its first token."""
     eng.prefix_begin(ids, spec=True)
-    t, k, p = smp
-    return eng.spec_begin(ids, t, k, p, seed=seed, uniform=random.Random(seed).random())
+    return begin(eng, ids, smp, seed, random.Random(seed).random())
 
 
 def solo(eng, ids, smp, seed, n):
@@ -56,11 +66,14 @@ def solo(eng, ids, smp, seed, n):
 
 
 SAMPLINGS = [(0.0, 1, 1.0), (1.0, 20, 0.95), (0.0, 20, 1.0), (0.7, 40, 0.9)]
+# --penalties: min_p and presence / frequency penalties on three of the four (and greedy with penalties).
+PENALTIES = [(0.0, 1, 1.0, 0.0, 1.5, 0.5), (1.0, 20, 0.95, 0.05, 1.5, 0.0), (0.7, 20, 0.8, 0.0, 0.0, 0.0),
+             (0.6, 40, 0.9, 0.1, 0.5, 1.0)]
 
 
-def make_cases(tok, n, seed0):
+def make_cases(tok, n, seed0, samplings=SAMPLINGS):
     """n sequences: the prompts in turn, and from the fifth on another sampling per prompt (Phase 7)."""
-    return [(chat_ids(tok, PROMPTS[NAMES[i % 4]]), SAMPLINGS[(i + i // 4) % 4], seed0 + i) for i in range(n)]
+    return [(chat_ids(tok, PROMPTS[NAMES[i % 4]]), samplings[(i + i // 4) % 4], seed0 + i) for i in range(n)]
 
 
 def case_name(i):
@@ -68,7 +81,7 @@ def case_name(i):
 
 
 def check(eng, tok, args):
-    cases = make_cases(tok, args.seqs, 100)
+    cases = make_cases(tok, args.seqs, 100, PENALTIES if args.penalties else SAMPLINGS)
     t0 = time.time()
     refs = [solo(eng, ids, smp, seed, args.gen) for ids, smp, seed in cases]
     print(f"solo runs {time.time() - t0:.1f} s", flush=True)
@@ -115,7 +128,7 @@ def check(eng, tok, args):
 
 
 def kvfull(eng, tok, args, KvFull):
-    cases = make_cases(tok, args.seqs, 200)
+    cases = make_cases(tok, args.seqs, 200, PENALTIES if args.penalties else SAMPLINGS)
     refs = [solo(eng, ids, smp, seed, args.gen) for ids, smp, seed in cases]
     outs = [[] for _ in cases]
     where = {}
@@ -175,8 +188,7 @@ def kvfull(eng, tok, args, KvFull):
         out = outs[v]
         cached = eng.prefix_begin(ids + out[:-1], spec=True)
         rest = (ids + out[:-1])[cached:]
-        t, k, p = smp
-        out.append(eng.spec_begin(rest, t, k, p, seed=seed + 1))
+        out.append(begin(eng, rest, smp, seed + 1, prior=out[:-1]))
         while len(out) < args.gen:
             out += eng.spec_step(ahead=False)
         print(f"ok   {case_name(v)}: resumed from {cached} cached tokens, finished at {len(out)}", flush=True)
@@ -244,6 +256,7 @@ def main():
     ap.add_argument("--gen", type=int, default=400, help="check: tokens per sequence")
     ap.add_argument("--seqs", type=int, default=4, help="check / kvfull: sequences (2..8)")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--penalties", action="store_true", help="check / kvfull: samplings with min_p and penalties")
     ap.add_argument("--steps", type=int, default=200, help="bench: steps per run")
     ap.add_argument("--lanes", default="1,2,3,4")
     ap.add_argument("--reps", type=int, default=2)

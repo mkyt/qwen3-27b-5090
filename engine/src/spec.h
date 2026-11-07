@@ -40,6 +40,13 @@ struct SpecSampling {
   float top_p = 1.f;
   int paths = 1;            // draft walks merged into the tree (1: a chain)
   int32_t stop[2] = {-1, -1};  // end-of-sequence ids: an accepted one ends the step as its last token (not fed)
+  float min_p = 0.f;
+  Penalty pen;              // presence / frequency; pen.counts is set where the step is built
+  bool penalized() const { return pen.presence != 0.f || pen.frequency != 0.f; }
+  bool same(const SpecSampling& o) const {  // (the settings a captured step depends on)
+    return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && paths == o.paths &&
+           min_p == o.min_p && pen.presence == o.pen.presence && pen.frequency == o.pen.frequency;
+  }
 };
 
 // The selector's choice, consumed by the accept kernel.
@@ -99,10 +106,22 @@ void topk_rows(const float* logits, int T, int V, int k, float* vals, int32_t* i
 // tokens are appended to hist at *pos (lookup drafting). par (optional): the result goes to out[*par].
 // budget (optional): at most max(1, *budget) tokens are output (an accepted end-of-sequence id, see
 // SpecSampling::stop, also ends the step).
-void spec_accept(int32_t* ids, int32_t* block_ids, const float* tv, const int32_t* ti, int k, DraftChoice choice,
-                 SpecSampling smp, const uint64_t* rng, int32_t* ncommit, int32_t* cpath, SpecOut* out,
-                 int32_t* hist, const int32_t* pos, cudaStream_t s, const int32_t* par = nullptr,
+// ld: entries per row of the top-k lists (>= k; 64 with penalties, see penalize_rows). smp.pen.counts
+// (optional): the committed tokens are counted.
+void spec_accept(int32_t* ids, int32_t* block_ids, const float* tv, const int32_t* ti, int k, int ld,
+                 DraftChoice choice, SpecSampling smp, const uint64_t* rng, int32_t* ncommit, int32_t* cpath,
+                 SpecOut* out, int32_t* hist, const int32_t* pos, cudaStream_t s, const int32_t* par = nullptr,
                  const int32_t* budget = nullptr);
+// The penalties of verify rows, before the accept step: lane z's rows z * rows .. (row r: node r of
+// trees[z]) of the sorted top-64 lists (ld entries per row) get pen[z] (counts plus the tokens on the
+// node's path from the root, the node's own included) and are sorted again. Lanes without counts are left.
+struct PenaltyLanes {
+  Penalty pen[kMaxLanes] = {};
+};
+void penalize_rows(float* tv, int32_t* ti, int ld, int rows, int n, const PenaltyLanes& pl, const SpecTree* trees,
+                   cudaStream_t s);
+// counts[so->tok[i]] += delta for i < so->n (a dropped step's tokens: delta -1).
+void count_out(uint32_t* counts, const SpecOut* so, int delta, cudaStream_t s);
 // Batched steps (P6-10): the sampling of each lane and the length of its top-k lists (1 when greedy).
 struct AcceptLanes {
   SpecSampling smp[kMaxLanes] = {};

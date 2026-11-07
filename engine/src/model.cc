@@ -86,6 +86,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   size_t o_pt = state_.add("page table", max_pages_ * sizeof(int32_t));
   size_t o_pos = state_.add("position", sizeof(int32_t));
   size_t o_delta = state_.add("rope delta", sizeof(int32_t));
+  size_t o_pen = state_.add("penalty counts", size_t(1 + opt.park_slots) * kVocab * 4);
   size_t o_rep = 0, o_par = 0, o_nc = 0, o_rng = 0, o_idv = 0, o_blk = 0, o_tv = 0, o_ti = 0, o_cap = 0, o_hist = 0,
          o_lk = 0, o_tree = 0, o_cpath = 0, o_sbuf = 0, o_kvl = 0, o_bud = 0;
   // Lanes of a batched step (P6-10; MAX_SEQS with a draft model).
@@ -265,6 +266,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   page_table_ = state_.at<int32_t>(o_pt);
   pos_dev_ = state_.at<int32_t>(o_pos);
   rope_delta_ = state_.at<int32_t>(o_delta);
+  pen_ = state_.at<uint32_t>(o_pen);
   x_ = act_.at<float>(o_x), h_ = act_.at<float>(o_h), big1_ = act_.at<float>(o_b1), big2_ = act_.at<float>(o_b2);
   q_ = act_.at<float>(o_q), k_ = act_.at<float>(o_k), v_ = act_.at<float>(o_v), o_ = act_.at<float>(o_o);
   n_ = act_.at<float>(o_n), a_ = act_.at<float>(o_a), b_ = act_.at<float>(o_bb), g_ = act_.at<float>(o_g);
@@ -1200,21 +1202,35 @@ void Model::forward_topk(const int32_t* ids, int n, int k,
   mpos_on_ = false;
 }
 
-int32_t Model::forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform) {
+int32_t Model::forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
+                              float min_p, float presence, float frequency) {
   Q27_CHECK(n > 0, "forward_sample: no tokens");
   spec_flush();
-  if (n == 1 && graphs_ && !cap_) return decode_step(ids[0], temperature, top_k, top_p, uniform);
+  const Penalty pen{presence != 0.f || frequency != 0.f ? pen_ : nullptr, presence, frequency};
+  if (n == 1 && graphs_ && !cap_) return decode_step(ids[0], temperature, top_k, top_p, uniform, min_p, pen);
   int last = 0;
   prompt_chunks(ids, n, n, false, &last);
   logits(x_ + size_t(last) * kHidden, 1);
   Q27_CUDA(cudaMemcpyAsync(uniform_, &uniform, 4, cudaMemcpyHostToDevice, s_));
   mark("sample");
-  sample(logits_, 1, kVocab, temperature, top_k, top_p, uniform_, sampled_, s_);
+  sample(logits_, 1, kVocab, temperature, top_k, top_p, uniform_, sampled_, s_, min_p, pen);
   int32_t out = 0;
   Q27_CUDA(cudaMemcpyAsync(&out, sampled_, 4, cudaMemcpyDeviceToHost, s_));
   Q27_CUDA(cudaStreamSynchronize(s_));
   profile_collect();
   return out;
+}
+
+void Model::penalty_init(const int32_t* ids, int n) {
+  spec_flush();  // (a dropped step would uncount its tokens afterwards)
+  for (int i = 0; i < n; i++) Q27_CHECK(ids[i] >= 0 && ids[i] < kVocab, "penalty_init: not a text token");
+  Q27_CUDA(cudaMemsetAsync(pen_, 0, size_t(kVocab) * 4, s_));
+  for (int c0 = 0; c0 < n; c0 += opt_.prefill_chunk) {  // (through ids_, prefill_chunk entries)
+    const int c = std::min(opt_.prefill_chunk, n - c0);
+    Q27_CUDA(cudaMemcpyAsync(ids_, ids + c0, size_t(c) * 4, cudaMemcpyHostToDevice, s_));
+    count_tokens(pen_, ids_, c, 1, s_);
+    Q27_CUDA(cudaStreamSynchronize(s_));  // (ids_ is reused)
+  }
 }
 
 int Model::prefill(const int32_t* ids, int n, int budget, bool spec) {
@@ -1277,7 +1293,8 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
 // One decode token through a CUDA graph of the whole step (embedding .. sampling). The first call
 // runs eagerly (one-time initialization of the kernels); the second captures the graph, which is
 // reused while the sampling parameters stay the same.
-int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform) {
+int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform, float min_p,
+                           Penalty pen) {
   Q27_CHECK(pos_ + 1 <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   ensure_pages(pos_ + 1);
   seq_ids_.push_back(id);
@@ -1296,11 +1313,11 @@ int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p
     chunk(decode_memcpy_ ? ids_ : &io->id, 1);
     logits(x_, 1);
     sample(logits_, 1, kVocab, temperature, top_k, top_p, decode_memcpy_ ? uniform_ : &io->uniform,
-           decode_memcpy_ ? sampled_ : &io->out, s_);
+           decode_memcpy_ ? sampled_ : &io->out, s_, min_p, pen);
   };
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
-  const GraphKey key{temperature, top_k, top_p};
+  const GraphKey key{temperature, top_k, top_p, min_p, pen.presence, pen.frequency};
   if (!graph_warm_) {
     body();
     graph_warm_ = true;
@@ -1358,6 +1375,7 @@ void Model::spec_flush() {
     Q27_CUDA(cudaStreamSynchronize(s_));
     spec_inflight_ = false;
     set_sbuf(sbuf_host_ ^ 1);
+    if (spec_smp_.penalized()) count_out(pen_, spec_out_dev_ + inflight_slot_, -1, s_);  // (its tokens were counted)
     // Its accept step also made its bonus token the next anchor and took a step of the RNG and its
     // tokens from the budget: undo those, so that spec_step can continue the sequence later (Phase 6:
     // another sequence ran in between).
@@ -1406,7 +1424,8 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   cap_ = cap_buf_;
   int32_t first = 0;
   try {
-    first = forward_sample(ids, n, smp.temperature, smp.top_k, smp.top_p, uniform);
+    first = forward_sample(ids, n, smp.temperature, smp.top_k, smp.top_p, uniform, smp.min_p, smp.pen.presence,
+                           smp.pen.frequency);
   } catch (...) {
     cap_ = nullptr;
     throw;
@@ -1434,7 +1453,9 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
 
 // One step on the device: draft -> verify (8 rows, features captured) -> accept -> draft context ->
 // position / parity / RNG advance.
-void Model::spec_body(const SpecSampling& smp) {
+void Model::spec_body(const SpecSampling& sampling) {
+  SpecSampling smp = sampling;
+  smp.pen.counts = smp.penalized() ? pen_ : nullptr;
   const auto& lm = w_.lm_head;
   Lookup lk = lookup_;
   lk.hist = hist_, lk.pos = pos_dev_, lk.best = lk_best_;
@@ -1453,9 +1474,15 @@ void Model::spec_body(const SpecSampling& smp) {
   logits(x_, W);
   mark("accept");
   const int k = smp.temperature <= 0.f ? 1 : std::clamp(smp.top_k <= 0 ? 64 : smp.top_k, 1, 64);
-  topk_rows(logits_, W, kVocab, k, tv_, ti_, s_);
-  spec_accept(ids_ver_, block_ids_, tv_, ti_, k, draft_->choice, smp, rng_, ncommit_, cpath_, spec_out_dev_, hist_,
-              pos_dev_, s_, par_, budget_);
+  const int ld = smp.pen.counts ? 64 : k;  // (penalties: the top k of the 64 highest logits after them)
+  topk_rows(logits_, W, kVocab, ld, tv_, ti_, s_);
+  if (smp.pen.counts) {
+    PenaltyLanes pl;
+    pl.pen[0] = smp.pen;
+    penalize_rows(tv_, ti_, ld, W, 1, pl, tree_, s_);
+  }
+  spec_accept(ids_ver_, block_ids_, tv_, ti_, k, ld, draft_->choice, smp, rng_, ncommit_, cpath_, spec_out_dev_,
+              hist_, pos_dev_, s_, par_, budget_);
   if (smp.paths > 1) kv_commit(kv_layers_dev_, kAttnLayers, opt_.kv_type, page_table_, pos_dev_, ncommit_, cpath_, s_);
   mark("draft context");
   draft_->append_ctx(cap_buf_, kSpecBlock, pos_dev_, 0, ncommit_, skinny_ws_, kSkinnyWsBytes, nullptr, 0, s_, cpath_);
@@ -1469,9 +1496,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   Q27_CHECK(pos_ + spec_rows(smp) <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   // Pages for this step's rows and for the one launched ahead (the position advances by <= 8).
   ensure_pages(pos_ + kSpecBlock + spec_rows(smp));
-  auto same = [](const SpecSampling& a, const SpecSampling& b) {
-    return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p && a.paths == b.paths;
-  };
+  auto same = [](const SpecSampling& a, const SpecSampling& b) { return a.same(b); };
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
   // Pipelining (Q27_SPEC_PIPELINE, default on): the next step's graph is launched before this step's
@@ -1715,6 +1740,7 @@ int Model::seq_park() {
   reserve_area(a);  // (KvFull: nothing changed but evicted checkpoints)
   SeqState& st = parked_[a];
   for (const Region& r : seq_regions(st.dev)) Q27_CUDA(cudaMemcpyAsync(r.area, r.dev, r.bytes, cudaMemcpyDeviceToDevice, s_));
+  Q27_CUDA(cudaMemcpyAsync(pen_counts(a), pen_, size_t(kVocab) * 4, cudaMemcpyDeviceToDevice, s_));
   seq_scalars(st.scalars, true);
   seq_take(st);
   st.used = true;
@@ -1727,6 +1753,7 @@ void Model::seq_unpark(int a) {
   reset();  // (drops the running sequence, if any)
   SeqState& st = parked_[a];
   for (const Region& r : seq_regions(st.dev)) Q27_CUDA(cudaMemcpyAsync(r.dev, r.area, r.bytes, cudaMemcpyDeviceToDevice, s_));
+  Q27_CUDA(cudaMemcpyAsync(pen_, pen_counts(a), size_t(kVocab) * 4, cudaMemcpyDeviceToDevice, s_));
   seq_scalars(st.scalars, false);
   seq_give(st);
   st.used = false;
@@ -1738,6 +1765,7 @@ void Model::seq_swap(int a) {
   spec_flush();
   SeqState& st = parked_[a];
   for (const Region& r : seq_regions(st.dev)) swap_bytes(r.dev, r.area, r.bytes, s_);
+  swap_bytes(pen_, pen_counts(a), size_t(kVocab) * 4, s_);
   int32_t cur[kSeqScalars];
   seq_scalars(cur, true);
   seq_scalars(st.scalars, false);
@@ -1852,6 +1880,7 @@ void Model::batch_enter(const int32_t* lanes, int n) {
     if (!pages->empty()) upload_pages(pt, pages->data(), pages->size());
     smp.paths = 1;
     std::copy(stop_, stop_ + 2, smp.stop);
+    smp.pen.counts = smp.penalized() ? pen_counts(a) : nullptr;
     bacc_.smp[z] = smp;
     bacc_.k[z] = smp.temperature <= 0.f ? 1 : std::clamp(smp.top_k <= 0 ? 64 : smp.top_k, 1, 64);
   }
@@ -1922,8 +1951,13 @@ void Model::batch_body(int n) {
   cap_ = nullptr;
   logits(x_, W);
   mark("accept");
-  const int K = *std::max_element(bacc_.k, bacc_.k + n);
+  int K = *std::max_element(bacc_.k, bacc_.k + n);
+  PenaltyLanes pl;
+  for (int z = 0; z < n; z++) pl.pen[z] = bacc_.smp[z].pen;
+  const bool pen = std::any_of(pl.pen, pl.pen + n, [](const Penalty& p) { return p.counts != nullptr; });
+  if (pen) K = 64;  // (see spec_body)
   topk_rows(logits_, W, kVocab, K, tv_, ti_, s_);
+  if (pen) penalize_rows(tv_, ti_, K, kSpecBlock, n, pl, b_tree_, s_);
   spec_accept_lanes(n, b_ids_, b_blk_, tv_, ti_, K, bacc_, draft_->lane_cand(), b_tree_, draft_->lane_src(), b_rng_,
                     b_nc_, b_cpath_, b_out_dev_, b_pos_, b_par_, b_budget_, s_);
   mark("draft context");
@@ -1952,7 +1986,7 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     auto same_acc = [&](const AcceptLanes& a) {
       for (int z = 0; z < n; z++) {
         const SpecSampling &x = a.smp[z], &y = bacc_.smp[z];
-        if (x.temperature != y.temperature || x.top_k != y.top_k || x.top_p != y.top_p) return false;
+        if (!x.same(y)) return false;
       }
       return true;
     };

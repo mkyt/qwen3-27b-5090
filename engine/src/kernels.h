@@ -316,9 +316,20 @@ void kv_commit(KvLayer* layers_dev, int nlayers, KvType kv_type, const int32_t* 
 
 // Per row: log-softmax, then the k most likely tokens (descending). k <= 64.
 void logsoftmax_topk(const float* logits, int T, int V, int k, int32_t* ids, float* logp, cudaStream_t s);
-// Samples one token per row from softmax(logits / temperature) restricted to top_k (1..64) and top_p.
-// temperature <= 0 means greedy. `uniform` holds one U(0,1) number per row.
+// Presence / frequency penalties (OpenAI's, on the logits before the temperature): a token's logit
+// -= presence * (c > 0) + frequency * c, c its count in the sequence's output so far (counts[vocab],
+// which the samplers keep up to date) and, in a verify row, on the row's draft path. They are applied
+// to the 64 highest logits, and top_k is taken from those afterwards.
+struct Penalty {
+  uint32_t* counts = nullptr;  // nullptr: no penalties
+  float presence = 0.f, frequency = 0.f;
+};
+// Samples one token per row from softmax(logits / temperature) restricted to top_k (1..64), min_p (the
+// tokens at least min_p times as likely as the top one) and top_p. temperature <= 0 means greedy.
+// `uniform` holds one U(0,1) number per row. pen (optional): penalties first, and the token is counted.
 void sample(const float* logits, int T, int V, float temperature, int top_k, float top_p, const float* uniform,
-            int32_t* out, cudaStream_t s);
+            int32_t* out, cudaStream_t s, float min_p = 0.f, Penalty pen = {});
+// counts[ids[i]] += delta for i < n (the penalty counts of a sequence's output).
+void count_tokens(uint32_t* counts, const int32_t* ids, int n, int delta, cudaStream_t s);
 
 }  // namespace q27

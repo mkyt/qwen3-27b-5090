@@ -199,17 +199,26 @@ int q27_forward_topk(void* m, const int32_t* ids, int n, int k, int32_t* out_ids
   });
 }
 
-// Runs n tokens and samples the next one (temperature <= 0: greedy).
+// Runs n tokens and samples the next one (temperature <= 0: greedy; presence / frequency: Model::forward_sample).
 int q27_forward_sample(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
-                       int32_t* out) {
-  return guard([&] { *out = static_cast<Model*>(m)->forward_sample(ids, n, temperature, top_k, top_p, uniform); });
+                       float min_p, float presence, float frequency, int32_t* out) {
+  return guard([&] {
+    *out = static_cast<Model*>(m)->forward_sample(ids, n, temperature, top_k, top_p, uniform, min_p, presence,
+                                                  frequency);
+  });
+}
+
+// The running sequence's output so far as its penalty counts (Model::penalty_init).
+int q27_penalty_init(void* m, const int32_t* ids, int n) {
+  return guard([&] { static_cast<Model*>(m)->penalty_init(ids, n); });
 }
 
 // Speculative decoding: prompt + first token, then steps of 1..8 new tokens (out[8]; returns the count).
 int q27_spec_begin(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, uint64_t seed,
-                   float uniform, int max_new, int32_t* out) {
+                   float uniform, int max_new, float min_p, float presence, float frequency, int32_t* out) {
   return guard([&] {
     SpecSampling smp{temperature, top_k, top_p, 0};  // paths 0: Q27_SPEC_PATHS
+    smp.min_p = min_p, smp.pen.presence = presence, smp.pen.frequency = frequency;
     *out = static_cast<Model*>(m)->spec_begin(ids, n, smp, seed, uniform, max_new);
   });
 }
@@ -601,8 +610,10 @@ int q27t_logsoftmax_topk(const float* logits, int T, int V, int k, int32_t* ids,
   return kernel([&] { logsoftmax_topk(logits, T, V, k, ids, logp, ts()); });
 }
 int q27t_sample(const float* logits, int T, int V, float temperature, int top_k, float top_p, const float* uniform,
-                int32_t* out) {
-  return kernel([&] { sample(logits, T, V, temperature, top_k, top_p, uniform, out, ts()); });
+                int32_t* out, float min_p, uint32_t* counts, float presence, float frequency) {
+  return kernel([&] {
+    sample(logits, T, V, temperature, top_k, top_p, uniform, out, ts(), min_p, Penalty{counts, presence, frequency});
+  });
 }
 
 }  // extern "C"

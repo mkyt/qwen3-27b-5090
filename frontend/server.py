@@ -667,9 +667,19 @@ def sampling_of(body, top_k_key="top_k"):
     temp = body.get("temperature")
     top_p = body.get("top_p")
     top_k = body.get(top_k_key)
+    extra = {}
+    for key, lo, hi in (("min_p", 0.0, 1.0), ("presence_penalty", -2.0, 2.0), ("frequency_penalty", -2.0, 2.0)):
+        v = body.get(key)
+        try:
+            v = 0.0 if v is None else float(v)
+        except (TypeError, ValueError):
+            raise ApiError(400, f"{key}: a number is required") from None
+        if not lo <= v <= hi:
+            raise ApiError(400, f"{key}: must be in [{lo:g}, {hi:g}], got {v:g}")
+        extra[key] = v
     return {"temperature": float(DEFAULTS["temperature"] if temp is None else temp),
             "top_k": int(DEFAULTS["top_k"] if top_k is None else top_k) if (top_k is None or top_k >= 0) else 0,
-            "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": body.get("seed")}
+            "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": body.get("seed"), **extra}
 
 
 def stops_of(value):

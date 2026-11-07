@@ -209,9 +209,16 @@ from an anchor and verifies all 8 rows in one forward of the target.
   token and layer), and the next step's GDN kernel first replays the accepted tokens onto the state, in the same
   kernel and before its PDL wait. One state slot per request is enough.
 - **Lossless sampling.** Acceptance is rejection sampling against the target's distribution with the request's
-  own temperature, top-k and top-p, so the output has the target's distribution exactly (checked with chi-square
-  tests in `scripts/spec_sampling_test.py`). With greedy decoding, speculative and plain decoding give identical
-  tokens (`scripts/bench_spec.py --check-greedy`).
+  own temperature, top-k, min-p and top-p, so the output has the target's distribution exactly (checked with
+  chi-square tests in `scripts/spec_sampling_test.py`). With greedy decoding, speculative and plain decoding give
+  identical tokens (`scripts/bench_spec.py --check-greedy`).
+- **Penalties on the device.** Presence and frequency penalties count each sequence's output tokens in a
+  vocabulary-sized array on the device (1 MiB per sequence), updated by the accept step itself, so pipelined
+  steps need no host round trip. A verify row also counts the draft tokens on its own path, so every row sees the
+  history plain decoding would have had, and acceptance stays lossless. The penalties are applied to the 64
+  highest logits of a row (one small kernel that re-sorts them), and top-k is taken from those. Requests without
+  penalties run the same kernels and graphs as before (`scripts/penalty_test.py` checks the tokens against a host
+  implementation and speculative against plain decoding).
 - **Stops at EOS and `max_tokens`.** A step never commits tokens past them, so the end of a generation is a clean
   prefix of the next turn's prompt ([§9](#9-prefix-cache)).
 
