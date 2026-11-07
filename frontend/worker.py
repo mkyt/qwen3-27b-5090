@@ -77,6 +77,13 @@ class Seq:
         self.arrival = now
         self.out = []            # generated tokens (EOS excluded)
         self.eng_ids = self.prompt  # what the engine runs (prompt + earlier output after a preemption)
+        # Forced output (tool_choice): (token id, ids) continues the output with ids after that token (the end of the
+        # reasoning); with no token id, the output starts with them. unsent: forced tokens the server has not got yet
+        # (they go out with the next generated ones).
+        self.force, self.unsent = req.get("force"), []
+        if self.force is not None and self.force[0] is None:
+            self.out, self.force = list(self.force[1]), None
+            self.eng_ids, self.unsent = self.prompt + self.out, list(self.out)
         self.started = False     # prefix_begin done (the engine holds its state: running or parked)
         self.area = None         # parking area while parked
         self.phase = PREFILL
@@ -485,6 +492,8 @@ class Scheduler:
             log(f"{s.rid}: prompt {len(s.prompt)} tokens, cached {cached} of {s.reusable} reusable, "
                 f"waited {time.time() - s.arrival:.2f} s, checkpoints at {s.at}")
             self.send("start", s.rid, {"cached": cached})
+        else:  # (after a preemption or a forced output)
+            log(f"{s.rid}: resumed at {len(s.eng_ids)} tokens, {cached} restored from the prefix cache")
         if s.images:
             import imageproc
 
@@ -527,18 +536,20 @@ class Scheduler:
             s.phase = DECODE
             if s.first_token is None:
                 s.first_token = time.time()
+        fed = s.fed  # (a forced output in the emit starts the request again: s.fed is 0 after it)
+        if s.phase == DECODE:
             self.emit(s, [tok], self.engine.logprobs() if s.logprobs >= 0 else None)
         dt = time.time() - t0
         s.last_run = time.time()
         s.prefill_s += dt
-        s.computed += s.fed - fed0
+        s.computed += fed - fed0
         if s.phase == DECODE and not s.dead:
             # The server answers a request its stop string ends with this and its own count of the steps after
             # it, rather than wait for "done", which follows the cancel only after the engine's next step.
             self.send("prefilled", s.rid, {"ttft": s.first_token - s.arrival, "prefill_s": s.prefill_s,
                                            "computed_tokens": s.computed, "drafted": s.drafted,
                                            "draft_accepted": s.draft_accepted, "draft_block": self.draft_block if self.spec else 0})
-        self.m["q27:prefill_tokens_total"] += s.fed - fed0
+        self.m["q27:prefill_tokens_total"] += fed - fed0
         if any(o.phase == DECODE for o in self.alive if o is not s):
             self.credit += self.share * dt
 
@@ -549,7 +560,7 @@ class Scheduler:
         has_prefill = any(o.phase == PREFILL for o in self.alive)
         turn = min(self.quantum, max(self.credit, 0.0)) if has_prefill else self.quantum
         step, n0 = 0.0, len(s.out)
-        while not s.dead:
+        while not s.dead and s.phase == DECODE:  # (a forced output makes it a prefill again)
             now = time.time()
             last = (others and now + step >= t0 + turn) or self.conn.poll(0)
             ts = time.time()
@@ -591,7 +602,7 @@ class Scheduler:
                 s.steps += 1
                 self.count_draft(s, toks)
                 self.emit(s, toks, self.engine.logprobs(z) if s.logprobs >= 0 else None)
-            if any(s.dead for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0):
+            if any(s.dead or s.phase != DECODE for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0):
                 break
         dt = time.time() - t0
         self.measure(len(seqs), sum(len(s.out) for s in seqs) - n0, dt)
@@ -607,9 +618,9 @@ class Scheduler:
         s.draft_accepted += len(toks) - 1
 
     def emit(self, s, toks, logprobs=None):
-        """Tokens of a step: stops at EOS and at max_new; the rest goes to the server (with their logprobs, when the
-        request asked for them)."""
-        out, finish = [], None
+        """Tokens of a step: stops at EOS and at max_new, and at the token a forced output follows (force); the rest goes
+        to the server (with their logprobs, when the request asked for them), after forced tokens not sent yet."""
+        out, finish, force = [], None, None
         for t in toks:
             if t in self.eos:
                 finish = "stop"
@@ -618,15 +629,43 @@ class Scheduler:
             if len(s.out) + len(out) >= s.max_new:
                 finish = "length"
                 break
+            if s.force is not None and t == s.force[0]:
+                force = s.force[1]
+                break
         if out:
             s.out += out
             self.m["q27:generation_tokens_total"] += len(out)
-            if logprobs is None:
-                self.send("tok", s.rid, out)
-            else:
-                self.send("tok", s.rid, out, logprobs[:len(out)])
+        if out or s.unsent:
+            self.send_toks(s, out, logprobs)
         if finish:
             self.finish(s, finish)
+        elif force is not None:
+            self.force_output(s, force)
+
+    def send_toks(self, s, out, logprobs=None):
+        """Sends output tokens, after the forced ones not sent yet (their logprob: 0, no top entries)."""
+        forced, s.unsent = s.unsent, []
+        if s.logprobs < 0:
+            self.send("tok", s.rid, forced + out)
+        else:
+            self.send("tok", s.rid, forced + out, [(0.0, [])] * len(forced) + list((logprobs or [])[:len(out)]))
+
+    def force_output(self, s, ids):
+        """The output continues with ids (the forced start of a tool call after the reasoning, tool_choice): s's state
+        becomes a prefix cache checkpoint and s runs its prompt + output + ids from the deepest one (its own if the
+        tokens committed past the reasoning's end are ids', else the start of the generation prompt: the reasoning
+        is computed again)."""
+        s.force = None
+        ids = list(ids[:s.max_new - len(s.out)])
+        s.out += ids
+        s.unsent += ids
+        self.m["q27:forced_outputs_total"] += 1
+        if len(s.out) >= s.max_new:
+            self.send_toks(s, [])
+            self.finish(s, "length")
+            return
+        self.restart(s)
+        s.est_cached = len(s.eng_ids) - len(ids)  # (prompt + output up to the reasoning's end: its own checkpoint)
 
     def suspend(self, v):
         """Preemption (KV pool full): v's state becomes a prefix cache checkpoint and its pages go back; it
@@ -634,6 +673,17 @@ class Scheduler:
         saved = len(v.eng_ids) if v.phase == DECODE else v.fed
         log(f"{v.rid}: preempted at {saved} tokens (KV pool full)")
         self.send("event", v.rid, "preempt", f"preempted at {saved} tokens (KV pool full)")
+        self.restart(v)
+        v.est_cached = min(saved, len(v.eng_ids) - 1)  # (the checkpoint it resumes from)
+        v.preempted += 1
+        self.m["q27:preemptions_total"] += 1
+        self.alive.remove(v)
+        self.waiting.appendleft(v)
+        v.held = False
+
+    def restart(self, v):
+        """v's state becomes a prefix cache checkpoint and leaves the engine; v runs again as a prompt of its prompt +
+        output (prefix_begin restores the deepest checkpoint of that)."""
         if v is self.cur:
             self.engine.checkpoint()
             self.engine.reset()
@@ -643,12 +693,6 @@ class Scheduler:
             v.area = None
         v.eng_ids = v.prompt + v.out  # (ids_bytes follows the new length)
         v.started, v.fed, v.phase = False, 0, PREFILL
-        v.est_cached = min(saved, len(v.eng_ids) - 1)  # (the checkpoint it resumes from)
-        v.preempted += 1
-        self.m["q27:preemptions_total"] += 1
-        self.alive.remove(v)
-        self.waiting.appendleft(v)
-        v.held = False
 
     def finish(self, s, reason, save=True, notify=True):
         if s.dead:

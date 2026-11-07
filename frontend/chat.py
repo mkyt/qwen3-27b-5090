@@ -97,6 +97,44 @@ def openai_call(call, index=None):
     return out
 
 
+def tool_choice_of(choice, tools):
+    """(mode, name) of a tool_choice: "auto", "none", "required" (a call of any tool) or "named" (a call of that tool).
+    Takes OpenAI chat's ("required", {"type": "function", "function": {"name"}}), the Responses API's
+    ({"type": "function" | "custom", "name"}, {"type": "allowed_tools", "mode"}: its tool list is not enforced) and
+    Anthropic's ({"type": "auto" | "any" | "tool" | "none", "name"}) forms."""
+    if choice is None:
+        return "auto", None
+    kind, name = choice, None
+    if isinstance(choice, dict):
+        kind = choice.get("type")
+        if kind in ("function", "custom", "tool"):
+            name = choice.get("name") or (choice.get("function") or {}).get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"tool_choice: a {kind} choice needs the tool's name")
+            kind = "named"
+        elif kind == "allowed_tools":
+            mode = choice.get("mode") or (choice.get("allowed_tools") or {}).get("mode")
+            kind = "required" if mode == "required" else "auto"
+    kind = {"any": "required"}.get(kind, kind)
+    if kind not in ("auto", "none", "required", "named"):
+        raise ValueError(f"tool_choice: unknown value {choice!r}")
+    if kind in ("required", "named") and not tools:
+        raise ValueError("tool_choice: a call is required but the request has no tools")
+    if kind == "named" and name not in tool_schemas(tools):
+        raise ValueError(f"tool_choice: no tool named {name!r} in tools")
+    return kind, name
+
+
+def forced_call(mode, name):
+    """The start of the answer a tool_choice forces (None: none), as the chat template renders a call without text
+    before it. For any tool it stops before the "=" ("=name" is often one token) and the model writes the name."""
+    if mode == "required":
+        return TOOL_START + "\n<function"
+    if mode == "named":
+        return f"{TOOL_START}\n<function={name}>\n"
+    return None
+
+
 def _partial_suffix(text, marker):
     """Length of the longest suffix of text that is a proper prefix of marker."""
     for n in range(min(len(marker) - 1, len(text)), 0, -1):

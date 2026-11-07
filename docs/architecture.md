@@ -349,6 +349,14 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
 
 - The chat template is the checkpoint's Jinja template; reasoning (`<think>`) and tool calls (Qwen's XML format)
   are parsed by one state machine for streaming and non-streaming responses, and tool calls stream one by one.
+- **Forced tool calls** (`tool_choice` naming a tool, or requiring any): the request carries tokens the output must
+  continue with, `<tool_call>\n<function=name>\n` (for any tool, up to `<function`, as `=name` is often one token).
+  Without thinking they follow the prompt at once. With thinking they follow the reasoning: when `</think>` comes
+  out, the scheduler drops the step's tokens after it, turns the sequence's state into a prefix cache checkpoint (as
+  a preemption does) and runs the prompt, the output and the forced tokens as a new prompt. The checkpoint matches
+  when the tokens the step committed past `</think>` were the forced ones (the model was about to call a tool);
+  otherwise the reasoning is computed again from an earlier checkpoint (about 0.1 s per 1,000 tokens). The forced
+  tokens are output tokens (usage, logprobs with logprob 0) and go through the same parser.
 - Anthropic `thinking` is honored; with `display: omitted`, the reasoning travels in the signature so that the next
   turn's prompt (and the prefix cache) still has it.
 - The server marks message boundaries for the prefix cache and reports, per request, how many tokens came from it.

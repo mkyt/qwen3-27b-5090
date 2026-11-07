@@ -3,6 +3,8 @@
 
 OpenAI: streamed tool calls, include_usage, stop strings, completions. Anthropic: messages (non-streaming and
 streaming events), thinking on / off, tool_use -> tool_result turn, stop_sequences, count_tokens, error format.
+tool_choice: a call forced (a named tool, any tool) where the model would answer in text, in the OpenAI chat,
+Anthropic and Responses forms, with thinking on and off.
 Server: requests run at once give the same greedy text as one at a time (switching sequences is exact), a
 closed connection cancels its request, /v1/models and /metrics.
 
@@ -275,17 +277,85 @@ def cancel_tests(cl):
     check("a closed non-streaming request is cancelled", metric('q27:requests_finished_total{reason="cancelled"}') > before)
 
 
+def tool_choice_tests(cl):
+    """A question the model answers without tools: the tool_choice forces a call anyway."""
+    tools = TOOLS + [{"type": "function", "function": {"name": "list_dir", "description": "List a directory.",
+                                                       "parameters": {"type": "object", "properties": {
+                                                           "path": {"type": "string"}}, "required": ["path"]}}}]
+    q = [{"role": "user", "content": "What is 17 + 25? Answer with the number only."}]
+    named = {"type": "function", "function": {"name": "list_dir"}}
+
+    def metric(name):
+        _, text = cl.get("/metrics")
+        return sum(float(line.split()[-1]) for line in text.splitlines() if line.startswith(name))
+
+    forced0 = metric("q27:forced_outputs_total")
+    st, r = cl.post("/v1/chat/completions", {"messages": q, "tools": tools, "tool_choice": named, "max_tokens": 2048,
+                                             "temperature": 0, "logprobs": True, "top_logprobs": 2})
+    ch = r["choices"][0] if st == 200 else {}
+    msg, calls = ch.get("message", {}), ch.get("message", {}).get("tool_calls") or []
+    check("tool_choice: openai named, thinking on: one call of that tool after the reasoning",
+          st == 200 and len(calls) == 1 and calls[0]["function"]["name"] == "list_dir" and bool(msg.get("reasoning_content"))
+          and not msg.get("content") and ch["finish_reason"] == "tool_calls", json.dumps(r)[:400])
+    check("tool_choice: logprobs cover the forced tokens too",
+          st == 200 and len(ch["logprobs"]["content"]) == r["usage"]["completion_tokens"]
+          and any(e["logprob"] == 0.0 and e["token"] == "<tool_call>" for e in ch["logprobs"]["content"]),
+          f"{len((ch.get('logprobs') or {}).get('content') or [])} entries, usage {r.get('usage')}")
+    check("tool_choice: the forced output counted (q27:forced_outputs_total)", metric("q27:forced_outputs_total") == forced0 + 1)
+
+    ev = cl.stream("/v1/chat/completions", {"messages": q, "tools": tools, "tool_choice": "required", "max_tokens": 512,
+                                            "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}})
+    calls = [tc for _, e in ev for c in e.get("choices", []) for tc in c["delta"].get("tool_calls", [])]
+    finish = [c["finish_reason"] for _, e in ev for c in e.get("choices", []) if c.get("finish_reason")]
+    check("tool_choice: openai required, stream, thinking off: a call of one of the tools",
+          bool(calls) and calls[0]["function"]["name"] in ("read_file", "list_dir") and finish == ["tool_calls"],
+          json.dumps(calls)[:300])
+
+    st, r = cl.post("/v1/chat/completions", {"messages": q, "tools": tools, "tool_choice": "none", "max_tokens": 512,
+                                             "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}})
+    check("tool_choice: none answers in text", st == 200 and "42" in (r["choices"][0]["message"]["content"] or "")
+          and not r["choices"][0]["message"].get("tool_calls"), json.dumps(r)[:300])
+
+    st, r = cl.post("/v1/chat/completions", {"messages": q, "tools": tools, "max_tokens": 8,
+                                             "tool_choice": {"type": "function", "function": {"name": "write_file"}}})
+    check("tool_choice: an unknown tool gives 400", st == 400 and "write_file" in r["error"]["message"], str(r))
+
+    a_tools = A_TOOLS + [{"name": "list_dir", "description": "List a directory.",
+                          "input_schema": tools[1]["function"]["parameters"]}]
+    base = {"model": "x", "max_tokens": 2048, "temperature": 0, "messages": q, "tools": a_tools}
+    st, r = cl.post("/v1/messages", dict(base, tool_choice={"type": "any"}, thinking={"type": "enabled", "budget_tokens": 1024}))
+    blocks = r.get("content", []) if st == 200 else []
+    check("tool_choice: anthropic any, thinking on: thinking then tool_use",
+          st == 200 and [b["type"] for b in blocks][:1] == ["thinking"] and any(b["type"] == "tool_use" for b in blocks)
+          and r["stop_reason"] == "tool_use", json.dumps(r)[:400])
+    ev = cl.stream("/v1/messages", dict(base, tool_choice={"type": "tool", "name": "read_file"}, thinking={"type": "disabled"}))
+    starts = [e["content_block"] for _, e in ev if e.get("type") == "content_block_start"]
+    stop = [e["delta"]["stop_reason"] for _, e in ev if e.get("type") == "message_delta"]
+    check("tool_choice: anthropic tool, stream, thinking off: one tool_use of that tool",
+          [b["type"] for b in starts] == ["tool_use"] and starts[0]["name"] == "read_file" and stop == ["tool_use"],
+          json.dumps(starts)[:300])
+
+    r_tools = [{"type": "function", "name": t["function"]["name"], "description": t["function"]["description"],
+                "parameters": t["function"]["parameters"]} for t in tools]
+    st, r = cl.post("/v1/responses", {"input": q[0]["content"], "tools": r_tools, "max_output_tokens": 2048, "temperature": 0,
+                                      "tool_choice": {"type": "function", "name": "list_dir"}})
+    items = r.get("output", []) if st == 200 else []
+    calls = [it for it in items if it["type"] == "function_call"]
+    check("tool_choice: responses named function: one function_call of that tool",
+          st == 200 and len(calls) == 1 and calls[0]["name"] == "list_dir" and r["status"] == "completed", json.dumps(r)[:400])
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", default="http://127.0.0.1:8000")
-    ap.add_argument("--only", default="openai,anthropic,concurrency,cancel")
+    ap.add_argument("--only", default="openai,anthropic,tool_choice,concurrency,cancel")
     args = ap.parse_args()
     cl = Client(args.base_url)
     st, models = cl.get("/v1/models")
     m = json.loads(models)["data"][0]
     check("/v1/models", st == 200 and m["id"] == "qwen3.8-27b" and m["max_model_len"] > 0, f"{m['id']} {m['max_model_len']}")
     for part in args.only.split(","):
-        {"openai": openai_tests, "anthropic": anthropic_tests, "concurrency": concurrency_tests,
+        {"openai": openai_tests, "anthropic": anthropic_tests, "tool_choice": tool_choice_tests, "concurrency": concurrency_tests,
          "cancel": cancel_tests}[part](cl)
     print("PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
     sys.exit(1 if FAILS else 0)

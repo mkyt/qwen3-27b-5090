@@ -214,8 +214,12 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
 
 Sampling: `temperature`, `top_k`, `top_p`, `min_p`, `presence_penalty` and `frequency_penalty` (OpenAI's, -2 to 2;
 the model card suggests `presence_penalty` 1.5 for non-thinking use), and `seed`. The penalties apply to the 64 most
-likely tokens of each step. Accepted but without effect: `response_format`, `repetition_penalty`, `tool_choice` other
-than `auto` / `none`. `n > 1` is rejected.
+likely tokens of each step. Accepted but without effect: `response_format`, `repetition_penalty`. `n > 1` is rejected.
+
+Tool choice: `tool_choice` forces a call in all three APIs: a named tool (OpenAI `{"type": "function", ...}`, Anthropic
+`{"type": "tool", "name": ...}`) gives one call of it, any tool (`required`, Anthropic `any`) at least one call. The
+server writes the start of the call into the answer (after the reasoning, with thinking on) and the model writes the
+arguments; they are not checked against the tool's schema. Responses `allowed_tools` is taken as its `mode` alone.
 
 Logprobs: chat completions take `logprobs: true` and `top_logprobs` (0 to 20), completions `logprobs` (0 to 20), also
 when streaming. The values are the model's raw log-probabilities (before the temperature, penalties and top-k / top-p,

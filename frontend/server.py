@@ -42,10 +42,10 @@ sys.path.insert(0, str(ROOT / "reference"))
 import worker  # noqa: E402
 from launch import ENGINE_ENV_DEFAULTS, Launch, env_settings, model_dir, set_engine_env  # noqa: E402,F401
 from stats import HUB, request_meta  # noqa: E402
-from chat import (STOP_REASON, AnthropicError, OutputParser, _partial_suffix, anthropic_messages,  # noqa: E402,F401
-                  anthropic_template_kwargs, new_id, normalize_messages, openai_call, parse_output,
-                  parse_tool_calls, responses_messages, responses_template_kwargs, split_reasoning,
-                  template_kwargs, thinking_signature)
+from chat import (STOP_REASON, THINK_END, AnthropicError, OutputParser, _partial_suffix,  # noqa: E402,F401
+                  anthropic_messages, anthropic_template_kwargs, forced_call, new_id, normalize_messages,
+                  openai_call, parse_output, parse_tool_calls, responses_messages, responses_template_kwargs,
+                  split_reasoning, template_kwargs, thinking_signature, tool_choice_of)
 
 MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "qwen3.8-27b")
 DEFAULTS = {"temperature": 1.0, "top_k": 20, "top_p": 0.95}  # generation_config.json of the checkpoint
@@ -464,7 +464,7 @@ class Generation:
     whose text has been yielded so far (a token is out with the piece its text starts in; the tokens of a stop string
     that cut the text are not), as (text offset, token id, logprob, [(id, logprob)])."""
 
-    def __init__(self, server, ids, max_new, sampling, stop=(), images=None, sock=None, keepalive=None):
+    def __init__(self, server, ids, max_new, sampling, stop=(), images=None, sock=None, keepalive=None, force=None):
         self.server, self.sock, self.keepalive = server, sock, keepalive
         self.stops = [s for s in stop if s]
         self.prompt_tokens = len(ids)
@@ -473,7 +473,7 @@ class Generation:
         # For _stopped_timings: the last "prefilled" info, (arrival time, tokens) of the prefill's "tok" and those after
         # it, and when the first token came.
         self.prefilled, self.toks, self.first_tok = None, [], None
-        req = dict(ids=ids, max_new=max_new, images=images, **sampling)
+        req = dict(ids=ids, max_new=max_new, images=images, force=force, **sampling)
         self.sampling_logprobs = sampling.get("logprobs", -1)
         self.rid, self.q = server.engine.submit(req)
         self.detok = Detokenizer(server.tok, server.tok_lock)
@@ -674,6 +674,17 @@ class Server:
             ids, spans, pixels = proc.prepare(ids, urls, self.pad_id)
             images = (spans, pixels)
         return ids, images
+
+    def force(self, choice, thinking):
+        """The worker's forced output of a tool choice ((mode, name), chat.tool_choice_of), or None: the start of a
+        call, at the start of the answer, or with thinking after the reasoning's end (`</think>`, then a blank line
+        as the template renders it)."""
+        text = forced_call(*choice)
+        if text is None:
+            return None
+        if not thinking:
+            return (None, self.encode(text))
+        return (self.tok.token_id(THINK_END), self.encode("\n\n" + text))
 
     def limit(self, n_prompt, anthropic=False):
         left = self.max_tokens - n_prompt - SPEC_MARGIN
@@ -931,7 +942,8 @@ class Handler(BaseHTTPRequestHandler):
         kwargs = template_kwargs(body, self.srv.thinking_default)
         thinking = kwargs.get("enable_thinking", True) is not False
         tools = body.get("tools") or None
-        parse_tools = tools is not None and body.get("tool_choice") != "none"
+        choice = tool_choice_of(body.get("tool_choice"), tools)
+        parse_tools = tools is not None and choice[0] != "none"
         messages = normalize_messages(body.get("messages"))
         ids, images = self.srv.render(messages, tools, kwargs)
         left = self.srv.limit(len(ids))
@@ -941,10 +953,10 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream"))
         keep = (lambda: self._keepalive_comment()) if stream else None
         gen = Generation(self.srv, ids, min(max_new, left), dict(sampling_of(body), logprobs=nlp),
-                         stops_of(body.get("stop")), images, self.connection, keep)
+                         stops_of(body.get("stop")), images, self.connection, keep, self.srv.force(choice, thinking))
         parser = OutputParser(thinking, tools if parse_tools else None)
         rid, created, model = f"chatcmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
-        single_call = body.get("parallel_tool_calls") is False
+        single_call = body.get("parallel_tool_calls") is False or choice[0] == "named"
         if stream:
             return self._chat_stream(gen, parser, rid, created, model, body, single_call)
         reasoning, content, calls = [], [], []
@@ -1082,12 +1094,13 @@ class Handler(BaseHTTPRequestHandler):
         ids, images, tools, thinking = self._anthropic_prompt(body)
         left = self.srv.limit(len(ids), anthropic=True)
         tc = body.get("tool_choice") or {}
-        parse_tools = bool(tools) and tc.get("type") != "none"
-        single_call = bool(tc.get("disable_parallel_tool_use"))
+        choice = tool_choice_of(body.get("tool_choice"), tools)
+        parse_tools = bool(tools) and choice[0] != "none"
+        single_call = bool(tc.get("disable_parallel_tool_use")) or choice[0] == "named"
         stream = bool(body.get("stream"))
         keep = (lambda: self._sse({"type": "ping"}, "ping")) if stream else None
         gen = Generation(self.srv, ids, min(body["max_tokens"], left), sampling_of(body),
-                         stops_of(body.get("stop_sequences")), images, self.connection, keep)
+                         stops_of(body.get("stop_sequences")), images, self.connection, keep, self.srv.force(choice, thinking))
         parser = OutputParser(thinking, tools if parse_tools else None)
         mid, model = f"msg_{gen.rid[4:]}", self._model(body)
         omit = (body.get("thinking") or {}).get("display") == "omitted" if isinstance(body.get("thinking"), dict) else False
@@ -1200,10 +1213,11 @@ class Handler(BaseHTTPRequestHandler):
         ids, images = self.srv.render(normalize_messages(messages), tools, kwargs)
         left = self.srv.limit(len(ids))
         max_new = min(body.get("max_output_tokens") or left, left)
-        parse_tools = bool(tools) and body.get("tool_choice") != "none"
+        choice = tool_choice_of(body.get("tool_choice"), tools)
+        parse_tools = bool(tools) and choice[0] != "none"
         stream = bool(body.get("stream"))
         gen = Generation(self.srv, ids, max_new, sampling_of(body), (), images, self.connection,
-                         (lambda: self._keepalive_comment()) if stream else None)
+                         (lambda: self._keepalive_comment()) if stream else None, self.srv.force(choice, thinking))
         parser = OutputParser(thinking, tools if parse_tools else None)
         resp = {"id": f"resp_{gen.rid[4:]}", "object": "response", "created_at": int(time.time()), "status": "in_progress",
                 "model": self._model(body), "output": [], "instructions": body.get("instructions"),
@@ -1213,7 +1227,7 @@ class Handler(BaseHTTPRequestHandler):
                 "max_output_tokens": body.get("max_output_tokens"), "usage": None, "error": None,
                 "incomplete_details": None, "metadata": body.get("metadata") or {}}
         out = ResponsesOut(self._sse if stream else None, "reasoning.encrypted_content" in (body.get("include") or []),
-                           namespaces, custom, body.get("parallel_tool_calls") is False)
+                           namespaces, custom, body.get("parallel_tool_calls") is False or choice[0] == "named")
         if stream:
             self._sse_start()
             out.ev("response.created", response=resp)
