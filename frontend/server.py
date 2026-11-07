@@ -477,6 +477,9 @@ class Generation:
         self.prefilled, self.toks, self.first_tok = None, [], None
         req = dict(ids=ids, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
         self.sampling_logprobs = sampling.get("logprobs", -1)
+        # (ignore_eos: the end-of-sequence tokens count and have logprobs, but their text is left out, as vLLM's
+        # skip_special_tokens does)
+        self.hide = set(getattr(server.engine, "cfg", {}).get("eos", ())) if sampling.get("ignore_eos") else set()
         self.rid, self.q = server.engine.submit(req)
         self.detok = Detokenizer(server.tok, server.tok_lock)
         self.text, self.sent = "", 0
@@ -543,9 +546,9 @@ class Generation:
                     if len(msg) > 3:  # (per token: where its text starts)
                         for t, (lp, top) in zip(msg[2], msg[3]):
                             self.lps.append((len(self.text), t, lp, top))
-                            self.text += self.detok.add([t])
+                            self.text += self.detok.add([] if t in self.hide else [t])
                     else:
-                        self.text += self.detok.add(msg[2])
+                        self.text += self.detok.add([t for t in msg[2] if t not in self.hide])
                     piece = self._release()
                     if piece:
                         last = time.time()
@@ -627,6 +630,11 @@ class Server:
         self.max_tokens_conf = max_tokens
         self.thinking_default = thinking_default
         self.pad_id = tok.token_id("<|image_pad|>")
+
+    @property
+    def vocab(self):
+        """Token ids the tokenizer knows (logit_bias)."""
+        return self.tok.tok.get_vocab_size(with_added_tokens=True)
 
     @property
     def max_tokens(self):
@@ -735,6 +743,50 @@ def sampling_of(body, top_k_key="top_k"):
             "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": body.get("seed"), **extra}
 
 
+MAX_BIAS = 300  # (OpenAI's limit, kMaxBias)
+
+
+def token_controls_of(body, vocab, max_new):
+    """OpenAI's logit_bias ({token id: -100..100}, at most 300) and vLLM's min_tokens / ignore_eos, as the request's
+    sampling entries (only those it sets)."""
+    out = {}
+    bias = body.get("logit_bias")
+    if bias is not None:
+        if not isinstance(bias, dict):
+            raise ApiError(400, "logit_bias: an object of token ids to values is required")
+        if len(bias) > MAX_BIAS:
+            raise ApiError(400, f"logit_bias: at most {MAX_BIAS} entries, got {len(bias)}")
+        parsed = {}
+        for k, v in bias.items():
+            try:
+                t = int(k)
+            except (TypeError, ValueError):
+                raise ApiError(400, f"logit_bias: {k!r} is not a token id") from None
+            if not 0 <= t < vocab:
+                raise ApiError(400, f"logit_bias: token id {t} is out of the vocabulary (0..{vocab - 1})")
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not -100 <= v <= 100:
+                raise ApiError(400, f"logit_bias: the value of {k} must be a number in [-100, 100], got {v!r}")
+            if v:
+                parsed[t] = float(v)
+        if parsed:
+            out["logit_bias"] = parsed
+    m = body.get("min_tokens")
+    if m is not None:
+        if isinstance(m, bool) or not isinstance(m, int) or m < 0:
+            raise ApiError(400, "min_tokens: an integer >= 0 is required")
+        if m > max_new:
+            raise ApiError(400, f"min_tokens ({m}) is greater than max_tokens ({max_new})")
+        if m:
+            out["min_tokens"] = m
+    ie = body.get("ignore_eos")
+    if ie is not None:
+        if not isinstance(ie, bool):
+            raise ApiError(400, "ignore_eos: true or false is required")
+        if ie:
+            out["ignore_eos"] = True
+    return out
+
+
 def logprobs_of(body, chat):
     """Top logprobs per token the request asks for (-1: none): chat's logprobs (bool) + top_logprobs, completions'
     logprobs (the number of top entries). 0..20, as vLLM's default max_logprobs."""
@@ -755,6 +807,17 @@ def logprobs_of(body, chat):
     if given is not None and not 0 <= given <= MAX_LOGPROBS:
         raise ApiError(400, f"{'top_logprobs' if chat else 'logprobs'}: must be in [0, {MAX_LOGPROBS}], got {given}")
     return n
+
+
+def responses_logprobs_of(body):
+    """Top logprobs per token for the Responses API (-1: none): on with include "message.output_text.logprobs",
+    top_logprobs 0..20 (vLLM ignores top_logprobs without the include, and so do we)."""
+    include, top = body.get("include") or [], body.get("top_logprobs")
+    if top is not None and (isinstance(top, bool) or not isinstance(top, int)):
+        raise ApiError(400, "top_logprobs: an integer is required")
+    if top is not None and not 0 <= top <= MAX_LOGPROBS:
+        raise ApiError(400, f"top_logprobs: must be in [0, {MAX_LOGPROBS}], got {top}")
+    return (top or 0) if "message.output_text.logprobs" in include else -1
 
 
 def chat_logprobs(tok, entries):
@@ -970,7 +1033,8 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream"))
         keep = (lambda: self._keepalive_comment()) if stream else None
         grammar = self.srv.constrain(lambda: structured.chat_format(body), choice, tools, thinking)
-        gen = Generation(self.srv, ids, min(max_new, left), dict(sampling_of(body), logprobs=nlp),
+        sampling = dict(sampling_of(body), logprobs=nlp, **token_controls_of(body, self.srv.vocab, min(max_new, left)))
+        gen = Generation(self.srv, ids, min(max_new, left), sampling,
                          stops_of(body.get("stop")), images, self.connection, keep, self.srv.force(choice, thinking),
                          grammar)
         parser = OutputParser(thinking, tools if parse_tools else None)
@@ -1072,7 +1136,8 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream"))
         nlp = logprobs_of(body, chat=False)
         grammar = self.srv.constrain(lambda: structured.chat_format(body), ("auto", None), None, False)
-        gen = Generation(self.srv, ids, max_new, dict(sampling_of(body), logprobs=nlp), stops_of(body.get("stop")),
+        sampling = dict(sampling_of(body), logprobs=nlp, **token_controls_of(body, self.srv.vocab, max_new))
+        gen = Generation(self.srv, ids, max_new, sampling, stops_of(body.get("stop")),
                          None, self.connection, (lambda: self._keepalive_comment()) if stream else None, None, grammar)
         rid, created, model = f"cmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
         lps = (lambda: completion_logprobs(self.srv.tok, gen.take_logprobs())) if nlp >= 0 else (lambda: None)
@@ -1239,7 +1304,8 @@ class Handler(BaseHTTPRequestHandler):
         parse_tools = bool(tools) and choice[0] != "none"
         stream = bool(body.get("stream"))
         grammar = self.srv.constrain(lambda: structured.responses_format(body), choice, tools, thinking)
-        gen = Generation(self.srv, ids, max_new, sampling_of(body), (), images, self.connection,
+        nlp = responses_logprobs_of(body)
+        gen = Generation(self.srv, ids, max_new, dict(sampling_of(body), logprobs=nlp), (), images, self.connection,
                          (lambda: self._keepalive_comment()) if stream else None, self.srv.force(choice, thinking),
                          grammar)
         parser = OutputParser(thinking, tools if parse_tools else None)
@@ -1248,10 +1314,11 @@ class Handler(BaseHTTPRequestHandler):
                 "parallel_tool_calls": body.get("parallel_tool_calls", True), "tool_choice": body.get("tool_choice", "auto"),
                 "tools": body.get("tools") or [], "temperature": body.get("temperature"), "top_p": body.get("top_p"),
                 "reasoning": body.get("reasoning"), "store": False, "text": body.get("text"),
-                "max_output_tokens": body.get("max_output_tokens"), "usage": None, "error": None,
+                "max_output_tokens": body.get("max_output_tokens"), "top_logprobs": body.get("top_logprobs") or 0, "usage": None, "error": None,
                 "incomplete_details": None, "metadata": body.get("metadata") or {}}
         out = ResponsesOut(self._sse if stream else None, "reasoning.encrypted_content" in (body.get("include") or []),
-                           namespaces, custom, body.get("parallel_tool_calls") is False or choice[0] == "named")
+                           namespaces, custom, body.get("parallel_tool_calls") is False or choice[0] == "named",
+                           (lambda: chat_logprobs(self.srv.tok, gen.take_logprobs())) if nlp >= 0 else None)
         if stream:
             self._sse_start()
             out.ev("response.created", response=resp)
@@ -1394,11 +1461,24 @@ class Handler(BaseHTTPRequestHandler):
 class ResponsesOut:
     """Output items of a Responses API answer from the parser's events, with the streaming events (sse: None
     for a non-streaming answer). Reasoning goes out as reasoning_text (and, when the client asks for
-    `reasoning.encrypted_content`, also in it, so that it comes back with the next request)."""
+    `reasoning.encrypted_content`, also in it, so that it comes back with the next request).
 
-    def __init__(self, sse, encrypted, namespaces, custom, single_call):
+    take_lps (None: no logprobs) gives the logprobs entries of the generation's text out since the last call. The
+    tokens out since the last events go with the events' first message text when they have some, else (reasoning, a
+    tool call, held text) they are dropped: output_text.logprobs has the tokens of the message's text (and of markup
+    out in the same piece, like </think> before it), not those of the reasoning or the tool calls."""
+
+    def __init__(self, sse, encrypted, namespaces, custom, single_call, take_lps=None):
         self.sse, self.encrypted, self.namespaces, self.custom, self.single = sse, encrypted, namespaces, custom, single_call
         self.items, self.cur, self.seq, self.ncalls = [], None, 0, 0
+        self.take_lps, self.pending = take_lps, []
+
+    @staticmethod
+    def _stream_lps(entries):
+        """The streaming events' form (no bytes, as vLLM and OpenAI send them)."""
+        return [{"token": e["token"], "logprob": e["logprob"],
+                 "top_logprobs": [{"token": t["token"], "logprob": t["logprob"]} for t in e["top_logprobs"]]}
+                for e in entries]
 
     def ev(self, kind, **kw):
         if self.sse:
@@ -1418,21 +1498,26 @@ class ResponsesOut:
         it, idx = self.cur, len(self.items) - 1
         if it is None:
             return
-        text = it.pop("_text")
+        text, lps = it.pop("_text"), it.pop("_lps", [])
         if it["type"] == "reasoning":
             it["content"] = [{"type": "reasoning_text", "text": text}]
             if self.encrypted:
                 it["encrypted_content"] = thinking_signature(text)
             self.ev("response.reasoning_text.done", item_id=it["id"], output_index=idx, content_index=0, text=text)
         else:
-            part = {"type": "output_text", "text": text, "annotations": [], "logprobs": []}
-            self.ev("response.output_text.done", item_id=it["id"], output_index=idx, content_index=0, text=text, logprobs=[])
+            part = {"type": "output_text", "text": text, "annotations": [], "logprobs": lps}
+            self.ev("response.output_text.done", item_id=it["id"], output_index=idx, content_index=0, text=text,
+                    logprobs=self._stream_lps(lps))
             self.ev("response.content_part.done", item_id=it["id"], output_index=idx, content_index=0, part=part)
             it["content"], it["status"] = [part], "completed"
         self.ev("response.output_item.done", output_index=idx, item=it)
         self.cur = None
 
     def feed(self, events):
+        if self.take_lps:
+            self.pending.extend(self.take_lps())
+            if not any(kind == "content" for kind, _ in events):
+                self.pending = []
         for kind, v in events:
             if kind == "reasoning":
                 if self.cur is None or self.cur["type"] != "reasoning":
@@ -1447,8 +1532,10 @@ class ResponsesOut:
                     self.ev("response.content_part.added", item_id=self.cur["id"], output_index=len(self.items) - 1,
                             content_index=0, part={"type": "output_text", "text": "", "annotations": [], "logprobs": []})
                 self.cur["_text"] += v
+                lps, self.pending = self.pending, []
+                self.cur.setdefault("_lps", []).extend(lps)
                 self.ev("response.output_text.delta", item_id=self.cur["id"], output_index=len(self.items) - 1,
-                        content_index=0, delta=v, logprobs=[])
+                        content_index=0, delta=v, logprobs=self._stream_lps(lps))
             elif not (self.single and self.ncalls):
                 self.close()
                 self.ncalls += 1

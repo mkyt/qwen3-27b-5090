@@ -354,6 +354,28 @@ void sample(const float* logits, int T, int V, float temperature, int top_k, flo
 // (other lanes' rows are left).
 void mask_logits(float* logits, int rows, int V, const uint32_t* mask, int words, int rows_per_lane, uint32_t lanes,
                  cudaStream_t s);
+// Logit bias (OpenAI logit_bias): a sequence's sparse list of (token, value) added to its rows' logits before the
+// grammar mask, the top-k and the penalties (so the logprobs include it, as OpenAI's do). In device memory, so a
+// captured step reads the values of the sequence it runs.
+constexpr int kMaxBias = 300;  // (OpenAI's limit)
+// min_tokens (vLLM's): the end-of-sequence ids eos[] get -inf in a row whose token would be at a sequence position
+// below eos_before (0: none).
+struct alignas(16) BiasList {  // (a multiple of 16 bytes: swap_bytes)
+  int32_t n;
+  int32_t ids[kMaxBias];
+  float vals[kMaxBias];
+  int32_t eos[2];
+  int32_t eos_before;
+};
+// Row r of logits [rows][V] (lane z = r / rows_per_lane) gets list[z]'s values (nullptr: the lane's rows are left).
+// Its token's position: *pos[z] (the sequence's length: a decode or prompt row), or with depth[z] (a verify row j of
+// lane z is tree node j, *pos[z] the anchor's position) *pos[z] + depth[z][j] + 1.
+struct BiasLanes {
+  const BiasList* list[kMaxLanes] = {};
+  const int32_t* pos[kMaxLanes] = {};
+  const int8_t* depth[kMaxLanes] = {};
+};
+void bias_logits(float* logits, int rows, int V, const BiasLanes& bl, int rows_per_lane, cudaStream_t s);
 // counts[ids[i]] += delta for i < n (the penalty counts of a sequence's output).
 void count_tokens(uint32_t* counts, const int32_t* ids, int n, int delta, cudaStream_t s);
 

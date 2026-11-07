@@ -787,12 +787,26 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
   if (pen)
     for (int i = lane; i < kDraft * kSelK; i += 32) s_cnt[i] = smp.pen.counts[cand_i[i]];
   __syncwarp();
+  // Logit bias: the candidates take the request's bias as the verify rows do (a banned token is not proposed).
+  __shared__ float s_bias[kDraft * kSelK];
+  if (smp.bias) {
+    const BiasList* b = smp.bias;
+    for (int i = lane; i < kDraft * kSelK; i += 32) {
+      const int32_t t = cand_i[i];
+      float v = 0.f;
+      for (int j = 0; j < b->n; j++) v += b->ids[j] == t ? b->vals[j] : 0.f;
+      s_bias[i] = v;
+    }
+  }
+  __syncwarp();
   auto penalty = [&](int e, const int32_t* ptok) {
-    if (!pen || lane >= kSelK) return 0.f;
+    if (lane >= kSelK) return 0.f;
+    const float bias = smp.bias ? s_bias[e * kSelK + lane] : 0.f;
+    if (!pen) return -bias;
     const int32_t t = cand_i[e * kSelK + lane];
     uint32_t c = s_cnt[e * kSelK + lane];
     for (int j = 0; j < e; j++) c += ptok[j] == t;
-    return c ? smp.pen.presence + smp.pen.frequency * float(c) : 0.f;
+    return (c ? smp.pen.presence + smp.pen.frequency * float(c) : 0.f) - bias;
   };
   if (smp.temperature > 0.f || K == 1) {
     for (int k = 0; k < K; k++) {

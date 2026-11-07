@@ -9,7 +9,8 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from server import ApiError, Generation, chat_logprobs, completion_logprobs, logprobs_of  # noqa: E402
+from server import (ApiError, Generation, ResponsesOut, chat_logprobs, completion_logprobs, logprobs_of,  # noqa: E402
+                    responses_logprobs_of)
 from tokenizer import BYTE_DECODER  # noqa: E402
 
 
@@ -121,3 +122,60 @@ def test_formats():
 def test_byte_decoder():
     assert sorted(BYTE_DECODER.values()) == list(range(256))
     assert BYTE_DECODER["Ġ"] == 32 and BYTE_DECODER["Ċ"] == 10
+
+
+def test_responses_parameters():
+    inc = {"include": ["message.output_text.logprobs"]}
+    assert responses_logprobs_of({}) == -1
+    assert responses_logprobs_of({"top_logprobs": 5}) == -1  # (without the include, as vLLM)
+    assert responses_logprobs_of(inc) == 0
+    assert responses_logprobs_of(dict(inc, top_logprobs=20)) == 20
+    for bad in (21, -1, "3", True):
+        with pytest.raises(ApiError):
+            responses_logprobs_of(dict(inc, top_logprobs=bad))
+
+
+def test_responses_output_text():
+    # reasoning's tokens are dropped, the message's go with its deltas, part and done event; a tool call's dropped
+    tok, events = FakeTok(), []
+    batches = [([(0, 1, -0.5, [])], [("reasoning", "Hello")]),
+               ([(5, 2, -1.0, [(2, -1.0)]), (6, 3, -2.0, [])], [("reasoning", ","), ("content", " wor")]),
+               ([(10, 4, -0.25, [])], []),  # (held by the parser)
+               ([(12, 6, -0.75, [])], [("content", "ld!")]),
+               ([(15, 5, -0.1, [])], [("tool", {"name": "f", "arguments": {}})])]
+    it = iter(batches)
+    cur = []
+    out = ResponsesOut(lambda d, kind: events.append(d), False, {}, set(), False,
+                       lambda: chat_logprobs(tok, cur))
+    for entries, evs in it:
+        cur[:] = entries
+        out.feed(evs)
+    out.close()
+    msg = next(i for i in out.items if i["type"] == "message")
+    assert [e["token"] for e in msg["content"][0]["logprobs"]] == [",", " wor", "!"]
+    assert msg["content"][0]["logprobs"][0]["top_logprobs"] == [{"token": ",", "logprob": -1.0, "bytes": [44]}]
+    deltas = [e for e in events if e["type"] == "response.output_text.delta"]
+    assert [[x["token"] for x in d["logprobs"]] for d in deltas] == [[",", " wor"], ["!"]]
+    assert "bytes" not in deltas[0]["logprobs"][0] and deltas[0]["logprobs"][0]["top_logprobs"] == [{"token": ",", "logprob": -1.0}]
+    done = next(e for e in events if e["type"] == "response.output_text.done")
+    assert [x["token"] for x in done["logprobs"]] == [",", " wor", "!"]
+
+
+def test_responses_without_logprobs():
+    events = []
+    out = ResponsesOut(lambda d, kind: events.append(d), False, {}, set(), False)
+    out.feed([("content", "hi")])
+    out.close()
+    assert out.items[0]["content"][0]["logprobs"] == []
+    assert next(e for e in events if e["type"] == "response.output_text.delta")["logprobs"] == []
+
+
+def test_ignore_eos_hides_the_end_of_sequence_text():
+    # token 5 ("END") as the end of sequence: counted, with its logprob, but not in the text
+    srv = FakeServer()
+    srv.engine.cfg = {"eos": [5]}
+    gen = Generation(srv, [0], 100, {"logprobs": 0, "ignore_eos": True})
+    srv.engine.q.put(("tok", gen.rid, [1, 5, 6], [(-0.5, []), (-1.0, []), (-0.25, [])]))
+    srv.engine.q.put(("done", gen.rid, "length", {"cached_tokens": 0}))
+    assert "".join(gen) == "Hello!" and gen.tokens == 3
+    assert [t for _, t, _, _ in gen.take_logprobs()] == [1, 5, 6]

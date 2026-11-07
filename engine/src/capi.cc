@@ -200,12 +200,14 @@ int q27_forward_topk(void* m, const int32_t* ids, int n, int k, int32_t* out_ids
 }
 
 // Runs n tokens and samples the next one (temperature <= 0: greedy; presence / frequency: Model::forward_sample;
-// logprobs >= 0: q27_logprobs answers with that many top entries; masked: by row 0 of q27_mask_rows).
+// logprobs >= 0: q27_logprobs answers with that many top entries; masked: by row 0 of q27_mask_rows; biased: the
+// running sequence's q27_bias_set list).
 int q27_forward_sample(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
-                       float min_p, float presence, float frequency, int logprobs, int32_t* out, int masked) {
+                       float min_p, float presence, float frequency, int logprobs, int32_t* out, int masked,
+                       int biased) {
   return guard([&] {
     *out = static_cast<Model*>(m)->forward_sample(ids, n, temperature, top_k, top_p, uniform, min_p, presence,
-                                                  frequency, logprobs, masked != 0);
+                                                  frequency, logprobs, masked != 0, biased != 0);
   });
 }
 
@@ -227,16 +229,22 @@ int q27_logprobs(void* m, int lane, int* top, float* lp, int32_t* top_id, float*
   return l.n;
 }
 
+// The running sequence's logit bias, n (token, value) pairs, and min_tokens' eos_before (Model::bias_set).
+int q27_bias_set(void* m, const int32_t* ids, const float* vals, int n, int eos_before) {
+  return guard([&] { static_cast<Model*>(m)->bias_set(ids, vals, n, eos_before); });
+}
+
 // The running sequence's output so far as its penalty counts (Model::penalty_init).
 int q27_penalty_init(void* m, const int32_t* ids, int n) {
   return guard([&] { static_cast<Model*>(m)->penalty_init(ids, n); });
 }
 
 // Speculative decoding: prompt + first token, then steps of 1..8 new tokens (out[8]; returns the count). masked: grammar
-// masks (q27_mask_rows, q27_spec_draft); until >= 0: a step ends at that token (SpecSampling::stop[2]).
+// masks (q27_mask_rows, q27_spec_draft); until >= 0: a step ends at that token (SpecSampling::stop[2]); biased: the
+// running sequence's q27_bias_set list; ignore_eos: an end-of-sequence id does not end a step (SpecSampling).
 int q27_spec_begin(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, uint64_t seed,
                    float uniform, int max_new, float min_p, float presence, float frequency, int logprobs,
-                   int32_t* out, int masked, int until) {
+                   int32_t* out, int masked, int until, int biased, int ignore_eos) {
   return guard([&] {
     Q27_CHECK(logprobs <= kMaxTopLogprobs, "spec_begin: at most 20 top logprobs");
     SpecSampling smp{temperature, top_k, top_p, 0};  // paths 0: Q27_SPEC_PATHS
@@ -244,6 +252,8 @@ int q27_spec_begin(void* m, const int32_t* ids, int n, float temperature, int to
     smp.logprobs = logprobs < 0 ? -1 : logprobs;
     smp.masked = masked != 0;
     smp.stop[2] = until;
+    smp.biased = biased != 0;
+    smp.ignore_eos = ignore_eos != 0;
     *out = static_cast<Model*>(m)->spec_begin(ids, n, smp, seed, uniform, max_new);
   });
 }

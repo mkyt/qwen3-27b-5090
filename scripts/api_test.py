@@ -8,6 +8,9 @@ Anthropic and Responses forms, with thinking on and off.
 structured: response_format (json_schema with thinking on and off, json_object streamed), vLLM structured_outputs
 (choice, regex, completions), Responses text.format, Anthropic output_config.format, JSON or a tool call with tools,
 a bad schema (400), and three masked requests next to a free one giving the text each gives alone.
+controls: logit_bias (a banned answer, 400 on a bad one), vLLM min_tokens and ignore_eos, Responses logprobs (include
+message.output_text.logprobs, plain and streamed), and biased requests next to a free one giving the text each gives
+alone.
 Server: requests run at once give the same greedy text as one at a time (switching sequences is exact), a
 closed connection cancels its request, /v1/models and /metrics.
 
@@ -423,10 +426,74 @@ def structured_tests(cl):
           json.dumps([a[:80] for a in alone]) + " vs " + json.dumps([t[:80] for t in together]))
 
 
+def controls_tests(cl):
+    off = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
+    q = [{"role": "user", "content": "What is the capital of France? Answer with the city's name only."}]
+
+    def chat(**kw):
+        st, r = cl.post("/v1/chat/completions", dict(off, messages=q, max_tokens=32, **kw))
+        return st, r, (r["choices"][0]["message"]["content"] if st == 200 else "")
+    _, _, base = chat()
+    ban = {}
+    for word in ("Paris", " Paris", "PAR", "Par"):
+        _, t = cl.post("/tokenize", {"prompt": word})
+        ban[str(t["tokens"][0])] = -100
+    st, r, text = chat(logit_bias=ban)
+    check("controls: logit_bias bans the answer's first token", st == 200 and "Paris" in base and not text.startswith("Paris"),
+          f"{base!r} -> {text!r}")
+    st, r, _ = chat(logit_bias={"999999999": 1})
+    check("controls: logit_bias out of the vocabulary gives 400", st == 400, str(r)[:200])
+    q2 = [{"role": "user", "content": "Say hi."}]
+    st, r = cl.post("/v1/chat/completions", dict(off, messages=q2, max_tokens=64))
+    n0 = r["usage"]["completion_tokens"] if st == 200 else 0
+    st, r = cl.post("/v1/chat/completions", dict(off, messages=q2, max_tokens=64, min_tokens=24))
+    n1 = r["usage"]["completion_tokens"] if st == 200 else 0
+    check("controls: min_tokens", st == 200 and n0 < 24 <= n1, f"{n0} -> {n1} tokens")
+    st, r = cl.post("/v1/chat/completions", dict(off, messages=q2, max_tokens=40, ignore_eos=True))
+    msg = r["choices"][0] if st == 200 else {}
+    check("controls: ignore_eos runs to max_tokens without the end's text",
+          st == 200 and r["usage"]["completion_tokens"] == 40 and msg["finish_reason"] == "length"
+          and "<|im_end|>" not in (msg["message"]["content"] or ""), json.dumps(r)[:300])
+    st, r = cl.post("/v1/completions", {"prompt": "The capital of France is", "max_tokens": 24, "temperature": 0,
+                                        "ignore_eos": True, "min_tokens": 24})
+    check("controls: completions min_tokens / ignore_eos", st == 200 and r["usage"]["completion_tokens"] == 24, json.dumps(r)[:200])
+    # Responses logprobs
+    body = {"input": "Name three colors.", "max_output_tokens": 64, "temperature": 0, "reasoning": {"effort": "none"},
+            "include": ["message.output_text.logprobs"], "top_logprobs": 2}
+    st, r = cl.post("/v1/responses", body)
+    parts = [c for it in r.get("output", []) if it["type"] == "message" for c in it["content"]] if st == 200 else []
+    lps = parts[0]["logprobs"] if parts else []
+    check("controls: responses logprobs", st == 200 and lps and "".join(e["token"] for e in lps) == parts[0]["text"]
+          and all(len(e["top_logprobs"]) == 2 and e["logprob"] <= 0 for e in lps), json.dumps(r)[:300])
+    ev = cl.stream("/v1/responses", body)
+    deltas = [e for _, e in ev if e.get("type") == "response.output_text.delta"]
+    text = "".join(d["delta"] for d in deltas)
+    check("controls: responses logprobs, streamed", deltas and "".join(x["token"] for d in deltas for x in d["logprobs"]) == text
+          and parts and text == parts[0]["text"], text[:200])
+    st, r = cl.post("/v1/responses", dict(body, include=[]))
+    parts = [c for it in r.get("output", []) if it["type"] == "message" for c in it["content"]] if st == 200 else []
+    check("controls: responses without the include: no logprobs", st == 200 and parts and parts[0]["logprobs"] == [])
+    # Biased and free requests at once (batched steps) give the text each gives alone.
+    bodies = [dict(off, messages=q, max_tokens=32, logit_bias=ban),
+              dict(off, messages=[{"role": "user", "content": "Write a haiku about Kyoto."}], max_tokens=96),
+              dict(off, messages=q2, max_tokens=48, min_tokens=30),
+              dict(off, messages=[{"role": "user", "content": "List five fruits."}], max_tokens=96,
+                   logit_bias={k: -5 for k in ban})]
+
+    def text_of(b):
+        st, r = cl.post("/v1/chat/completions", b)
+        return r["choices"][0]["message"]["content"] if st == 200 else f"error {st}"
+    alone = [text_of(b) for b in bodies]
+    with cf.ThreadPoolExecutor(len(bodies)) as ex:
+        together = list(ex.map(text_of, bodies))
+    check("controls: 3 biased + 1 free at once give the text of each alone", alone == together,
+          json.dumps([a[:80] for a in alone]) + " vs " + json.dumps([t[:80] for t in together]))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", default="http://127.0.0.1:8000")
-    ap.add_argument("--only", default="openai,anthropic,tool_choice,structured,concurrency,cancel")
+    ap.add_argument("--only", default="openai,anthropic,tool_choice,structured,controls,concurrency,cancel")
     args = ap.parse_args()
     cl = Client(args.base_url)
     st, models = cl.get("/v1/models")
@@ -434,7 +501,7 @@ def main():
     check("/v1/models", st == 200 and m["id"] == "qwen3.8-27b" and m["max_model_len"] > 0, f"{m['id']} {m['max_model_len']}")
     for part in args.only.split(","):
         {"openai": openai_tests, "anthropic": anthropic_tests, "tool_choice": tool_choice_tests,
-         "structured": structured_tests, "concurrency": concurrency_tests, "cancel": cancel_tests}[part](cl)
+         "structured": structured_tests, "controls": controls_tests, "concurrency": concurrency_tests, "cancel": cancel_tests}[part](cl)
     print("PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
     sys.exit(1 if FAILS else 0)
 

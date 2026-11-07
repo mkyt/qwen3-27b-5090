@@ -229,8 +229,17 @@ from an anchor and verifies all 8 rows in one forward of the target.
   the tokens, so pipelined steps do not overwrite them. Requests without logprobs run the same kernels and graphs
   (`scripts/logprobs_test.py` checks the values against the decode path's log-softmax and speculative against plain
   decoding, `scripts/batch_test.py check --logprobs` batched lanes against each alone).
+- **Logit bias and `min_tokens` on the device.** A sequence's `logit_bias` is a list of up to 300 (token, value)
+  pairs in device memory (kept with the sequence when it is parked), added to its rows' logits by one small kernel
+  before the grammar mask, top-k and penalties; the whole vocabulary is open to it, so a positive bias can raise a
+  token from anywhere. The same list carries `min_tokens` as a position: a verify row whose token would come before
+  it gets -inf at the end-of-sequence ids, so the ban ends exactly at the right token within a step. The draft's
+  selector adds the bias to its candidates, so banned tokens are not proposed. Requests without them run the same
+  kernels and graphs as before (`scripts/bias_test.py` checks the tokens against a host implementation, speculative
+  against plain decoding, batched lanes against each alone, and `min_tokens` at the exact token).
 - **Stops at EOS and `max_tokens`.** A step never commits tokens past them, so the end of a generation is a clean
-  prefix of the next turn's prompt ([§9](#9-prefix-cache)).
+  prefix of the next turn's prompt ([§9](#9-prefix-cache)). With `ignore_eos` the end-of-sequence ids are ordinary
+  tokens of the step.
 
 Acceptance depends on the text: about 6 tokens per step on JSON, 4.5 to 5 on code, 3.5 on English prose and less
 on Japanese prose (a property of the draft model, also seen in other engines).

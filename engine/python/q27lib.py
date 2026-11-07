@@ -15,7 +15,7 @@ P, I, I64, F, SZ = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float
 SIGNATURES = {
     "q27_create": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p], P),
     "q27_plan": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p, I64, I64], P),
-    "q27_spec_begin": ([P, P, I, F, I, F, ctypes.c_uint64, F, I, F, F, F, I, P, I, I], I),
+    "q27_spec_begin": ([P, P, I, F, I, F, ctypes.c_uint64, F, I, F, F, F, I, P, I, I, I, I], I),
     "q27_spec_draft": ([P, P], I),
     "q27_spec_set_masked": ([P, I], I),
     "q27_spec_draft_lanes": ([P, P, I, P], I),
@@ -58,7 +58,8 @@ SIGNATURES = {
     "q27_reset": ([P], I),
     "q27_pos": ([P], I),
     "q27_forward_topk": ([P, P, I, I, P, P], I),
-    "q27_forward_sample": ([P, P, I, F, I, F, F, F, F, F, I, P, I], I),
+    "q27_forward_sample": ([P, P, I, F, I, F, F, F, F, F, I, P, I, I], I),
+    "q27_bias_set": ([P, P, P, I, I], I),
     "q27_logprobs": ([P, I, P, P, P, P], I),
     "q27_penalty_init": ([P, P, I], I),
     "q27_profile_dump": ([P], I),
@@ -216,16 +217,16 @@ class Engine:
         self._check(lib().q27_profile_dump(self.h), "q27_profile_dump")
 
     def forward_sample(self, ids, temperature=0.0, top_k=20, top_p=1.0, uniform=0.5, min_p=0.0, presence=0.0,
-                       frequency=0.0, logprobs=-1, masked=False):
+                       frequency=0.0, logprobs=-1, masked=False, biased=False):
         """Runs ids and returns the sampled next token (temperature <= 0: greedy). presence / frequency:
         OpenAI's penalties by the sequence's output counts (penalty_init). logprobs >= 0: the token's logprobs
         with that many top entries are kept for logprobs(). masked: only the tokens row 0 of the grammar masks
-        allows (mask_row)."""
+        allows (mask_row). biased: the sequence's logit bias (bias_set) is added to the logits first."""
         src = array.array("i", ids)
         out = ctypes.c_int32()
         self._check(lib().q27_forward_sample(self.h, src.buffer_info()[0], len(ids), temperature, top_k, top_p,
                                              uniform, min_p, presence, frequency, logprobs, ctypes.byref(out),
-                                             int(masked)), "q27_forward_sample")
+                                             int(masked), int(biased)), "q27_forward_sample")
         return out.value
 
     def mask_row(self, i):
@@ -257,21 +258,34 @@ class Engine:
         src = array.array("i", ids)
         self._check(lib().q27_penalty_init(self.h, src.buffer_info()[0], len(ids)), "q27_penalty_init")
 
+    def bias_set(self, bias, eos_before=0):
+        """Sets the running sequence's logit bias: {token id: value added to its logit} (at most 300 entries; {}:
+        none), and min_tokens: the end-of-sequence ids are banned for the tokens at sequence positions below
+        eos_before (0: none; the prompt's length + min_tokens). Used by the calls with biased=True; a parked sequence
+        keeps its own."""
+        ids = array.array("i", list(bias))
+        vals = array.array("f", [float(v) for v in bias.values()])
+        self._check(lib().q27_bias_set(self.h, ids.buffer_info()[0] if ids else None,
+                                       vals.buffer_info()[0] if vals else None, len(ids), eos_before), "q27_bias_set")
+
     @property
     def has_draft(self):
         return bool(lib().q27_has_draft(self.h))
 
     def spec_begin(self, ids, temperature=0.0, top_k=20, top_p=1.0, seed=0, uniform=0.5, max_new=0, min_p=0.0,
-                   presence=0.0, frequency=0.0, logprobs=-1, masked=False, until=None):
+                   presence=0.0, frequency=0.0, logprobs=-1, masked=False, until=None, biased=False,
+                   ignore_eos=False):
         """Speculative decoding: runs the prompt and returns the first token (also fills the draft context).
         masked: grammar masks (mask_row; row 0 for the first token); each step is then spec_draft + spec_step.
         until: a token that ends a step as its last one (the end of the reasoning, before a forced output or a
-        grammar; spec_set_masked clears it)."""
+        grammar; spec_set_masked clears it). biased: the sequence's logit bias (bias_set) on every step. ignore_eos:
+        an end-of-sequence id does not end a step (it is fed like any token)."""
         src = array.array("i", ids)
         out = ctypes.c_int32()
         self._check(lib().q27_spec_begin(self.h, src.buffer_info()[0], len(ids), temperature, top_k, top_p,
                                          seed & (2**64 - 1), uniform, max_new, min_p, presence, frequency,
-                                         logprobs, ctypes.byref(out), int(masked), -1 if until is None else until),
+                                         logprobs, ctypes.byref(out), int(masked), -1 if until is None else until,
+                                         int(biased), int(ignore_eos)),
                     "q27_spec_begin")
         return out.value
 

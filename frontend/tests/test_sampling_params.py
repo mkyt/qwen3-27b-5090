@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from server import ApiError, sampling_of  # noqa: E402
+from server import ApiError, sampling_of, token_controls_of  # noqa: E402
 
 
 def test_defaults():
@@ -27,4 +27,22 @@ def test_min_p_and_penalties():
 def test_out_of_range(body):
     with pytest.raises(ApiError) as e:
         sampling_of(body)
+    assert e.value.code == 400
+
+
+def test_token_controls():
+    assert token_controls_of({}, 1000, 64) == {}
+    assert token_controls_of({"logit_bias": {"5": -100, "7": 2.5, "9": 0}}, 1000, 64) == {"logit_bias": {5: -100.0, 7: 2.5}}
+    assert token_controls_of({"logit_bias": {}, "min_tokens": 0, "ignore_eos": False}, 1000, 64) == {}
+    assert token_controls_of({"min_tokens": 64, "ignore_eos": True}, 1000, 64) == {"min_tokens": 64, "ignore_eos": True}
+    assert len(token_controls_of({"logit_bias": {str(i): 1 for i in range(300)}}, 1000, 64)["logit_bias"]) == 300
+
+
+@pytest.mark.parametrize("body", [{"logit_bias": [1, 2]}, {"logit_bias": {"x": 1}}, {"logit_bias": {"1000": 1}},
+                                  {"logit_bias": {"-1": 1}}, {"logit_bias": {"5": 101}}, {"logit_bias": {"5": "1"}},
+                                  {"logit_bias": {str(i): 1 for i in range(301)}}, {"min_tokens": -1},
+                                  {"min_tokens": 65}, {"min_tokens": 1.5}, {"ignore_eos": "yes"}])
+def test_bad_token_controls(body):
+    with pytest.raises(ApiError) as e:
+        token_controls_of(body, 1000, 64)
     assert e.value.code == 400

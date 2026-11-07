@@ -87,6 +87,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   size_t o_pos = state_.add("position", sizeof(int32_t));
   size_t o_delta = state_.add("rope delta", sizeof(int32_t));
   size_t o_pen = state_.add("penalty counts", size_t(1 + opt.park_slots) * kVocab * 4);
+  size_t o_bias = state_.add("logit bias", size_t(1 + opt.park_slots) * sizeof(BiasList));
   size_t o_rep = 0, o_par = 0, o_nc = 0, o_rng = 0, o_idv = 0, o_blk = 0, o_tv = 0, o_ti = 0, o_cap = 0, o_hist = 0,
          o_lk = 0, o_tree = 0, o_cpath = 0, o_sbuf = 0, o_kvl = 0, o_bud = 0;
   // Lanes of a batched step (P6-10; MAX_SEQS with a draft model).
@@ -270,6 +271,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   pos_dev_ = state_.at<int32_t>(o_pos);
   rope_delta_ = state_.at<int32_t>(o_delta);
   pen_ = state_.at<uint32_t>(o_pen);
+  bias_ = state_.at<BiasList>(o_bias);
   x_ = act_.at<float>(o_x), h_ = act_.at<float>(o_h), big1_ = act_.at<float>(o_b1), big2_ = act_.at<float>(o_b2);
   q_ = act_.at<float>(o_q), k_ = act_.at<float>(o_k), v_ = act_.at<float>(o_v), o_ = act_.at<float>(o_o);
   n_ = act_.at<float>(o_n), a_ = act_.at<float>(o_a), b_ = act_.at<float>(o_bb), g_ = act_.at<float>(o_g);
@@ -1226,7 +1228,7 @@ void Model::forward_topk(const int32_t* ids, int n, int k,
 }
 
 int32_t Model::forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
-                              float min_p, float presence, float frequency, int logprobs, bool masked) {
+                              float min_p, float presence, float frequency, int logprobs, bool masked, bool biased) {
   Q27_CHECK(n > 0, "forward_sample: no tokens");
   Q27_CHECK(logprobs <= kMaxTopLogprobs, "forward_sample: at most 20 top logprobs");
   spec_flush();
@@ -1238,10 +1240,11 @@ int32_t Model::forward_sample(const int32_t* ids, int n, float temperature, int 
     return tok;
   };
   if (n == 1 && graphs_ && !cap_)
-    return done(decode_step(ids[0], temperature, top_k, top_p, uniform, min_p, pen, lp, masked));
+    return done(decode_step(ids[0], temperature, top_k, top_p, uniform, min_p, pen, lp, masked, biased));
   int last = 0;
   prompt_chunks(ids, n, n, false, &last);
   logits(x_ + size_t(last) * kHidden, 1);
+  if (biased) bias_logits(logits_, 1, kVocab, running_bias(), 1, s_);
   if (masked) {
     Q27_CUDA(cudaMemcpyAsync(mask_dev_, mask_host_, size_t(kMaskWords) * 4, cudaMemcpyHostToDevice, s_));
     mask_logits(logits_, 1, kVocab, mask_dev_, kMaskWords, 1, 1u, s_);
@@ -1254,6 +1257,20 @@ int32_t Model::forward_sample(const int32_t* ids, int n, float temperature, int 
   Q27_CUDA(cudaStreamSynchronize(s_));
   profile_collect();
   return done(out);
+}
+
+void Model::bias_set(const int32_t* ids, const float* vals, int n, int eos_before) {
+  Q27_CHECK(n >= 0 && n <= kMaxBias, "bias_set: at most 300 entries");
+  BiasList b{};
+  b.n = n;
+  b.eos[0] = stop_[0], b.eos[1] = stop_[1], b.eos_before = std::max(eos_before, 0);
+  for (int i = 0; i < n; i++) {
+    Q27_CHECK(ids[i] >= 0 && ids[i] < kVocab, "bias_set: token out of the vocabulary");
+    b.ids[i] = ids[i], b.vals[i] = vals[i];
+  }
+  spec_flush();  // (a step in flight reads the list)
+  Q27_CUDA(cudaMemcpyAsync(bias_, &b, sizeof b, cudaMemcpyHostToDevice, s_));
+  Q27_CUDA(cudaStreamSynchronize(s_));
 }
 
 void Model::penalty_init(const int32_t* ids, int n) {
@@ -1329,7 +1346,7 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
 // runs eagerly (one-time initialization of the kernels); the second captures the graph, which is
 // reused while the sampling parameters stay the same.
 int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform, float min_p,
-                           Penalty pen, LogprobSink lp, bool masked) {
+                           Penalty pen, LogprobSink lp, bool masked, bool biased) {
   Q27_CHECK(pos_ + 1 <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   ensure_pages(pos_ + 1);
   seq_ids_.push_back(id);
@@ -1347,6 +1364,7 @@ int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p
   auto body = [&] {
     chunk(decode_memcpy_ ? ids_ : &io->id, 1);
     logits(x_, 1);
+    if (biased) bias_logits(logits_, 1, kVocab, running_bias(), 1, s_);
     if (masked) {
       Q27_CUDA(cudaMemcpyAsync(mask_dev_, mask_host_, size_t(kMaskWords) * 4, cudaMemcpyHostToDevice, s_));
       mask_logits(logits_, 1, kVocab, mask_dev_, kMaskWords, 1, 1u, s_);
@@ -1356,7 +1374,7 @@ int32_t Model::decode_step(int32_t id, float temperature, int top_k, float top_p
   };
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
-  const GraphKey key{temperature, top_k, top_p, min_p, pen.presence, pen.frequency, lp.n, masked};
+  const GraphKey key{temperature, top_k, top_p, min_p, pen.presence, pen.frequency, lp.n, masked, biased};
   if (!graph_warm_) {
     body();
     graph_warm_ = true;
@@ -1465,7 +1483,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   int32_t first = 0;
   try {
     first = forward_sample(ids, n, smp.temperature, smp.top_k, smp.top_p, uniform, smp.min_p, smp.pen.presence,
-                           smp.pen.frequency, smp.logprobs, smp.masked);
+                           smp.pen.frequency, smp.logprobs, smp.masked, smp.biased);
   } catch (...) {
     cap_ = nullptr;
     throw;
@@ -1486,7 +1504,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   Q27_CUDA(cudaMemcpyAsync(ids_ver_, blk, sizeof blk, cudaMemcpyHostToDevice, s_));
   Q27_CUDA(cudaStreamSynchronize(s_));
   spec_smp_ = smp;
-  std::copy(stop_, stop_ + 2, spec_smp_.stop);
+  if (!smp.ignore_eos) std::copy(stop_, stop_ + 2, spec_smp_.stop);
   if (spec_smp_.paths <= 0) spec_smp_.paths = spec_paths_;
   if (spec_smp_.masked) spec_smp_.paths = 1;  // (the host masks a chain's rows)
   return first;
@@ -1497,6 +1515,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
 void Model::spec_body(const SpecSampling& sampling, int part) {
   SpecSampling smp = sampling;
   smp.pen.counts = smp.penalized() ? pen_ : nullptr;
+  smp.bias = smp.biased ? bias_list() : nullptr;
   const auto& lm = w_.lm_head;
   if (part != 2) {
     Lookup lk = lookup_;
@@ -1517,6 +1536,11 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
   cap_ = nullptr;
   logits(x_, W);
   mark("accept");
+  if (smp.bias) {
+    BiasLanes bl;
+    bl.list[0] = smp.bias, bl.pos[0] = pos_dev_, bl.depth[0] = tree_->depth;
+    bias_logits(logits_, W, kVocab, bl, W, s_);
+  }
   if (smp.masked) {
     Q27_CUDA(cudaMemcpyAsync(mask_dev_, mask_host_, size_t(W) * kMaskWords * 4, cudaMemcpyHostToDevice, s_));
     mask_logits(logits_, W, kVocab, mask_dev_, kMaskWords, kSpecBlock, 1u, s_);
@@ -1877,6 +1901,7 @@ int Model::seq_park() {
   SeqState& st = parked_[a];
   for (const Region& r : seq_regions(st.dev)) Q27_CUDA(cudaMemcpyAsync(r.area, r.dev, r.bytes, cudaMemcpyDeviceToDevice, s_));
   Q27_CUDA(cudaMemcpyAsync(pen_counts(a), pen_, size_t(kVocab) * 4, cudaMemcpyDeviceToDevice, s_));
+  Q27_CUDA(cudaMemcpyAsync(bias_list(a), bias_, sizeof(BiasList), cudaMemcpyDeviceToDevice, s_));
   seq_scalars(st.scalars, true);
   seq_take(st);
   st.used = true;
@@ -1890,6 +1915,7 @@ void Model::seq_unpark(int a) {
   SeqState& st = parked_[a];
   for (const Region& r : seq_regions(st.dev)) Q27_CUDA(cudaMemcpyAsync(r.dev, r.area, r.bytes, cudaMemcpyDeviceToDevice, s_));
   Q27_CUDA(cudaMemcpyAsync(pen_, pen_counts(a), size_t(kVocab) * 4, cudaMemcpyDeviceToDevice, s_));
+  Q27_CUDA(cudaMemcpyAsync(bias_, bias_list(a), sizeof(BiasList), cudaMemcpyDeviceToDevice, s_));
   seq_scalars(st.scalars, false);
   seq_give(st);
   st.used = false;
@@ -1902,6 +1928,7 @@ void Model::seq_swap(int a) {
   SeqState& st = parked_[a];
   for (const Region& r : seq_regions(st.dev)) swap_bytes(r.dev, r.area, r.bytes, s_);
   swap_bytes(pen_, pen_counts(a), size_t(kVocab) * 4, s_);
+  swap_bytes(bias_, bias_list(a), sizeof(BiasList), s_);
   int32_t cur[kSeqScalars];
   seq_scalars(cur, true);
   seq_scalars(st.scalars, false);
@@ -2015,8 +2042,9 @@ void Model::batch_enter(const int32_t* lanes, int n) {
     }
     if (!pages->empty()) upload_pages(pt, pages->data(), pages->size());
     smp.paths = 1;
-    std::copy(stop_, stop_ + 2, smp.stop);
+    if (!smp.ignore_eos) std::copy(stop_, stop_ + 2, smp.stop);
     smp.pen.counts = smp.penalized() ? pen_counts(a) : nullptr;
+    smp.bias = smp.biased ? bias_list(a) : nullptr;
     bacc_.smp[z] = smp;
     bacc_.k[z] = smp.temperature <= 0.f ? 1 : std::clamp(smp.top_k <= 0 ? 64 : smp.top_k, 1, 64);
   }
@@ -2095,6 +2123,10 @@ void Model::batch_body(int n, int part) {
   cap_ = nullptr;
   logits(x_, W);
   mark("accept");
+  BiasLanes bl;
+  for (int z = 0; z < n; z++) bl.list[z] = bacc_.smp[z].bias, bl.pos[z] = b_pos_ + z, bl.depth[z] = b_tree_[z].depth;
+  if (std::any_of(bl.list, bl.list + n, [](const BiasList* b) { return b != nullptr; }))
+    bias_logits(logits_, W, kVocab, bl, kLaneRows, s_);
   uint32_t masked = 0;
   for (int z = 0; z < n; z++)
     if (bacc_.smp[z].masked) {

@@ -72,6 +72,10 @@ class Seq:
         self.min_p = req.get("min_p", 0.0)
         self.presence, self.frequency = req.get("presence_penalty", 0.0), req.get("frequency_penalty", 0.0)
         self.logprobs = req.get("logprobs", -1)  # top logprobs per token (0..20; -1: none)
+        # logit_bias ({token id: value}), min_tokens (the end-of-sequence ids are banned until that many tokens are
+        # out) and ignore_eos (they are ordinary tokens): the engine's logit bias (Engine.bias_set) and its steps.
+        self.bias = {int(k): float(v) for k, v in (req.get("logit_bias") or {}).items()}
+        self.min_tokens, self.ignore_eos = req.get("min_tokens", 0), bool(req.get("ignore_eos"))
         self.rng = random.Random(req.get("seed"))
         self.images = req.get("images")  # (spans [(start, gh, gw)], [(encoded image, resized size, norm)]) or None
         self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), started on arrival
@@ -111,6 +115,10 @@ class Seq:
         self.steps = 0           # decode steps (speculative: verify steps)
         self.drafted = self.draft_accepted = 0  # draft tokens verified, and those accepted (as llama.cpp counts them)
         self.marks = [0, 0, 0]   # end of the first message, starts of the last message and the generation prompt
+
+    @property
+    def biased(self):
+        return bool(self.bias) or self.min_tokens > 0
 
     def rest(self):
         return len(self.eng_ids) - (self.fed if self.started else self.est_cached)
@@ -555,8 +563,10 @@ class Scheduler:
             seed = s.rng.getrandbits(63)
             if s.presence or s.frequency:
                 self.engine.penalty_init(s.out)  # (after a preemption the earlier output counts too)
+            if s.biased:  # (min_tokens: output token j is at position len(prompt) + j)
+                self.engine.bias_set(s.bias, len(s.prompt) + s.min_tokens if s.min_tokens > len(s.out) else 0)
             extra = dict(min_p=s.min_p, presence=s.presence, frequency=s.frequency, logprobs=s.logprobs,
-                         masked=s.gm is not None)
+                         masked=s.gm is not None, biased=s.biased)
             # A step ends at the end of the reasoning when a forced output or a grammar follows it, so the engine holds
             # no tokens past it (sampled without the forced tokens, or the masks).
             until = s.force[0] if s.force is not None else s.grammar_after if s.matcher is not None and s.gm is None \
@@ -565,7 +575,8 @@ class Scheduler:
                 write_mask(self.engine, s.gm, 0)
             if self.spec:
                 tok = self.engine.spec_begin(rest, s.temperature, s.top_k, s.top_p, seed=seed,
-                                             uniform=s.rng.random(), max_new=left, until=until, **extra)
+                                             uniform=s.rng.random(), max_new=left, until=until,
+                                             ignore_eos=s.ignore_eos, **extra)
             else:
                 tok = self.engine.forward_sample(rest, s.temperature, s.top_k, s.top_p, s.rng.random(), **extra)
             s.fed = len(s.eng_ids)
@@ -611,7 +622,8 @@ class Scheduler:
                     write_mask(self.engine, s.gm, 0)
                 toks = [self.engine.forward_sample([s.out[-1]], s.temperature, s.top_k, s.top_p, s.rng.random(),
                                                    min_p=s.min_p, presence=s.presence, frequency=s.frequency,
-                                                   logprobs=s.logprobs, masked=s.gm is not None)]
+                                                   logprobs=s.logprobs, masked=s.gm is not None,
+                                                   biased=s.biased)]
             step = max(step * 0.8, time.time() - ts)
             s.steps += 1
             self.emit(s, toks, self.engine.logprobs() if s.logprobs >= 0 else None)
@@ -671,7 +683,7 @@ class Scheduler:
             if s.gm is not None and not allows(s.gm, t, self.eos):
                 cut = True  # (only right after the grammar began: masked steps output what it allows)
                 break
-            if t in self.eos:
+            if t in self.eos and not s.ignore_eos:
                 finish = "stop"
                 break
             out.append(t)

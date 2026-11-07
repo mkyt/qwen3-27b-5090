@@ -67,16 +67,20 @@ class Model {
   // Runs ids[0..n) and samples the token after the last one. presence / frequency: penalties (Penalty) by
   // the running sequence's output counts, which this and the speculative steps keep (see penalty_init).
   // logprobs >= 0: the token's logprobs with that many top entries (see logprobs()). masked: the logits are masked by
-  // row 0 of mask_rows() first.
+  // row 0 of mask_rows() first. biased: the running sequence's logit bias (bias_set) is added to the logits first.
   int32_t forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
                          float min_p = 0.f, float presence = 0.f, float frequency = 0.f, int logprobs = -1,
-                         bool masked = false);
+                         bool masked = false, bool biased = false);
   // The logprobs of the tokens the last forward_sample / spec_begin / spec_step returned (lane -1), or of lane z of
   // the last spec_step_lanes; n = 0 when that sequence's sampling has none (SpecSampling::logprobs).
   const Logprobs& logprobs(int lane = -1) const { return last_lp_[lane < 0 ? 0 : lane]; }
   // The running sequence's output so far, ids[0..n), as the penalty counts (before the first sampled
   // token of a request with penalties; parked sequences keep theirs).
   void penalty_init(const int32_t* ids, int n);
+  // The running sequence's logit bias (BiasList; n <= kMaxBias entries, n = 0: none) and min_tokens (eos_before: the
+  // end-of-sequence ids are banned for the tokens at positions below it; 0: none), used by the calls whose sampling
+  // is biased (forward_sample's biased, SpecSampling::biased); parked sequences keep theirs.
+  void bias_set(const int32_t* ids, const float* vals, int n, int eos_before = 0);
 
   // Per-op GPU time (Q27_PROFILE=1): every op records an event when it starts; prints the totals
   // per label since the last dump to stderr and resets them.
@@ -215,9 +219,16 @@ class Model {
   bool fused(int T) const;
   bf16* cap_for(int layer) const;
   int32_t decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform, float min_p, Penalty pen,
-                      LogprobSink lp, bool masked);
+                      LogprobSink lp, bool masked, bool biased);
   // Penalty counts [vocab]: the running sequence's (-1), or parking area a's.
   uint32_t* pen_counts(int a = -1) const { return pen_ + size_t(a + 1) * dims::kVocab; }
+  // Logit bias list: the running sequence's (-1), or parking area a's.
+  BiasList* bias_list(int a = -1) const { return bias_ + (a + 1); }
+  BiasLanes running_bias() const {  // (a decode or prompt row)
+    BiasLanes b;
+    b.list[0] = bias_, b.pos[0] = pos_dev_;
+    return b;
+  }
   void logits(const float* x_rows, int rows);  // final norm + lm_head into logits_
   void gdn(int layer, int T);
   void attn(int layer, int T);
@@ -425,10 +436,11 @@ class Model {
     float top_p;
     float min_p, presence, frequency;
     int logprobs;
-    bool masked;
+    bool masked, biased;
     bool operator==(const GraphKey& o) const {
       return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && min_p == o.min_p &&
-             presence == o.presence && frequency == o.frequency && logprobs == o.logprobs && masked == o.masked;
+             presence == o.presence && frequency == o.frequency && logprobs == o.logprobs && masked == o.masked &&
+             biased == o.biased;
     }
   } graph_key_{};
   cudaGraphExec_t graph_exec_ = nullptr;
@@ -476,6 +488,7 @@ class Model {
   SpecOut *spec_out_ = nullptr, *spec_out_dev_ = nullptr;  // [2] (by step parity), mapped pinned
   int32_t* hist_ = nullptr;   // committed tokens by position (lookup drafting)
   uint32_t* pen_ = nullptr;   // penalty counts [1 + parking areas][vocab] (pen_counts)
+  BiasList* bias_ = nullptr;  // logit bias lists [1 + parking areas] (bias_list)
   // Logprobs (SpecSampling::logprobs): mapped pinned results [2] by step parity of the running sequence, [lanes][2]
   // of a batched step, [1] of the sampler (kLpSample), the raw top lists the penalties would overwrite (scratch,
   // [verify rows][kMaxTopLogprobs]), and the host copies of the last call's (logprobs()).

@@ -509,6 +509,20 @@ __global__ void mask_logits_kernel(float* logits, int V, const uint32_t* mask, i
     if (!(m[t >> 5] >> (t & 31) & 1u)) x[t] = -INFINITY;
 }
 
+__global__ void bias_logits_kernel(float* logits, int V, BiasLanes bl, int rows_per_lane) {
+  pdl_trigger();
+  pdl_wait();
+  const int z = blockIdx.x / rows_per_lane;
+  const BiasList* b = bl.list[z];
+  if (!b) return;
+  float* x = logits + int64_t(blockIdx.x) * V;
+  for (int i = threadIdx.x; i < b->n; i += blockDim.x) x[b->ids[i]] += b->vals[i];
+  if (b->eos_before > 0 && threadIdx.x < 2 && b->eos[threadIdx.x] >= 0) {
+    const int at = *bl.pos[z] + (bl.depth[z] ? bl.depth[z][blockIdx.x % rows_per_lane] + 1 : 0);
+    if (at < b->eos_before) x[b->eos[threadIdx.x]] = -INFINITY;
+  }
+}
+
 // Block-wide: the logprobs of token tok in row x (V logits) and the row's top n (tv / ti: its raw sorted list) into
 // entry i of out. One pass of an online log-sum-exp.
 __device__ void logprob_row(const float* x, int V, int tok, const float* tv, const int32_t* ti, int n, Logprobs* out,
@@ -593,6 +607,12 @@ void mask_logits(float* logits, int rows, int V, const uint32_t* mask, int words
                  cudaStream_t s) {
   Q27_CHECK(words * 32 >= V, "mask_logits: mask rows shorter than the vocabulary");
   launch_pdl(mask_logits_kernel, dim3(64, rows), dim3(256), 0, s, logits, V, mask, words, rows_per_lane, lanes);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void bias_logits(float* logits, int rows, int V, const BiasLanes& bl, int rows_per_lane, cudaStream_t s) {
+  Q27_CHECK(rows_per_lane > 0 && (rows - 1) / rows_per_lane < kMaxLanes, "bias_logits: too many lanes");
+  launch_pdl(bias_logits_kernel, dim3(rows), dim3(256), 0, s, logits, V, bl, rows_per_lane);
   Q27_CUDA(cudaGetLastError());
 }
 

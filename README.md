@@ -214,7 +214,10 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
 
 Sampling: `temperature`, `top_k`, `top_p`, `min_p`, `presence_penalty` and `frequency_penalty` (OpenAI's, -2 to 2;
 the model card suggests `presence_penalty` 1.5 for non-thinking use), and `seed`. The penalties apply to the 64 most
-likely tokens of each step. Accepted but without effect: `repetition_penalty`. `n > 1` is rejected.
+likely tokens of each step. Chat completions and completions also take OpenAI's `logit_bias` (token id to -100..100, up
+to 300 entries; added to the logits before everything else) and vLLM's `min_tokens` (no end of sequence before that
+many tokens) and `ignore_eos` (generate to `max_tokens`; the end-of-sequence tokens count but their text is left out).
+Accepted but without effect: `repetition_penalty`. `n > 1` is rejected.
 
 Structured output: the output follows a JSON schema, any JSON object, a regex, a choice or a grammar, by masking the
 tokens the format does not allow at each step: OpenAI chat `response_format` (`json_object`, `json_schema`; enforced
@@ -229,11 +232,13 @@ Tool choice: `tool_choice` forces a call in all three APIs: a named tool (OpenAI
 server writes the start of the call into the answer (after the reasoning, with thinking on) and the model writes the
 arguments; they are not checked against the tool's schema. Responses `allowed_tools` is taken as its `mode` alone.
 
-Logprobs: chat completions take `logprobs: true` and `top_logprobs` (0 to 20), completions `logprobs` (0 to 20), also
-when streaming. The values are the model's raw log-probabilities (before the temperature, penalties and top-k / top-p,
-as vLLM's default `raw_logprobs`). As in vLLM, chat's `logprobs.content` covers every generated token, the reasoning
-and tool calls included; tokens of a stop string that ends the text are left out. `bytes` holds a token's own UTF-8
-bytes, which can end inside a character (its `token` then shows U+FFFD). Not for the Responses and Anthropic APIs.
+Logprobs: chat completions take `logprobs: true` and `top_logprobs` (0 to 20), completions `logprobs` (0 to 20), the
+Responses API `include: ["message.output_text.logprobs"]` and `top_logprobs` (0 to 20), also when streaming. The values
+are the model's raw log-probabilities (before the temperature, penalties and top-k / top-p, as vLLM's default
+`raw_logprobs`; a `logit_bias` is included, as in OpenAI's API). As in vLLM, chat's `logprobs.content` covers every
+generated token, the reasoning and tool calls included; the Responses API's `output_text.logprobs` covers the tokens of
+the message's text only. Tokens of a stop string that ends the text are left out. `bytes` holds a token's own UTF-8
+bytes, which can end inside a character (its `token` then shows U+FFFD). Not for the Anthropic API.
 
 ## Configuration
 
