@@ -215,7 +215,9 @@ from an anchor and verifies all 8 rows in one forward of the target.
 - **Penalties on the device.** Presence and frequency penalties count each sequence's output tokens in a
   vocabulary-sized array on the device (1 MiB per sequence), updated by the accept step itself, so pipelined
   steps need no host round trip. A verify row also counts the draft tokens on its own path, so every row sees the
-  history plain decoding would have had, and acceptance stays lossless. The penalties are applied to the 64
+  history plain decoding would have had, and acceptance stays lossless. The draft's candidate selector takes the
+  same penalties on its proposals (the counts plus the tokens already chosen on the walk), so the drafts follow
+  the penalized target instead of the repetitions the penalties suppress. The penalties are applied to the 64
   highest logits of a row (one small kernel that re-sorts them), and top-k is taken from those. Requests without
   penalties run the same kernels and graphs as before (`scripts/penalty_test.py` checks the tokens against a host
   implementation and speculative against plain decoding).

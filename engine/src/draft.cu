@@ -779,11 +779,27 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
   auto row = [&](int e, int prev) {
     return lane < kSelK ? __ldcg(&lattice[(e * kSelK + prev) * kSelK + lane]) : -INFINITY;
   };
+  // Penalties: the proposals take the request's presence / frequency penalties as the verify does,
+  // counting the output so far and the path's drafted tokens ptok[0..e). The proposal of a node depends
+  // only on its path, so the draws from a node stay i.i.d. from one q.
+  const bool pen = smp.pen.counts != nullptr;
+  __shared__ uint32_t s_cnt[kDraft * kSelK];
+  if (pen)
+    for (int i = lane; i < kDraft * kSelK; i += 32) s_cnt[i] = smp.pen.counts[cand_i[i]];
+  __syncwarp();
+  auto penalty = [&](int e, const int32_t* ptok) {
+    if (!pen || lane >= kSelK) return 0.f;
+    const int32_t t = cand_i[e * kSelK + lane];
+    uint32_t c = s_cnt[e * kSelK + lane];
+    for (int j = 0; j < e; j++) c += ptok[j] == t;
+    return c ? smp.pen.presence + smp.pen.frequency * float(c) : 0.f;
+  };
   if (smp.temperature > 0.f || K == 1) {
     for (int k = 0; k < K; k++) {
       int node = 0, prev = 0;
+      int32_t ptok[kDraft];
       for (int e = 0; e < kDraft; e++) {
-        const float sc = row(e, prev);
+        const float sc = row(e, prev) - penalty(e, ptok);
         int idx;
         float prob;
         if (smp.temperature <= 0.f) {  // greedy chain: the argmax walk (ties: the lower candidate)
@@ -819,6 +835,7 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
         }
         node = __shfl_sync(0xffffffffu, c, 0);
         prev = idx;
+        ptok[e] = cand_i[e * kSelK + idx];
         __syncwarp();
       }
       if (lane == 0) tr->leaf[k] = int8_t(node);
@@ -834,7 +851,9 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
     __syncwarp();
     for (int e = 0; e < kDraft; e++) {
       for (int b = 0; b < nb; b++) {
-        const float x = row(e, e == 0 ? 0 : b_seq[b][e - 1]);
+        int32_t ptok[kDraft];
+        for (int i = 0; i < e; i++) ptok[i] = cand_i[i * kSelK + b_seq[b][i]];
+        const float x = row(e, e == 0 ? 0 : b_seq[b][e - 1]) - penalty(e, ptok);
         float mx = x;
         for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
         const float ex = lane < kSelK ? expf(x - mx) : 0.f;
