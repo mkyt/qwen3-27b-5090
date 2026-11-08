@@ -211,6 +211,8 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
 - **Codex** (Responses API): a provider with `base_url = "http://127.0.0.1:8000/v1"` and `wire_api = "responses"`.
 - Send the previous turns' reasoning back: the chat template renders it, and the prefix cache only hits when it is there.
 - Images as data URLs or http(s) URLs. No video.
+- Special tokens written in messages (e.g. `<|im_start|>` in a pasted file or a tool result) are read as text, not as
+  turn markers. `/v1/completions` takes them as tokens.
 
 Sampling: `temperature`, `top_k`, `top_p`, `min_p`, `presence_penalty` and `frequency_penalty` (OpenAI's, -2 to 2;
 the model card suggests `presence_penalty` 1.5 for non-thinking use), and `seed`. The penalties apply to the 64 most

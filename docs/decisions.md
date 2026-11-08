@@ -389,6 +389,20 @@ gate without an explicit decision, recorded below with its numbers.
   Found on the way: when the pool ran out, the scheduler suspended the latest request other than the one that ran
   out, and two requests could suspend each other thousands of times. It now suspends the latest request including
   itself, and a suspended request resumes only when the KV pool has room.
+- **P6-50: what a client writes stays text.** Rendering the chat template and encoding the result (as
+  transformers, vLLM and SGLang do) turned special tokens' strings in a message into the tokens: `<|im_end|>` and
+  `<|im_start|>system` in a user message ended the turn and opened a system turn, `</tool_response>` in a tool result
+  closed it, `<|image_pad|>` counted as an image. This also happens without intent, e.g. an agent reading source
+  code that contains `<tool_call>`. The server now marks those strings in system, user and tool messages and in the
+  tool definitions before rendering, and encodes the marked parts with the same tokenizer without its added tokens
+  (`<|im_start|>` becomes `<`, `|`, `im`, ...). A prompt without such strings has the same ids as before. Assistant
+  messages keep their tokens (they are the model's own output), as does a user message that is a whole
+  `<tool_response>...</tool_response>` (the template treats it as a tool result), and `/v1/completions` prompts are
+  encoded as they are. A whole state machine over the template (llama.cpp's input marking, not used by its server)
+  was not needed: only the added tokens' strings are marked, so the template's string tests (`trim`, `startswith`)
+  see the same text. With a fake system turn asking for one word, the old encoding answered with it; the new one
+  translated the line as asked. The marking costs under 1 ms on a 200K-token prompt with 50 marked strings
+  (encoding takes about 200 ms either way).
 
 ## Not done
 

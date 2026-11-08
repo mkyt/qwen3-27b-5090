@@ -6,6 +6,7 @@ and encodes to the same ids (frontend/tests/test_tokenizer.py compares them wher
 import hashlib
 import json
 import pathlib
+import re
 from datetime import datetime
 
 import jinja2
@@ -59,6 +60,12 @@ def _byte_decoder():
 
 BYTE_DECODER = _byte_decoder()
 
+# Marks of client text in a rendered prompt (Tokenizer.prompt_ids): ESC + one character per added token, ESC ESC for
+# an ESC the client wrote. Private-use characters, which the template passes through unchanged.
+ESC = "\U0010fffd"
+MARK0 = 0xF0000
+RESULT = ("<tool_response>", "</tool_response>")
+
 
 def fingerprint(path):
     r"""What gives a model directory's token ids their meaning (vocabulary, merges and added tokens of tokenizer.json)
@@ -102,8 +109,21 @@ class Tokenizer:
         self.template = env.from_string(source)
         # (transformers passes its special tokens map to the template; kwargs override them)
         self.special = {k: v for k, v in config.items() if k.endswith("_token") and isinstance(v, str)}
-        self.added = set(self.tok.get_added_tokens_decoder())
+        added = self.tok.get_added_tokens_decoder()
+        self.added = set(added)
         self._pieces = {}
+        # Client text is kept as text (prompt_ids): the same tokenizer without added tokens encodes the parts of a
+        # rendered prompt that came from the client, so "<|im_start|>" there is "<", "|", "im", ... and not the token.
+        spec = json.loads((self.path / "tokenizer.json").read_text(encoding="utf-8"))
+        spec.update(added_tokens=[], truncation=None, padding=None, post_processor=None)
+        self.plain = RustTokenizer.from_str(json.dumps(spec))
+        strings = sorted({t.content for t in added.values()}, key=lambda s: (-len(s), s))
+        self._added_id = {t.content: i for i, t in added.items()}
+        self._mark = {s: ESC + chr(MARK0 + k) for k, s in enumerate(strings)}
+        self._unmark = {m[1]: s for s, m in self._mark.items()}
+        self._unmark[ESC] = ESC
+        self._added_re = re.compile("|".join(map(re.escape, strings)) or "(?!)")
+        self._marked_re = re.compile(ESC + "(.)", re.S)
 
     def encode(self, text):
         return self.tok.encode(text, add_special_tokens=False).ids
@@ -131,3 +151,80 @@ class Tokenizer:
         """The prompt text of chat messages (transformers' apply_chat_template with tokenize=False)."""
         return self.template.render(**{**self.special, "messages": messages, "tools": tools, "documents": None,
                                        "add_generation_prompt": add_generation_prompt, **kwargs})
+
+    def prompt_ids(self, messages, tools=None, add_generation_prompt=True, **kwargs):
+        """The prompt ids of chat messages, with what the client wrote kept as text: an added token's string
+        ("<|im_start|>", "</tool_response>", "<tool_call>", "<|image_pad|>", ...) in a system, user or tool message or
+        in the tool definitions encodes as ordinary tokens, so it cannot end a turn, open a fake one or stand for an
+        image. Assistant messages (content, reasoning, tool calls) are the model's own output and keep their tokens.
+        Without such strings the ids are those of encode(render(...)), as transformers has them."""
+        messages = [m if not isinstance(m, dict) or m.get("role") == "assistant" else self._escape_message(m)
+                    for m in messages]
+        text = self.render(messages, tools=self._escape(tools), add_generation_prompt=add_generation_prompt, **kwargs)
+        return self.encode_marked(text)
+
+    def _escape(self, x):
+        """x (strings, lists and mappings of them, keys too) with the added tokens' strings marked."""
+        if isinstance(x, str):
+            if ESC in x:
+                x = x.replace(ESC, ESC + ESC)
+            return self._added_re.sub(lambda m: self._mark[m.group()], x)
+        if isinstance(x, list):
+            return [self._escape(v) for v in x]
+        if isinstance(x, dict):
+            return {self._escape(k): self._escape(v) for k, v in x.items()}
+        return x
+
+    def _escape_message(self, m):
+        """A system, user or tool message with its text marked. The template takes a user message that is a whole
+        "<tool_response>...</tool_response>" as a tool result (clients that send results as user turns): those two
+        stay as they are."""
+        content = m.get("content")
+        if isinstance(content, str):
+            keep = m.get("role") == "user" and self._is_result(content, content)
+            content = self._wrapped(content, keep, keep)
+        elif isinstance(content, list):
+            def text(p):
+                return p.get("text") if isinstance(p, dict) and p.get("type") == "text" else None
+
+            ends = len(content) > 0 and text(content[0]), len(content) > 0 and text(content[-1])
+            keep = m.get("role") == "user" and self._is_result(*ends)
+            content = [dict(p, text=self._wrapped(text(p), keep and k == 0, keep and k == len(content) - 1))
+                       if text(p) is not None else p for k, p in enumerate(content)]  # (images: their URLs)
+        return dict(self._escape({k: v for k, v in m.items() if k != "content"}), content=content)
+
+    @staticmethod
+    def _is_result(first, last):
+        """Whether text that starts with `first` and ends with `last` is a whole tool result (template: trimmed
+        content.startswith('<tool_response>') and .endswith('</tool_response>'))."""
+        return (isinstance(first, str) and isinstance(last, str) and first.lstrip().startswith(RESULT[0])
+                and last.rstrip().endswith(RESULT[1]))
+
+    def _wrapped(self, text, keep_start, keep_end):
+        """text marked, but for a leading "<tool_response>" (keep_start) and a trailing "</tool_response>" (keep_end)."""
+        if not isinstance(text, str):
+            return self._escape(text)
+        a, b = 0, len(text)
+        if keep_start:
+            a = len(text) - len(text.lstrip()) + len(RESULT[0])
+        if keep_end:
+            b = max(a, len(text.rstrip()) - len(RESULT[1]))
+        return text[:a] + self._escape(text[a:b]) + text[b:]
+
+    def encode_marked(self, text):
+        """Ids of a rendered prompt whose client text was marked (_escape): the added tokens the template wrote are
+        tokens, the text between them is encoded without added tokens, with the marked strings put back."""
+        if ESC not in text:
+            return self.encode(text)
+        out, parts, at = [], [], 0
+        for m in self._added_re.finditer(text):
+            parts.append((len(out), text[at:m.start()]))
+            out.append(self._added_id[m.group()])
+            at = m.end()
+        parts.append((len(out), text[at:]))
+        unmark = lambda m: self._unmark[m.group(1)]  # noqa: E731
+        segs = [self._marked_re.sub(unmark, s) for _, s in parts]
+        encs = self.plain.encode_batch(segs, add_special_tokens=False)
+        for (pos, _), e in reversed(list(zip(parts, encs))):
+            out[pos:pos] = e.ids
+        return out

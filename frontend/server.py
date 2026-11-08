@@ -669,13 +669,13 @@ class Server:
             self.tok = tok
 
     def render(self, messages, tools, kwargs):
-        """Prompt ids (images expanded) and the images, of chat messages."""
+        """Prompt ids (images expanded) and the images, of chat messages. Special tokens' strings in what the client
+        wrote stay text (Tokenizer.prompt_ids): only the template opens and ends turns, and places images."""
         try:
             with self.tok_lock:
-                prompt = self.tok.render(messages, tools=tools or None, **kwargs)
+                ids = self.tok.prompt_ids(messages, tools=tools or None, **kwargs)
         except Exception as e:  # noqa: BLE001 - template errors (no user message, bad roles) are the client's
             raise ApiError(400, f"chat template: {e}") from e
-        ids = self.encode(prompt)
         urls, images = Images.collect(messages), None
         if urls:
             proc = self.images
