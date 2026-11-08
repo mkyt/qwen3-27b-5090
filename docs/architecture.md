@@ -358,6 +358,8 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
 
 - The chat template is the checkpoint's Jinja template; reasoning (`<think>`) and tool calls (Qwen's XML format)
   are parsed by one state machine for streaming and non-streaming responses, and tool calls stream one by one.
+  The state machine splits only at the marker tokens (the detokenizer writes them as private-use characters):
+  the same strings written as ordinary tokens, as the model quotes them in code or in a log it repeats, stay text.
 - Special tokens' strings in what a client writes (system, user and tool messages, tool definitions) stay text:
   they are marked before the template renders and encoded without the added tokens, so only the template opens
   and ends turns and places images (`Tokenizer.prompt_ids`; assistant turns, the model's own output, keep theirs).

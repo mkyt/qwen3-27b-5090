@@ -403,6 +403,16 @@ gate without an explicit decision, recorded below with its numbers.
   see the same text. With a fake system turn asking for one word, the old encoding answered with it; the new one
   translated the line as asked. The marking costs under 1 ms on a 200K-token prompt with 50 marked strings
   (encoding takes about 200 ms either way).
+- **P6-51: the output parser splits on tokens, not strings.** The parser looked for `</think>`, `<tool_call>` and
+  `</tool_call>` in the decoded text, but the model writes them as ordinary tokens (`<`, `tool`, `_call`, `>`) when
+  it quotes them, and as one token each only when it means them. Asked for a function that strips `<think>`
+  sections, its reasoning ended at the first quoted `</think>` (73 characters; 3 of 3 runs); asked for a tool-call
+  parser, the code's examples came back as calls of tools that do not exist (3 of 3); asked to repeat a log that
+  contains a call, the server returned it as a call of `delete_all`, which the request did not define (6 of 6). The
+  detokenizer of the chat APIs now writes those three tokens as private-use characters, the parser splits only
+  there, and its events have the strings again. A stop string matches both forms. With it the same runs keep their
+  reasoning, code and logs as text, and the model's real calls still parse. `/v1/completions` returns the text as
+  it was.
 
 ## Not done
 

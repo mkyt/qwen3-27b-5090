@@ -43,7 +43,7 @@ import structured  # noqa: E402
 import worker  # noqa: E402
 from launch import ENGINE_ENV_DEFAULTS, Launch, env_settings, model_dir, set_engine_env  # noqa: E402,F401
 from stats import HUB, request_meta  # noqa: E402
-from chat import (STOP_REASON, THINK_END, AnthropicError, OutputParser, _partial_suffix,  # noqa: E402,F401
+from chat import (MARKS, STOP_REASON, THINK_END, AnthropicError, OutputParser, _partial_suffix, mark_strings,  # noqa: E402,F401
                   anthropic_messages, anthropic_template_kwargs, forced_call, new_id, normalize_messages,
                   openai_call, parse_output, parse_tool_calls, responses_messages, responses_template_kwargs,
                   split_reasoning, template_kwargs, thinking_signature, tool_choice_of)
@@ -436,23 +436,44 @@ def client_gone(sock):
 
 
 class Detokenizer:
-    """Incremental detokenization: text is released only at complete UTF-8 characters."""
+    """Incremental detokenization: text is released only at complete UTF-8 characters. marks: {token string:
+    character} of tokens written as that character (chat.MARKS, for the output parser)."""
 
-    def __init__(self, tok, lock):
+    def __init__(self, tok, lock, marks=None):
         self.tok, self.lock = tok, lock
         self.ids, self.prefix, self.read = [], 0, 0
+        self.marks = {tok.token_id(k): v for k, v in (marks or {}).items() if tok.token_id(k) is not None}
+        self.literal = set(self.marks.values())
 
     def _decode(self, ids):
         with self.lock:
             return self.tok.decode(ids)
 
     def add(self, ids, final=False):
+        if not self.marks or not any(t in self.marks for t in ids):
+            return self._add(ids, final)
+        out, run = "", []
+        for t in ids:
+            if t not in self.marks:
+                run.append(t)
+                continue
+            # (a marked token ends the text before it: bytes left incomplete there decode as U+FFFD, as in a
+            # decode of the whole)
+            out += self._add(run, final=True) + self.marks[t]
+            self.ids, self.prefix, self.read, run = [], 0, 0, []
+        return out + self._add(run, final)
+
+    def _add(self, ids, final=False):
         self.ids += ids
         prefix_text = self._decode(self.ids[self.prefix:self.read])
         new_text = self._decode(self.ids[self.prefix:])
         if len(new_text) > len(prefix_text) and (final or not new_text.endswith("�")):
             self.prefix, self.read = self.read, len(self.ids)
-            return new_text[len(prefix_text):]
+            text = new_text[len(prefix_text):]
+            if self.marks and any(c in self.literal for c in text):
+                # (the mark characters themselves, plane-16 private use, as text: U+FFFD, so they never split)
+                text = "".join("\ufffd" if c in self.literal else c for c in text)
+            return text
         return ""
 
 
@@ -466,9 +487,15 @@ class Generation:
     that cut the text are not), as (text offset, token id, logprob, [(id, logprob)])."""
 
     def __init__(self, server, ids, max_new, sampling, stop=(), images=None, sock=None, keepalive=None, force=None,
-                 grammar=None):
+                 grammar=None, marked=False):
         self.server, self.sock, self.keepalive = server, sock, keepalive
-        self.stops = [s for s in stop if s]
+        # marked (the chat APIs): the text has the output parser's marker tokens as chat.MARKS. A stop string then
+        # matches both where the model wrote the markers as tokens and where it wrote them as text.
+        stop = [s for s in stop if s]
+        self.stop_of = {s: s for s in stop}
+        if marked:
+            self.stop_of.update({mark_strings(s): s for s in stop})
+        self.stops = list(self.stop_of)
         self.prompt_tokens = len(ids)
         self.finish, self.stop_sequence, self.cached = None, None, 0
         self.tokens, self.timings = 0, None
@@ -481,7 +508,7 @@ class Generation:
         # skip_special_tokens does)
         self.hide = set(getattr(server.engine, "cfg", {}).get("eos", ())) if sampling.get("ignore_eos") else set()
         self.rid, self.q = server.engine.submit(req)
-        self.detok = Detokenizer(server.tok, server.tok_lock)
+        self.detok = Detokenizer(server.tok, server.tok_lock, MARKS if marked else None)
         self.text, self.sent = "", 0
         self.lps, self.lp_taken, self.lp_all = [], 0, False
 
@@ -506,7 +533,7 @@ class Generation:
             if hits:
                 i, s = min(hits)
                 self.text = self.text[:i]
-                self.finish, self.stop_sequence = "stop", s
+                self.finish, self.stop_sequence = "stop", self.stop_of[s]
                 self.cancel()
                 final = cut = True
             safe = len(self.text) if final else len(self.text) - (max(map(len, self.stops)) - 1)
@@ -1036,8 +1063,8 @@ class Handler(BaseHTTPRequestHandler):
         sampling = dict(sampling_of(body), logprobs=nlp, **token_controls_of(body, self.srv.vocab, min(max_new, left)))
         gen = Generation(self.srv, ids, min(max_new, left), sampling,
                          stops_of(body.get("stop")), images, self.connection, keep, self.srv.force(choice, thinking),
-                         grammar)
-        parser = OutputParser(thinking, tools if parse_tools else None)
+                         grammar, marked=True)
+        parser = OutputParser(thinking, tools if parse_tools else None, marked=True)
         rid, created, model = f"chatcmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
         single_call = body.get("parallel_tool_calls") is False or choice[0] == "named"
         if stream:
@@ -1187,8 +1214,8 @@ class Handler(BaseHTTPRequestHandler):
         grammar = self.srv.constrain(lambda: structured.anthropic_format(body), choice, tools, thinking)
         gen = Generation(self.srv, ids, min(body["max_tokens"], left), sampling_of(body),
                          stops_of(body.get("stop_sequences")), images, self.connection, keep, self.srv.force(choice, thinking),
-                         grammar)
-        parser = OutputParser(thinking, tools if parse_tools else None)
+                         grammar, marked=True)
+        parser = OutputParser(thinking, tools if parse_tools else None, marked=True)
         mid, model = f"msg_{gen.rid[4:]}", self._model(body)
         omit = (body.get("thinking") or {}).get("display") == "omitted" if isinstance(body.get("thinking"), dict) else False
 
@@ -1307,8 +1334,8 @@ class Handler(BaseHTTPRequestHandler):
         nlp = responses_logprobs_of(body)
         gen = Generation(self.srv, ids, max_new, dict(sampling_of(body), logprobs=nlp), (), images, self.connection,
                          (lambda: self._keepalive_comment()) if stream else None, self.srv.force(choice, thinking),
-                         grammar)
-        parser = OutputParser(thinking, tools if parse_tools else None)
+                         grammar, marked=True)
+        parser = OutputParser(thinking, tools if parse_tools else None, marked=True)
         resp = {"id": f"resp_{gen.rid[4:]}", "object": "response", "created_at": int(time.time()), "status": "in_progress",
                 "model": self._model(body), "output": [], "instructions": body.get("instructions"),
                 "parallel_tool_calls": body.get("parallel_tool_calls", True), "tool_choice": body.get("tool_choice", "auto"),

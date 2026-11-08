@@ -16,6 +16,25 @@ import uuid
 THINK_END = "</think>"
 TOOL_START, TOOL_END = "<tool_call>", "</tool_call>"
 
+# The server's detokenizer writes these tokens as one private-use character each (Detokenizer(marks=MARKS)), so the
+# parser (OutputParser(marked=True)) splits only where the model wrote the token: the same strings written with
+# ordinary tokens ("<", "tool", "_call", ">"), as the model quotes them in code, logs and its reasoning, are text.
+MARKS = {THINK_END: "\U0010fff0", TOOL_START: "\U0010fff1", TOOL_END: "\U0010fff2"}
+_UNMARK = {v: k for k, v in MARKS.items()}
+_MARKED = re.compile("|".join(_UNMARK))
+
+
+def unmark(text):
+    """The text with the marked tokens as their strings."""
+    return _MARKED.sub(lambda m: _UNMARK[m.group()], text) if text else text
+
+
+def mark_strings(text):
+    """The text with the markers' strings as the marks (what the detokenizer gives for the tokens)."""
+    for k, v in MARKS.items():
+        text = text.replace(k, v)
+    return text
+
 
 def new_id(prefix, n=24):
     return f"{prefix}{uuid.uuid4().hex[:n]}"
@@ -149,9 +168,14 @@ class OutputParser:
     whitespace (dropped before `</think>` and `<tool_call>`), is held back until it is known.
 
     thinking: the prompt ended in `<think>` (the output starts with reasoning). tools: tool definitions
-    (None: tool calls are not parsed and stay in the content)."""
+    (None: tool calls are not parsed and stay in the content). marked: the text has the marker tokens as MARKS (the
+    server's detokenizer) and only those split; the events have them as their strings again. Otherwise (tests, whole
+    texts) the markers' strings split."""
 
-    def __init__(self, thinking, tools=None):
+    def __init__(self, thinking, tools=None, marked=False):
+        self.think_end, self.tool_start, self.tool_end = (
+            (MARKS[THINK_END], MARKS[TOOL_START], MARKS[TOOL_END]) if marked else (THINK_END, TOOL_START, TOOL_END))
+        self.out = unmark if marked else (lambda t: t)
         self.mode = "reasoning" if thinking else "content"
         self.tools = tools is not None
         self.schemas = tool_schemas(tools)
@@ -169,7 +193,7 @@ class OutputParser:
         keep = seg[len(seg.rstrip()):] if hold_ws else ""
         emit = seg[:len(seg) - len(keep)]
         if emit:
-            events.append((kind, emit))
+            events.append((kind, self.out(emit)))
         self.buf = keep + self.buf[upto:]
 
     def feed(self, text):
@@ -177,30 +201,30 @@ class OutputParser:
         events = []
         while True:
             if self.mode == "reasoning":
-                i = self.buf.find(THINK_END)
+                i = self.buf.find(self.think_end)
                 if i < 0:
-                    self._text("reasoning", len(self.buf) - _partial_suffix(self.buf, THINK_END), events)
+                    self._text("reasoning", len(self.buf) - _partial_suffix(self.buf, self.think_end), events)
                     return events
                 self._text("reasoning", i, events)
-                self.buf = self.buf.lstrip()[len(THINK_END):] if self.buf.lstrip().startswith(THINK_END) else ""
+                self.buf = self.buf.lstrip()[len(self.think_end):] if self.buf.lstrip().startswith(self.think_end) else ""
                 self.mode, self.lead = "content", True
             elif self.mode == "content":
-                i = self.buf.find(TOOL_START) if self.tools else -1
+                i = self.buf.find(self.tool_start) if self.tools else -1
                 if i < 0:
-                    hold = _partial_suffix(self.buf, TOOL_START) if self.tools else 0
+                    hold = _partial_suffix(self.buf, self.tool_start) if self.tools else 0
                     self._text("content", len(self.buf) - hold, events)
                     return events
                 self._text("content", i, events)
-                self.buf = self.buf[self.buf.find(TOOL_START):]  # (held whitespace before the call is dropped)
+                self.buf = self.buf[self.buf.find(self.tool_start):]  # (held whitespace before the call is dropped)
                 self.mode = "tool"
             elif self.mode == "tool":
-                i = self.buf.find(TOOL_END)
+                i = self.buf.find(self.tool_end)
                 if i < 0:
                     return events
-                block, self.buf = self.buf[:i + len(TOOL_END)], self.buf[i + len(TOOL_END):]
-                calls = parse_call_block(block, self.schemas)
+                block, self.buf = self.buf[:i + len(self.tool_end)], self.buf[i + len(self.tool_end):]
+                calls = parse_call_block(self.out(block), self.schemas)
                 if not calls:  # (not a call after all: keep the text)
-                    events.append(("content", block))
+                    events.append(("content", self.out(block)))
                 for c in calls:
                     self.ncalls += 1
                     events.append(("tool_call", c))
@@ -209,9 +233,9 @@ class OutputParser:
                 rest = self.buf.lstrip()
                 if not rest:
                     return events
-                if rest.startswith(TOOL_START):
+                if rest.startswith(self.tool_start):
                     self.buf, self.mode = rest, "tool"
-                elif TOOL_START.startswith(rest):
+                elif self.tool_start.startswith(rest):
                     return events
                 else:  # text after the calls: content
                     self.buf, self.mode, self.lead = rest, "content", False
@@ -225,12 +249,12 @@ class OutputParser:
             self._text("content", len(self.buf), events, hold_ws=False)
         elif self.mode == "tool":
             # Cut off inside a call (max_tokens): a complete function still counts, otherwise it is text.
-            calls = parse_call_block(self.buf, self.schemas) if "</function>" in self.buf else []
+            calls = parse_call_block(self.out(self.buf), self.schemas) if "</function>" in self.buf else []
             for c in calls:
                 self.ncalls += 1
                 events.append(("tool_call", c))
             if not calls and self.buf.strip():
-                events.append(("content", self.buf))
+                events.append(("content", self.out(self.buf)))
         self.buf = ""
         return events
 
