@@ -161,6 +161,7 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
     vocab_w_off_ = wpool_.add("draft vocabulary head", size_t(n) * kHidden / 2);
     vocab_sf_off_ = wpool_.add("draft vocabulary head scales", size_t(sf_bytes(n, kHidden / 16)));
     log("draft vocabulary: %d ids (%s)", n, vf.c_str());
+    if (dspine()) tsv_off_ = wpool_.add("draft sender table", size_t(n) * 2 * kBridgeRank * 2);
   }
 
   const int R = max_ctx_rows_;
@@ -247,6 +248,7 @@ void Draft::bind() {
     ecode_ = apool_.at<bf16>(off_.ecode), egv_ = apool_.at<float>(off_.egv), emsg_ = apool_.at<bf16>(off_.emsg);
     refined_ = apool_.at<float>(off_.refined);
     codebook_ = hpool_.at<bf16>(codebook_off_);
+    if (!vocab_.empty()) tsv_ = wpool_.at<bf16>(tsv_off_);
   }
   lattice_ = apool_.at<float>(off_.lattice);
   choice.cand = cand_i_;
@@ -327,6 +329,24 @@ void Draft::build_vocab_head(const uint8_t* lm_w, const uint8_t* lm_sf, cudaStre
   Q27_CUDA(cudaMemsetAsync(vocab_sf_, 0, size_t(sf_bytes(n, kHidden / 16)), s));
   draft_gather_head(lm_w, lm_sf, vocab_ids_, n, kHidden, vocab_w_, vocab_sf_, s);
   Q27_CUDA(cudaStreamSynchronize(s));
+  if (!tsv_) return;
+  // DSpine's sender table: the codebook rows of the vocabulary in chunks (UVA), times G_p | A, rounded to BF16.
+  constexpr int kRows = 8192;
+  bf16 *codes = nullptr, *gv16 = nullptr;
+  float* gv = nullptr;
+  Q27_CUDA(cudaMalloc(&codes, size_t(kRows) * kCode * 2));
+  Q27_CUDA(cudaMalloc(&gv, size_t(kRows) * 2 * kBridgeRank * 4));
+  const bf16* gv_w = static_cast<const bf16*>(packed_.w) + size_t(kBridgeRank) * kCode;  // G_p | A
+  for (int c = 0; c < n; c += kRows) {
+    const int m = std::min(kRows, n - c);
+    dspine_gather_codes(codebook_, vocab_ids_ + c, m, codes, s);
+    gemm_bf16(m, 2 * kBridgeRank, kCode, codes, gv_w, 1.f, nullptr, 0.f, gv, s);
+    draft_round_bf16(gv, int64_t(m) * 2 * kBridgeRank, tsv_ + size_t(c) * 2 * kBridgeRank, s);
+  }
+  Q27_CUDA(cudaStreamSynchronize(s));
+  Q27_CUDA(cudaFree(codes));
+  Q27_CUDA(cudaFree(gv));
+  (void)gv16;
 }
 
 void Draft::reset(cudaStream_t s) {
@@ -599,13 +619,18 @@ void Draft::propose_dspine(int nb, int T, const DraftLanes& lanes, const int32_t
   // row as the code), giving the 16 x 16 logits per position the selector walks.
   dspine_cand(nb, T, batched, cand_c_, voc ? vocab_ids_ : nullptr, block_ids, cand_i_, sid_, s);
   const int E = nb * nd * kSelK;
-  dspine_gather_codes(codebook_, sid_, E, ecode_, s);
   constexpr int kChunk = 64;  // (the skinny GEMMs take up to 64 rows)
   const bf16* gv_w = static_cast<const bf16*>(packed_.w) + size_t(kBridgeRank) * kCode;  // G_p | A
-  for (int c = 0; c < E; c += kChunk)
-    skinny_bf16(std::min(kChunk, E - c), 2 * kBridgeRank, kCode, ecode_ + size_t(c) * kCode, gv_w, 1.f, nullptr, 0.f,
-                egv_ + size_t(c) * 2 * kBridgeRank, ws, ws_bytes, s);
-  dspine_emsg(nb, T, batched, egv_, pk_, gate_b_, emsg_, s);
+  if (tsv_) {  // the candidates' from the sender table; the anchors' (sid of (z, 0, 0)) computed here
+    dspine_gather_codes(codebook_, sid_, nb, ecode_, s, nd * kSelK);
+    skinny_bf16(nb, 2 * kBridgeRank, kCode, ecode_, gv_w, 1.f, nullptr, 0.f, egv_, ws, ws_bytes, s);
+  } else {
+    dspine_gather_codes(codebook_, sid_, E, ecode_, s);
+    for (int c = 0; c < E; c += kChunk)
+      skinny_bf16(std::min(kChunk, E - c), 2 * kBridgeRank, kCode, ecode_ + size_t(c) * kCode, gv_w, 1.f, nullptr, 0.f,
+                  egv_ + size_t(c) * 2 * kBridgeRank, ws, ws_bytes, s);
+  }
+  dspine_emsg(nb, T, batched, egv_, pk_, gate_b_, emsg_, s, tsv_, cand_c_);
   const bf16* ww = write_w_ + size_t(kLayers - 1) * kHidden * kBridgeRank;
   for (int c = 0; c < E; c += kChunk)
     skinny_bf16(std::min(kChunk, E - c), kHidden, kBridgeRank, emsg_ + size_t(c) * kBridgeRank, ww, 1.f, nullptr, 0.f,

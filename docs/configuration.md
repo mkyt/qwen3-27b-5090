@@ -423,7 +423,7 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_SKINNY_EXACT=1` | Make a row's skinny-GEMM result independent of M (tests of tree verification and preemption) |
 | `Q27_SKINNY_EXT_REDUCE_M` | Rows from which the skinny GEMM's split-K reduction runs as a separate kernel (default 1: M >= 2; at M = 1 the last CTA reduces; same result; P7-4) |
 | `Q27_DRAFT_ATTN_TC=0` | The draft's attention on CUDA cores (default: tensor cores; P7-4) |
-| `Q27_SKIP=norm,silu,gdn,attn,gemm,gemm4,gemm8` | Skip a kind of kernel to measure its share of the time (`gemm4` / `gemm8`: FP4 / FP8 GEMMs only; the output is garbage) |
+| `Q27_SKIP=norm,silu,gdn,attn,gemm,gemm4,gemm8,draft,dctx` | Skip a kind of kernel to measure its share of the time (`gemm4` / `gemm8`: FP4 / FP8 GEMMs only; `draft` / `dctx`: the draft model / its context update in a speculative step; the output is garbage) |
 | `Q27_DECODE_MEMCPY=1` | Decode inputs and outputs by copies instead of mapped pinned memory |
 | `Q27_ATTN_TC=0` | Decode / verify attention on CUDA cores (tree verification always uses them) |
 | `Q27_ATTN_TC_DEC=0` | Decode (T = 1) attention with one warp per token (same result) |

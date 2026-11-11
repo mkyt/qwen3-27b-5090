@@ -171,6 +171,10 @@ class Draft {
   DLinear packed_;                                          // gate | predecessor_gate | prev [1536][1024]
   size_t codebook_off_ = 0;
   const bf16* codebook_ = nullptr;                          // [vocab][1024]
+  // With a draft vocabulary: G_p e | A e of each of its tokens (e = sqrt(1024) * its codebook row), BF16 [n][1024],
+  // built at load; the refinement's candidate senders read it instead of the codebook (PCIe) and a GEMM.
+  size_t tsv_off_ = 0;
+  bf16* tsv_ = nullptr;
   void propose_dspine(int nb, int T, const DraftLanes& lanes, const int32_t* block_ids, const bf16* embed,
                       const uint8_t* lm_w, const uint8_t* lm_sf, float lm_in_scale, float lm_alpha,
                       const SpecSampling* smp, const SelectLanes* sl, const uint64_t* rng, int32_t* ids_out,
@@ -300,9 +304,10 @@ void dspine_write_norm(const float* delta, const float* rms, int rows, int T, fl
 // The refinement: candidate token ids and senders, the senders' codes, messages, and the 16 x 16 table.
 void dspine_cand(int nb, int T, bool lanes, const int32_t* cand_c, const int32_t* vocab_ids, const int32_t* block_ids,
                  int32_t* cand_i, int32_t* sid, cudaStream_t s);
-void dspine_gather_codes(const bf16* codebook, const int32_t* ids, int rows, bf16* out, cudaStream_t s);
+void dspine_gather_codes(const bf16* codebook, const int32_t* ids, int rows, bf16* out, cudaStream_t s, int stride = 1);
+// tsv (optional): the sender table, see Draft::tsv_ (cand_c: the candidates' compact ids).
 void dspine_emsg(int nb, int T, bool lanes, const float* egv, const float* pk, const bf16* gb, bf16* emsg,
-                 cudaStream_t s);
+                 cudaStream_t s, const bf16* tsv = nullptr, const int32_t* cand_c = nullptr);
 void dspine_table(int nb, int T, bool lanes, const float* raw, const float* rms, const float* delta,
                   const bf16* norm_w, const int32_t* cand_c, const uint8_t* head_w, const uint8_t* head_sf,
                   float wscale, float* lattice, cudaStream_t s);
@@ -310,6 +315,8 @@ void dspine_table(int nb, int T, bool lanes, const float* raw, const float* rms,
 void dspine_select(int nb, int nd, const SelectLanes* sl, const SpecSampling& smp, const int32_t* cand_i,
                    const int32_t* anchor, const uint64_t* rng, int32_t* ids_out, DraftChoice choice, float* lattice,
                    cudaStream_t s);
+// fp32 -> BF16 (load time).
+void draft_round_bf16(const float* x, int64_t n, bf16* out, cudaStream_t s);
 // Weight quantization at load: rows [n][K] of BF16 w into rows row0.. of l (format fmt).
 void draft_quant_weight(const bf16* w, int n, int K, DraftQuant fmt, const DLinear& l, int row0, cudaStream_t s);
 // Rows ids[0..n) of an NVFP4 head [V][K] (packed values + swizzled block scales) into a compact head [n][K].

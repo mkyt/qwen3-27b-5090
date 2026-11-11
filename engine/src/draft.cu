@@ -618,10 +618,12 @@ __global__ void gather_head_kernel(const uint8_t* w, const uint8_t* sf, const in
   for (int kb = 2 * c; kb < 2 * c + 2; kb++) dsf[sf_offset(r, kb, kblocks)] = sf[sf_offset(src, kb, kblocks)];
 }
 
+// E2M1 code -> value: 0, 0.5, 1, 1.5, 2, 3, 4, 6 (and their negatives), from the bits (a table indexed at run time
+// goes through local memory: the DSpine table kernel took 270 us with one).
 __device__ __forceinline__ float e2m1_value(uint32_t code) {
-  constexpr float lut[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-  const float m = lut[code & 7];
-  return code & 8 ? -m : m;
+  const uint32_t m = code & 7, e = m >> 1;
+  const float v = e ? __uint_as_float(((e + 126u) << 23) | ((m & 1u) << 22)) : 0.5f * float(m & 1u);
+  return code & 8 ? -v : v;
 }
 
 // Dequantization of weight rows to BF16 (prompt context through the BF16 GEMM): thread per 16 values.
@@ -1104,13 +1106,13 @@ __global__ void dspine_cand_kernel(DsGeo geo, int nb, const int32_t* cand_c, con
   sid[i] = e == 0 ? block_ids[geo.T * z] : id(e - 1);
 }
 
-// sqrt(C) * codebook[ids[r]] (pinned host, UVA) in BF16, rows of the refinement.
+// sqrt(C) * codebook[ids[r * stride]] (pinned host, UVA) in BF16, rows of the refinement.
 __global__ void __launch_bounds__(128) dspine_gather_codes_kernel(const bf16* codebook, const int32_t* ids,
-                                                                  bf16* out) {
+                                                                  bf16* out, int stride) {
   pdl_trigger();
   pdl_wait();
   const int r = blockIdx.x, c = threadIdx.x * 8;
-  const uint4 raw = *reinterpret_cast<const uint4*>(codebook + int64_t(ids[r]) * kCode + c);
+  const uint4 raw = *reinterpret_cast<const uint4*>(codebook + int64_t(ids[r * stride]) * kCode + c);
   const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
   const float sq = sqrtf(float(kCode));
   uint32_t o[4];
@@ -1123,16 +1125,26 @@ __global__ void __launch_bounds__(128) dspine_gather_codes_kernel(const bf16* co
 }
 
 // Messages of the refinement: sigmoid(q + G_p e + b) * A e for every (z, e, a) row (egv: G_p e | A e [rows][2 R],
-// q: the last write's G_q z of the position's block row in pk).
+// q: the last write's G_q z of the position's block row in pk). With the sender table tsv (G_p e | A e of the draft
+// vocabulary's tokens, BF16, by compact id), the senders of positions e >= 1 (candidates) come from it and the
+// anchors' from egv row z.
 __global__ void __launch_bounds__(kBridgeRank) dspine_emsg_kernel(DsGeo geo, const float* egv, const float* pk,
-                                                                  const bf16* gb, bf16* emsg) {
+                                                                  const bf16* gb, bf16* emsg, const bf16* tsv,
+                                                                  const int32_t* cand_c) {
   pdl_trigger();
   pdl_wait();
   const int m = blockIdx.x, r = threadIdx.x;
-  const int e = m / kSelK % geo.nd, z = m / kSelK / geo.nd;
+  const int a = m % kSelK, e = m / kSelK % geo.nd, z = m / kSelK / geo.nd;
   const float q = pk[int64_t(geo.brow(z, e)) * 3 * kBridgeRank + r];
-  const float* gv = egv + int64_t(m) * 2 * kBridgeRank;
-  emsg[int64_t(m) * kBridgeRank + r] = __float2bfloat16(sigmoidf(q + gv[r] + __bfloat162float(gb[r])) * gv[kBridgeRank + r]);
+  float g, v;
+  if (tsv && e > 0) {
+    const bf16* t = tsv + int64_t(cand_c[geo.crow(z, e - 1) * kSelK + a]) * 2 * kBridgeRank;
+    g = __bfloat162float(t[r]), v = __bfloat162float(t[kBridgeRank + r]);
+  } else {
+    const float* gv = egv + int64_t(tsv ? z : m) * 2 * kBridgeRank;
+    g = gv[r], v = gv[kBridgeRank + r];
+  }
+  emsg[int64_t(m) * kBridgeRank + r] = __float2bfloat16(sigmoidf(q + g + __bfloat162float(gb[r])) * v);
 }
 
 // The table: for (z, e, a) the last write redone with sender a, row = raw + rms * delta, RMSNorm * norm_w, then
@@ -1188,6 +1200,10 @@ __global__ void __launch_bounds__(kNormThreads) dspine_table_kernel(DsGeo geo, c
   }
 }
 
+__global__ void round_bf16_kernel(const float* x, int64_t n, bf16* out) {
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __float2bfloat16(x[i]);
+}
 }  // namespace
 
 void draft_norm(const float* x, const bf16* w, int T, float* out, ActOut ao, bf16* hb, cudaStream_t s) {
@@ -1363,15 +1379,15 @@ void dspine_cand(int nb, int T, bool lanes, const int32_t* cand_c, const int32_t
   Q27_CUDA(cudaGetLastError());
 }
 
-void dspine_gather_codes(const bf16* codebook, const int32_t* ids, int rows, bf16* out, cudaStream_t s) {
-  launch_pdl(dspine_gather_codes_kernel, dim3(rows), dim3(128), 0, s, codebook, ids, out);
+void dspine_gather_codes(const bf16* codebook, const int32_t* ids, int rows, bf16* out, cudaStream_t s, int stride) {
+  launch_pdl(dspine_gather_codes_kernel, dim3(rows), dim3(128), 0, s, codebook, ids, out, stride);
   Q27_CUDA(cudaGetLastError());
 }
 
 void dspine_emsg(int nb, int T, bool lanes, const float* egv, const float* pk, const bf16* gb, bf16* emsg,
-                 cudaStream_t s) {
+                 cudaStream_t s, const bf16* tsv, const int32_t* cand_c) {
   const DsGeo geo{T, T - 1, lanes};
-  launch_pdl(dspine_emsg_kernel, dim3(nb * geo.nd * kSelK), dim3(kBridgeRank), 0, s, geo, egv, pk, gb, emsg);
+  launch_pdl(dspine_emsg_kernel, dim3(nb * geo.nd * kSelK), dim3(kBridgeRank), 0, s, geo, egv, pk, gb, emsg, tsv, cand_c);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -1397,6 +1413,11 @@ void dspine_select(int nb, int nd, const SelectLanes* sl, const SpecSampling& sm
                static_cast<const float*>(nullptr), static_cast<const bf16*>(nullptr),
                static_cast<const bf16*>(nullptr), anchor, smp, rng, ids_out, choice, lattice,
                static_cast<int32_t*>(nullptr), Lookup{}, SelectLanes{}, nd);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void draft_round_bf16(const float* x, int64_t n, bf16* out, cudaStream_t s) {
+  round_bf16_kernel<<<unsigned((n + 255) / 256), 256, 0, s>>>(x, n, out);
   Q27_CUDA(cudaGetLastError());
 }
 

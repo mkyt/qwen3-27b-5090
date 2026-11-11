@@ -114,15 +114,18 @@ gate without an explicit decision, recorded below with its numbers.
   after every layer, blocks of 16) accepts far more tokens on code and JSON (JSON 10.4 against 6.5 tokens per step with
   the default sampling), but a 16-row verify costs about 1.5 ms more per step than 8 rows here (12.5 ms), so on prose
   and Japanese prose it lost to DFlash2 (0.88 and 0.99 times). Switching a request between 16 and 8 rows from the
-  moving average of its tokens per step fixed that: against DFlash2, code 1.17, JSON 1.43, ja-code 1.17, Japanese
-  1.05 and prose 0.98 times (one request, sampled; within the run-to-run spread on prose). Batched steps of several
+  moving average of its tokens per step fixed that: against DFlash2, code 1.19, JSON 1.46, ja-code 1.22, Japanese
+  1.06 and prose 1.00 times (one request, sampled), after two fixes in the draft: its table kernel decoded FP4 through
+  a table in local memory (270 -> 37 us), and the candidates' sender projections now come from a table built at load
+  for the draft vocabulary (256 MB) instead of codebook rows read over PCIe. Batched steps of several
   requests draft 8 rows each, on par with DFlash2. The width depends only on past steps, so the output distribution
   is unchanged (greedy output is identical to plain decoding; a chi-square test of the sampled tokens passes). The
   table of candidates is computed exactly for the 15 x 16 x 16 (position, sender, candidate) triples instead of
   DSpine's reference tables over the whole vocabulary (0.76 GB), and the 0.5 GB codebook stays in host memory.
-  At a 32K context (greedy, the same output for both drafts) DSpine stays ahead on code and JSON (1.19 and 1.26 times)
-  and Japanese (1.13), but prose is 0.91 times and four concurrent requests 0.94 to 0.98 times: in its 8-row mode
-  DSpine accepts slightly fewer prose tokens than DFlash2 and its code bridge makes the step about 0.4 ms longer.
+  At a 32K context (greedy, the same output for both drafts) DSpine stays ahead on code and JSON (1.21 and 1.28 times)
+  and Japanese (1.14), but prose is 0.93 times (DSpine accepts fewer prose tokens there: 3.07 against 3.26) and four
+  concurrent requests 0.97 to 0.99 times. Of a 16-row verify's extra 0.6 ms, the skinny GEMMs (+0.3) and the GDN
+  recurrence, sequential per token, take most; no split-K setting or batching of the GDN preparation helped.
   DSpine was trained with an 8,192-token window; served with 2,048 it accepts as many tokens at 32K with 0.2-0.3 ms
   shorter steps and a 40 MiB context ring per request instead of 160, so 2,048 is the default (`Q27_DRAFT_WINDOW`).
 - **DFlash2 with an 8-row chain** (Phase 3). The chain verify was built first, with every verify row

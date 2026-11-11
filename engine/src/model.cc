@@ -1542,7 +1542,8 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
     mark("lookup");
     if (lk.on) spec_lookup(lk, ids_ver_, s_);
     mark("draft");
-    draft_->propose(block_ids_, pos_dev_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], smp, rng_, ids_ver_,
+    if (!skip("draft"))  // (Q27_SKIP=draft: timing only, the step verifies the previous step's tokens)
+      draft_->propose(block_ids_, pos_dev_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], smp, rng_, ids_ver_,
                     aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_, spec_block_of(smp));
     if (part == 1) return;
   }
@@ -1586,7 +1587,8 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
   }
   if (smp.paths > 1) kv_commit(kv_layers_dev_, kAttnLayers, opt_.kv_type, page_table_, pos_dev_, ncommit_, cpath_, s_);
   mark("draft context");
-  draft_->append_ctx(cap_buf_, spec_block_of(smp), pos_dev_, 0, ncommit_, skinny_ws_, kSkinnyWsBytes, nullptr, 0, s_, cpath_);
+  if (!skip("dctx"))
+    draft_->append_ctx(cap_buf_, spec_block_of(smp), pos_dev_, 0, ncommit_, skinny_ws_, kSkinnyWsBytes, nullptr, 0, s_, cpath_);
   spec_advance(pos_dev_, ncommit_, par_, sbuf_, rng_, s_, budget_);
 }
 

@@ -6,7 +6,7 @@ each number. The JSON files of the speed numbers are in [results/](results/).
 
 These numbers were measured with the DFlash2 draft, the default until DSpine replaced it (`SPEC=dflash2` reproduces
 them). With DSpine, one request decodes code about 1.2 times and JSON about 1.4 times as fast, prose and Japanese about
-the same at short contexts; at a 32K context prose is about 9% slower and four concurrent requests 2-6% slower
+the same at short contexts; at a 32K context prose is about 7% slower and four concurrent requests 1-3% slower
 ([decisions.md](decisions.md#speculative-decoding)).
 
 ## Conditions
