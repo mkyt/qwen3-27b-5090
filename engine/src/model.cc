@@ -1689,6 +1689,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
     }
   }
   stat_steps_++, stat_lookup_ += so.src, stat_tokens_ += n;
+  last_block_ = spec_block_of(smp);  // (a width change waits for the step in flight: smp's is the returned step's)
   spec_adapt(spec_smp_, n);
   set_sbuf(sbuf_host_ ^ 1);  // (the device flipped it in spec_advance)
   for (int i = 0; i < n; i++) out[i] = so.tok[i];

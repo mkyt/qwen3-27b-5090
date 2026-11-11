@@ -54,20 +54,26 @@ def test_verify_step_counts_drafts_as_llama_cpp():
     sch = object.__new__(worker.Scheduler)
     s = worker.Seq(1, {"ids": [1], "max_new": 8, "temperature": 0.0, "top_k": 20, "top_p": 1.0}, 0.0)
     sch.draft_block = 7
+    sent = []
+    sch.send = lambda *m: sent.append(m)
     sch.count_draft(s, [5])          # all rejected: only the bonus token
     sch.count_draft(s, [1, 2, 3, 4])
     assert (s.drafted, s.draft_accepted) == (14, 3)
+    sch.count_draft(s, [1, 2], 15)   # a DSpine step of 16 rows (the adaptive width)
+    assert (s.drafted, s.draft_accepted) == (29, 4) and sent[-1] == ("drafts", 1, 29, 4)
     sch.draft_block = 0              # several paths: no count of drafts, so the server leaves them out
     sch.count_draft(s, [1, 2])
-    assert s.drafted == 14
+    assert s.drafted == 29 and len(sent) == 3
 
 
 def stopped(*msgs):
     gen = generation(10, 0, 0, None)
-    gen.prefilled, gen.toks, gen.first_tok = None, [], None
+    gen.prefilled, gen.toks, gen.first_tok, gen.drafts = None, [], None, None
     for m in msgs:  # (as Generation.__iter__ takes them)
         if m[0] == "prefilled":
             gen.prefilled, gen.toks = m[1], gen.toks[-1:]
+        elif m[0] == "drafts":
+            gen.drafts = (m[1], m[2])
         else:
             gen.tokens += m[2]
             gen.toks.append((m[1], m[2]))
@@ -96,6 +102,12 @@ def test_stop_string_timings_after_a_preemption():
                   ("tok", 13.0, 1), prefilled(drafted=14, accepted=2), ("tok", 13.5, 2))
     assert (gen.timings["drafted"], gen.timings["draft_accepted"]) == (21, 3)
     assert abs(gen.timings["total"] - 3.7) < 1e-9
+
+
+def test_stop_string_timings_take_the_workers_draft_counts():
+    # steps of 16 and 8 rows (the adaptive width): the worker's counts, not steps x 7
+    gen = stopped(("tok", 10.0, 1), prefilled(), ("drafts", 15, 9), ("tok", 10.5, 10), ("drafts", 22, 9), ("tok", 11.0, 1))
+    assert (gen.timings["drafted"], gen.timings["draft_accepted"]) == (22, 9)
 
 
 def test_stop_string_timings_without_drafts_or_reports():

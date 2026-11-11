@@ -115,6 +115,7 @@ class Model {
   void spec_set_masked(int area);
   bool has_draft() const { return draft_ != nullptr; }
   int spec_block() const { return draft_ ? draft_->block() : 0; }
+  int last_step_block() const { return last_block_; }  // rows of the block the last spec_step returned (adaptive width)
   // Counters since the last call: verify steps, steps that used the lookup chain, tokens produced.
   void spec_stats(int64_t* out);
   // Debug: KV rows (K then V, raw bytes) of attention layer `layer` at positions pos..pos+n-1, and the
@@ -505,6 +506,7 @@ class Model {
   int spec_paths_ = 1;        // Q27_SPEC_PATHS: draft walks merged into the verify tree (1: chain)
   // Adaptive verify width (Q27_SPEC_ADAPT*): a single sequence's block between adapt_low_ and the draft's block.
   bool adapt_on_ = false;
+  int last_block_ = 0;
   int adapt_low_ = 8;
   float adapt_up_ = 4.5f, adapt_down_ = 4.0f, adapt_alpha_ = 0.125f;
   void spec_adapt(SpecSampling& smp, int n) const;

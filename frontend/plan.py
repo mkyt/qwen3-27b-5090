@@ -2,7 +2,7 @@
 with no server running (the tray app's settings window). HF_HOME says the cache, and the variables the settings as the
 server would start with them. Q27_PLAN_REQUEST has the same JSON as the POST ({"settings": {...}}), and optionally
 "device": [free, total] bytes (default: NVML, as the server with no engine). Prints the answer, with "draft" (whether the
-draft of SPEC (DFlash2 by default) is in the cache) and "links" (paths.unreadable_repos), or {"error": ...}. Needs no GPU and allocates nothing.
+draft of SPEC (DSpine by default) is in the cache) and "links" (paths.unreadable_repos), or {"error": ...}. Needs no GPU and allocates nothing.
 """
 
 import json
@@ -20,8 +20,8 @@ from stats import HUB, Nvml  # noqa: E402
 
 def has_draft():
     try:
-        spec = os.environ.get("SPEC") or "dflash2"
-        return (paths.snapshot(*paths.DRAFTS.get(spec, paths.DFLASH2)) / "config.json").is_file()
+        spec = os.environ.get("SPEC") or "dspine"
+        return (paths.snapshot(*paths.DRAFTS.get(spec, paths.DSPINE)) / "config.json").is_file()
     except FileNotFoundError:
         return False
 

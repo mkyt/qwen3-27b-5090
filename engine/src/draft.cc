@@ -79,9 +79,10 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
                   !dc["selected_prefix_terminal"].b && dc["selected_prefix_feature_layers"][kLayers - 1].as_int() == kLayers,
               "draft config.json does not match the DSpine dimensions this runtime is built for");
     std::copy(kDSpineCtxLayers, kDSpineCtxLayers + kCtxFeatures, ctx_layers_);
-    // Served block (Q27_DRAFT_BLOCK, 8 or 16; trained 16) and window (Q27_DRAFT_WINDOW, <= 8192; a smaller ring
-    // keeps less of the context for less memory per sequence).
-    block_ = kMaxBlock, window_ = kDSpineWindow;
+    // Served block (Q27_DRAFT_BLOCK, 2..16; trained 16) and window (Q27_DRAFT_WINDOW, <= 8192, trained 8192). The
+    // window defaults to DFlash2's 2,048: at a 32K context the trained 8,192 accepted no more and its ring (160 MiB
+    // per sequence instead of 40) made the steps 0.2-0.3 ms longer.
+    block_ = kMaxBlock, window_ = kWindow;
     if (const char* e = getenv("Q27_DRAFT_BLOCK"); e && *e) block_ = atoi(e);
     Q27_CHECK(block_ >= 2 && block_ <= kMaxBlock, "Q27_DRAFT_BLOCK must be 2..16");
     if (const char* e = getenv("Q27_DRAFT_WINDOW"); e && *e) window_ = atoi(e);

@@ -98,7 +98,7 @@ def timings_ok(t, usage):
     """llama.cpp's timings: the counts agree with usage, and it took time."""
     return bool(t) and t["prompt_n"] + t["cache_n"] == usage["prompt_tokens"] and t["predicted_n"] == usage["completion_tokens"] \
         and t["prompt_ms"] > 0 and t["predicted_ms"] > 0 and t["prompt_per_second"] > 0 and t["predicted_per_second"] > 0 \
-        and ("draft_n" not in t or (t["draft_n"] % 7 == 0 and 0 <= t["draft_n_accepted"] <= t["draft_n"]))
+        and ("draft_n" not in t or (t["draft_n"] >= 7 and 0 <= t["draft_n_accepted"] <= t["draft_n"]))  # (7 or 15 drafts per step)
 
 
 def openai_tests(cl):

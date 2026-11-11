@@ -30,8 +30,9 @@ and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 | Time to first token, agent turn after a 20K-token history | **0.19 s** | 0.39 s | 0.31 s | 0.57 s |
 | Follow-up question on a 73K-token document | **0.14 s** | 10.9 s | 0.49 s | 1.01 s |
 
-- **Speculative decoding** with the [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) block drafter,
-  batched across concurrent requests; each request's tokens are bit-identical to running it alone.
+- **Speculative decoding** with the [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) block drafter (blocks of up to
+  16 tokens, the verify width adapting to the acceptance; [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) with
+  `SPEC=dflash2`), batched across concurrent requests; each request's tokens are bit-identical to running it alone.
 - **NVFP4 weights including the Gated DeltaNet projections**
   ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), GPTQ from the BF16 original;
   the attention projections stay FP8 because quantizing them cost parallel tool calls): decode reads 14 GiB of
@@ -254,7 +255,7 @@ to change it. The most useful ones:
 | `MAX_SEQS` | 8 | Requests that can run at once (1–8); how many actually run is decided while running, from the free KV cache |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16` |
 | `WEIGHTS` | `gdnfp4` | `gdnfp4`, `nvidia` (NVIDIA's checkpoint as is), `quasar`, another checkpoint of the model on the Hugging Face Hub (`ORG/NAME[@REVISION]`, [below](#other-checkpoints)), or a model directory |
-| `SPEC` | `dflash2` | `dflash2` or `none` |
+| `SPEC` | `dspine` | `dspine`, `dflash2` or `none` |
 | `VISION` | `host` | `host`, `fp8`, `bf16` (vision tower placement) or `off` |
 
 [docs/configuration.md](docs/configuration.md) lists every setting. By default the server accepts connections from this PC
@@ -356,7 +357,7 @@ docs/         architecture, decisions, configuration, benchmarks
 ## License
 
 MIT ([LICENSE](LICENSE)). The
-model weights (Qwen3.8-27B, NVIDIA's NVFP4 checkpoint, DFlash2, the gdnfp4 build) are Apache-2.0 and are downloaded,
+model weights (Qwen3.8-27B, NVIDIA's NVFP4 checkpoint, DSpine, DFlash2, the gdnfp4 build) are Apache-2.0 and are downloaded,
 not distributed here; other checkpoints carry their own licenses. The Windows package also contains Python and its
 packages under their own licenses (in the package). The golden prompt texts are public domain or from this repository
 ([bench/golden/sources/README.md](bench/golden/sources/README.md)).

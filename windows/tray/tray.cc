@@ -1250,7 +1250,7 @@ void show_scan() {
     if (!found)
         note += current + L" is not here: the server would download it.";
     else if (draft_needed)
-        note += L"The DFlash2 draft is not here: the server would download it (or set Speculative decoding to none).";
+        note += L"The draft model is not here: the server would download it (or set Speculative decoding to none).";
     else
         note = std::to_wstring(settings.scan_weights.size()) + L" checkpoints of the model here.";
     settings.folder_warning = settings.folder_warning || settings.download_needed;

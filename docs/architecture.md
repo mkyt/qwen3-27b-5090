@@ -105,7 +105,7 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 | lm_head | NVFP4 | 0.67 | yes |
 | Embedding | BF16, in pinned host memory | 0 | one row per token |
 | Vision tower | BF16, in pinned host memory (`VISION=host`) | 0 | only for images |
-| DFlash2 draft | NVFP4, quantized at load time | about 1.2 | yes |
+| Draft (DSpine; DFlash2) | NVFP4, quantized at load time (DSpine's code bridge BF16, its codebook in pinned host memory) | about 1.2 | yes |
 
 - **The checkpoint is read as it is**: NVIDIA's NVFP4 checkpoint, or `gdnfp4`, which replaces its GDN projections
   (FP8 in NVIDIA's) with NVFP4 ones quantized by GPTQ from the BF16 original. The loader rearranges the tensors on
@@ -189,7 +189,15 @@ request decodes at 96.6 tok/s at a short context.
 
 ## 7. Speculative decoding
 
-The draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"
+The default draft is [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16): DFlash2's backbone without the
+convolutions, block-causal, trained with an 8,192-token window (served with 2,048, `Q27_DRAFT_WINDOW`: no fewer accepted
+tokens at a 32K context, shorter steps), and after every layer a code bridge that writes each position's
+predecessor into it. A step drafts up to 15 tokens; the top-16 candidates of each position are scored again with the
+last layer's write redone for every candidate of the predecessor (a 16 x 16 table per position), and the selector
+below walks that table. A sequence verifies 16 rows while its tokens per step stay high and 8 otherwise
+(`Q27_SPEC_ADAPT`); batched steps draft 8 rows per sequence. `SPEC=dflash2` selects DFlash2, described next.
+
+The DFlash2 draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"
 layers that read the target's hidden states from five layers, attend to the last 2,048 tokens and propose 7 tokens
 in one pass; a low-rank selector chooses among the top-16 candidates at each position. One step drafts 7 tokens
 from an anchor and verifies all 8 rows in one forward of the target.

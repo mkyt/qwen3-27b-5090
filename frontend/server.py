@@ -14,7 +14,7 @@ is decided while it runs: a target number, room in the KV pool, MIN_SEQ_TPS). If
 dies (a CUDA error), requests in flight fail with 503, /health answers 503 and a new engine is started.
 Requests are cancelled when the client disconnects or a stop string matches.
 
-    python frontend/server.py [--port 8000] [--max-tokens 262144] [--kv-dtype nvfp4|fp8|bf16] [--spec dflash2|dspine|none]
+    python frontend/server.py [--port 8000] [--max-tokens 262144] [--kv-dtype nvfp4|fp8|bf16] [--spec dspine|dflash2|none]
 """
 
 import argparse
@@ -501,7 +501,7 @@ class Generation:
         self.tokens, self.timings = 0, None
         # For _stopped_timings: the last "prefilled" info, (arrival time, tokens) of the prefill's "tok" and those after
         # it, and when the first token came.
-        self.prefilled, self.toks, self.first_tok = None, [], None
+        self.prefilled, self.toks, self.first_tok, self.drafts = None, [], None, None
         req = dict(ids=ids, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
         self.sampling_logprobs = sampling.get("logprobs", -1)
         # (ignore_eos: the end-of-sequence tokens count and have logprobs, but their text is left out, as vLLM's
@@ -566,6 +566,8 @@ class Generation:
                     self.cached = msg[2]["cached"]
                 elif kind == "prefilled":
                     self.prefilled, self.toks = msg[2], self.toks[-1:]  # (it follows the prefill's token)
+                elif kind == "drafts":  # (the worker's counts so far, before the step's "tok")
+                    self.drafts = (msg[2], msg[3])
                 elif kind == "tok":
                     self.tokens += len(msg[2])
                     self.toks.append((time.time(), len(msg[2])))
@@ -612,6 +614,8 @@ class Generation:
         self.timings = {"computed_tokens": p["computed_tokens"], "prefill_s": p["prefill_s"], "ttft": p["ttft"],
                         "total": p["ttft"] + toks[-1][0] - self.first_tok,
                         "drafted": p["drafted"] + steps * p["draft_block"], "draft_accepted": p["draft_accepted"] + accepted}
+        if self.drafts:  # (exact: the steps' own block lengths)
+            self.timings["drafted"], self.timings["draft_accepted"] = self.drafts
 
     @property
     def usage(self):
@@ -1604,7 +1608,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", 262144)))
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
     ap.add_argument("--kv-dtype", default=env("KV_DTYPE", "nvfp4"), choices=["bf16", "fp8", "nvfp4"])
-    ap.add_argument("--spec", default=env("SPEC", "dflash2"), choices=["dflash2", "dspine", "none"])
+    ap.add_argument("--spec", default=env("SPEC", "dspine"), choices=["dspine", "dflash2", "none"])
     ap.add_argument("--weights", default=env("WEIGHTS", "gdnfp4"),
                     help="gdnfp4: GDN projections in NVFP4, attention FP8 (Phase Q, scripts/build-gdnfp4.sh); nvidia: "
                          "FP8 GDN / attention projections; quasar: every linear in NVFP4; or a model directory")

@@ -142,7 +142,8 @@ class Scheduler:
         self.engine = Engine(cfg["model"], max_tokens=cfg["max_tokens"], prefill_chunk=cfg["prefill_chunk"],
                              kv_dtype=cfg["kv_dtype"], draft=cfg.get("draft"))
         self.spec = cfg.get("draft") is not None and self.engine.has_draft
-        # Draft tokens of a verify step: a chain of 7. Several paths verify a tree: not reported.
+        # Draft tokens are reported for chains (the block's rows but the first; DSpine's single steps: 7 or 15 by the
+        # adaptive width, batched steps 7). Several paths verify a tree: not reported.
         self.draft_block = 7 if int(os.environ.get("Q27_SPEC_PATHS") or 1) <= 1 else 0
         self.engine_seqs = max(1, min(cfg["max_seqs"], self.engine.park_slots + 1))
         self.max_seqs = self.engine_seqs  # the target number of running requests (<= engine_seqs)
@@ -616,7 +617,7 @@ class Scheduler:
                     write_masks(self.engine, s.gm, self.engine.spec_draft(), 0, self.eos)
                 toks = self.engine.spec_step(ahead=not last)
                 self.m["q27:spec_verify_calls_total"] += 1
-                self.count_draft(s, toks)
+                self.count_draft(s, toks, self.engine.last_step_block - 1)
             else:
                 if s.gm is not None:
                     write_mask(self.engine, s.gm, 0)
@@ -668,10 +669,14 @@ class Scheduler:
         if has_prefill:
             self.credit -= dt
 
-    def count_draft(self, s, toks):
-        """A verify step's tokens are the accepted drafts and the bonus token."""
-        s.drafted += self.draft_block
+    def count_draft(self, s, toks, drafted=7):
+        """A verify step's tokens are the accepted drafts and the bonus token. The server gets the counts so far too
+        (the timings of a request a stop string ends before the engine reports it)."""
+        if not self.draft_block:
+            return
+        s.drafted += drafted
         s.draft_accepted += len(toks) - 1
+        self.send("drafts", s.rid, s.drafted, s.draft_accepted)
 
     def emit(self, s, toks, logprobs=None):
         """Tokens of a step: stops at EOS and at max_new, and at the token a forced output follows (force); the rest goes

@@ -319,6 +319,8 @@ int q27_spec_draft_lanes(void* m, const int32_t* lanes, int n, int32_t* chain) {
 int q27_has_draft(void* m) { return static_cast<Model*>(m)->has_draft() ? 1 : 0; }
 // Rows of a single sequence's speculative step (the draft block: 8 for DFlash2, up to 16 for DSpine; 0: no draft).
 int q27_spec_block(void* m) { return static_cast<Model*>(m)->spec_block(); }
+// Rows of the block of the step the last q27_spec_step returned (Q27_SPEC_ADAPT: 8 or the draft's block).
+int q27_last_step_block(void* m) { return static_cast<Model*>(m)->last_step_block(); }
 
 // Speculative counters since the last call: steps, lookup steps, tokens.
 int q27_spec_stats(void* m, int64_t* out) {

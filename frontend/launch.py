@@ -16,7 +16,7 @@ import threading
 from qwen27b.paths import DRAFTS, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
 from tokenizer import fingerprint
 
-CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dflash2", "dspine", "none"), "vision": ("host", "fp8", "bf16", "off")}
+CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dspine", "dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
 MAX_SEQS = 8                # (the engine's lanes of a batched step)
 MAX_CONTEXT = 262144        # max_position_embeddings of the checkpoint
 MIN_BUDGET_GIB = 4.0
@@ -48,7 +48,7 @@ def env_settings():
     """The start settings from the variables, by default the server's."""
     env = os.environ.get
     budget = env("VRAM_BUDGET_GIB")
-    return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dflash2"),
+    return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dspine"),
             "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 8)), MAX_SEQS)),
             "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_budget_gib": float(budget) if budget else None}
 

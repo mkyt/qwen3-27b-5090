@@ -4,6 +4,11 @@ Speed and quality of the default configuration (`docker compose up -d serve` wit
 `gdnfp4`, KV cache `nvfp4`, DFlash2 speculative decoding, `MAX_SEQS=8`, `MAX_TOKENS=262144`), and how to reproduce
 each number. The JSON files of the speed numbers are in [results/](results/).
 
+These numbers were measured with the DFlash2 draft, the default until DSpine replaced it (`SPEC=dflash2` reproduces
+them). With DSpine, one request decodes code about 1.2 times and JSON about 1.4 times as fast, prose and Japanese about
+the same at short contexts; at a 32K context prose is about 9% slower and four concurrent requests 2-6% slower
+([decisions.md](decisions.md#speculative-decoding)).
+
 ## Conditions
 
 | | |

@@ -31,6 +31,7 @@ SIGNATURES = {
     "q27_seq_suspend": ([P, I], I),
     "q27_has_draft": ([P], I),
     "q27_spec_block": ([P], I),
+    "q27_last_step_block": ([P], I),
     "q27_max_lanes": ([P], I),
     "q27_max_tokens": ([P], I),
     "q27_spec_step_lanes": ([P, P, I, P, P], I),
@@ -278,6 +279,11 @@ class Engine:
         """Rows of a single sequence's speculative step: the last token and the drafted ones (DFlash2 8, DSpine up to
         16; batched steps take 8 per lane)."""
         return lib().q27_spec_block(self.h)
+
+    @property
+    def last_step_block(self):
+        """Rows of the block of the step the last spec_step returned (the adaptive width: 8 or spec_block)."""
+        return lib().q27_last_step_block(self.h)
 
     def spec_begin(self, ids, temperature=0.0, top_k=20, top_p=1.0, seed=0, uniform=0.5, max_new=0, min_p=0.0,
                    presence=0.0, frequency=0.0, logprobs=-1, masked=False, until=None, biased=False,
