@@ -390,6 +390,18 @@ void Model::configure() {
   // (trees: blocks of up to 8 rows; their walks' random numbers and rows are laid out for that)
   if (draft_ && draft_->block() > ddims::kBlock) spec_paths_ = 1;
   if (draft_ && draft_->dspine()) lookup_.on = 0;  // (the selector's lookup chains are DFlash2's 7 rows)
+  // Adaptive verify width: on by default when the draft's block is longer than 8 (DSpine). A sequence verifies
+  // Q27_SPEC_ADAPT_LOW rows while the moving average of its tokens per step is below Q27_SPEC_ADAPT_DOWN, the full block
+  // again once it reaches Q27_SPEC_ADAPT_UP (16 rows cost about 1.1 ms more per step than 8).
+  auto env_f = [](const char* name, float dflt) {
+    const char* e = getenv(name);
+    return e && *e ? float(atof(e)) : dflt;
+  };
+  adapt_on_ = draft_ && draft_->block() > ddims::kBlock && env_int("Q27_SPEC_ADAPT", 1) != 0;
+  adapt_low_ = draft_ ? std::clamp(env_int("Q27_SPEC_ADAPT_LOW", ddims::kBlock), 2, draft_->block()) : ddims::kBlock;
+  adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
+  adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
+  adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
   spec_pipeline_ = env_int("Q27_SPEC_PIPELINE", 1) != 0;
   mlp_bf16_ = env_int("Q27_MLP_BF16", 1) != 0;
   mlp_fused_ = env_int("Q27_MLP_FUSED", 1) != 0;
@@ -1511,6 +1523,9 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   if (spec_smp_.paths <= 0) spec_smp_.paths = spec_paths_;
   if (draft_->block() > ddims::kBlock) spec_smp_.paths = 1;  // (see configure)
   if (spec_smp_.masked) spec_smp_.paths = 1;  // (the host masks a chain's rows)
+  // The full block first; the average starts between the thresholds.
+  spec_smp_.block = spec_smp_.block_next = draft_->block();
+  spec_smp_.accept_ema = 0.5f * (adapt_up_ + adapt_down_);
   return first;
 }
 
@@ -1528,7 +1543,7 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
     if (lk.on) spec_lookup(lk, ids_ver_, s_);
     mark("draft");
     draft_->propose(block_ids_, pos_dev_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], smp, rng_, ids_ver_,
-                    aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_);
+                    aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_, spec_block_of(smp));
     if (part == 1) return;
   }
   const int W = spec_rows(smp);
@@ -1571,13 +1586,15 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
   }
   if (smp.paths > 1) kv_commit(kv_layers_dev_, kAttnLayers, opt_.kv_type, page_table_, pos_dev_, ncommit_, cpath_, s_);
   mark("draft context");
-  draft_->append_ctx(cap_buf_, draft_->block(), pos_dev_, 0, ncommit_, skinny_ws_, kSkinnyWsBytes, nullptr, 0, s_, cpath_);
+  draft_->append_ctx(cap_buf_, spec_block_of(smp), pos_dev_, 0, ncommit_, skinny_ws_, kSkinnyWsBytes, nullptr, 0, s_, cpath_);
   spec_advance(pos_dev_, ncommit_, par_, sbuf_, rng_, s_, budget_);
 }
 
 int Model::spec_step(int32_t* out, bool allow_ahead) {
   Q27_CHECK(draft_, "spec_step: no draft model loaded");
   batch_exit();
+  // A width change waits until no step is in flight (that step was launched with the old one).
+  if (!spec_inflight_ && spec_smp_.block_next != spec_smp_.block) spec_smp_.block = spec_smp_.block_next;
   const SpecSampling smp = spec_smp_;
   Q27_CHECK(pos_ + spec_rows(smp) <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   // Pages for this step's rows and for the one launched ahead (the position advances by <= 8).
@@ -1633,7 +1650,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   }
   static const bool dbg_accept = getenv("Q27_DBG_ACCEPT") != nullptr;
   const bool ahead = allow_ahead && !smp.masked && spec_pipeline_ && graphs_ && spec_graph_ && spec_warm_ &&
-                     same(smp, spec_key_) && !trace &&
+                     same(smp, spec_key_) && !trace && smp.block_next == smp.block &&
                      !prof_.on && !dbg_accept &&
                      pos_ + kSpecBlock + spec_rows(smp) <= max_pages_ * kPageTokens;  // (worst-case position)
   if (ahead) {
@@ -1672,6 +1689,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
     }
   }
   stat_steps_++, stat_lookup_ += so.src, stat_tokens_ += n;
+  spec_adapt(spec_smp_, n);
   set_sbuf(sbuf_host_ ^ 1);  // (the device flipped it in spec_advance)
   for (int i = 0; i < n; i++) out[i] = so.tok[i];
   last_lp_[0].n = 0;
@@ -1685,6 +1703,17 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   seq_ids_.insert(seq_ids_.end(), out, out + n - 1);
   spec_last_ = out[n - 1];
   return n;
+}
+
+// The adaptive verify width: the moving average of the tokens per step picks the next block (with hysteresis).
+void Model::spec_adapt(SpecSampling& smp, int n) const {
+  if (!adapt_on_ || smp.masked) return;
+  smp.accept_ema += adapt_alpha_ * (float(n) - smp.accept_ema);
+  const int full = draft_->block();
+  if (smp.block_next == full && smp.accept_ema < adapt_down_)
+    smp.block_next = adapt_low_;
+  else if (smp.block_next != full && smp.accept_ema >= adapt_up_)
+    smp.block_next = full;
 }
 
 cudaGraphExec_t Model::capture(const std::function<void()>& body) {
@@ -1750,6 +1779,7 @@ void Model::spec_set_masked(int area) {
   Q27_CHECK(area < 0 || parked_[area].used, "spec_set_masked: no such sequence");
   if (area < 0) spec_flush();
   smp.masked = true, smp.paths = 1;
+  smp.block = smp.block_next = draft_->block();  // (a masked chain keeps the full block: the host masks its rows)
   smp.stop[2] = -1;  // (the reasoning has ended)
 }
 

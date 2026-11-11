@@ -116,7 +116,7 @@ class Draft {
   void propose(const int32_t* block_ids, const int32_t* pos, const bf16* embed, const uint8_t* lm_w,
                const uint8_t* lm_sf, float lm_in_scale, float lm_alpha, const SpecSampling& smp, const uint64_t* rng,
                int32_t* ids_out, uint8_t* aq, uint8_t* asf, float* logits, void* ws, size_t ws_bytes,
-               const Lookup& lk, cudaStream_t s);
+               const Lookup& lk, cudaStream_t s, int rows = 0);  // rows: DSpine's block rows (0: block())
   // Context K/V for `rows` target rows whose BF16 features (layers 5..61) are in cap [rows][25600], at
   // positions *pos + pos_add + r; only rows < *n_dev (if n_dev) are written. More than 8 rows go through
   // the BF16 GEMM with the weights dequantized into `scratch` (BF16 slices).

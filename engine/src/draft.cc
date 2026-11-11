@@ -372,9 +372,10 @@ DLinear rows_of(const DLinear& l, DraftQuant q, int r0, int n) {
 void Draft::propose(const int32_t* block_ids, const int32_t* pos, const bf16* embed, const uint8_t* lm_w,
                     const uint8_t* lm_sf, float lm_in_scale, float lm_alpha, const SpecSampling& smp,
                     const uint64_t* rng, int32_t* ids_out, uint8_t* aq, uint8_t* asf, float* logits, void* ws,
-                    size_t ws_bytes, const Lookup& lk, cudaStream_t s) {
+                    size_t ws_bytes, const Lookup& lk, cudaStream_t s, int rows) {
   if (dspine()) {
-    propose_dspine(1, block_, DraftLanes{1, pos, {ring_k_}, {ring_v_}}, block_ids, embed, lm_w, lm_sf, lm_in_scale,
+    Q27_CHECK(rows <= block_, "draft propose: more rows than the draft's block");
+    propose_dspine(1, rows > 0 ? rows : block_, DraftLanes{1, pos, {ring_k_}, {ring_v_}}, block_ids, embed, lm_w, lm_sf, lm_in_scale,
                    lm_alpha, &smp, nullptr, rng, ids_out, choice.tree, aq, asf, logits, ws, ws_bytes, s);
     return;
   }
