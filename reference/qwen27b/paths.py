@@ -10,6 +10,8 @@ HF_HUB = pathlib.Path(os.environ.get("HF_HOME", pathlib.Path.home() / ".cache/hu
 
 TARGET = ("nvidia/Qwen3.8-27B-NVFP4", "dbb8f445b3145f8a4c18ddc769f032d57d32867c")
 DFLASH2 = ("incoai/Qwen3.8-27B-DFlash2", "015e795645c74b1a0eeef3b570031fb62e769bc5")
+DSPINE = ("tencent/Qwen3.8-27B-DSpine-b16", "5f54174d301dbca65d9aa4448dc47e56732d9a12")  # draft (SPEC=dspine)
+DRAFTS = {"dflash2": DFLASH2, "dspine": DSPINE}  # SPEC value -> draft checkpoint
 # allfp4 candidate (Phase Q): every linear in NVFP4 (QAT), compressed-tensors; lm_head is the BF16 original,
 # so the engine takes the NVFP4 lm_head of TARGET (Q27_LM_HEAD_CKPT).
 QUASAR = ("QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4", "15d2e47bffe5d8ad23928879f8f7d2f74909e259")
@@ -67,7 +69,7 @@ def repo_snapshot(repo: str, rev: str | None = None) -> pathlib.Path:
 def downloaded_repos():
     """{weights value: snapshot} of the checkpoints of this model in the cache besides the profiles' (by config.json:
     Qwen3.8-27B's dimensions and a quantization config; the engine checks the rest when it plans them)."""
-    pinned = {r for r, _ in (TARGET, QUASAR, GDNFP4, BF16, DFLASH2)}
+    pinned = {r for r, _ in (TARGET, QUASAR, GDNFP4, BF16, DFLASH2, DSPINE)}
     out = {}
     for base in sorted(HF_HUB.glob("models--*--*")):
         repo = base.name.removeprefix("models--").replace("--", "/", 1)

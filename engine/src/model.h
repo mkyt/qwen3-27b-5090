@@ -114,6 +114,7 @@ class Model {
   // launched ahead is dropped.
   void spec_set_masked(int area);
   bool has_draft() const { return draft_ != nullptr; }
+  int spec_block() const { return draft_ ? draft_->block() : 0; }
   // Counters since the last call: verify steps, steps that used the lookup chain, tokens produced.
   void spec_stats(int64_t* out);
   // Debug: KV rows (K then V, raw bytes) of attention layer `layer` at positions pos..pos+n-1, and the
@@ -214,7 +215,7 @@ class Model {
   cudaGraphExec_t capture(const std::function<void()>& body);
   void spec_flush();  // replays the last verify's commits into the GDN / conv states
   void set_sbuf(int b);  // host side of the GDN state buffer switch
-  int spec_rows(const SpecSampling& smp) const { return 1 + (kSpecBlock - 1) * std::max(1, smp.paths); }
+  int spec_rows(const SpecSampling& smp) const { return 1 + (draft_->block() - 1) * std::max(1, smp.paths); }
   GdnSpec gdn_spec(int gdn_layer) const;
   bool fused(int T) const;
   bf16* cap_for(int layer) const;

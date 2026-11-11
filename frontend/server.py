@@ -14,7 +14,7 @@ is decided while it runs: a target number, room in the KV pool, MIN_SEQ_TPS). If
 dies (a CUDA error), requests in flight fail with 503, /health answers 503 and a new engine is started.
 Requests are cancelled when the client disconnects or a stop string matches.
 
-    python frontend/server.py [--port 8000] [--max-tokens 262144] [--kv-dtype nvfp4|fp8|bf16] [--spec dflash2|none]
+    python frontend/server.py [--port 8000] [--max-tokens 262144] [--kv-dtype nvfp4|fp8|bf16] [--spec dflash2|dspine|none]
 """
 
 import argparse
@@ -50,7 +50,7 @@ from chat import (MARKS, STOP_REASON, THINK_END, AnthropicError, OutputParser, _
 
 MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "qwen3.8-27b")
 DEFAULTS = {"temperature": 1.0, "top_k": 20, "top_p": 0.95}  # generation_config.json of the checkpoint
-SPEC_MARGIN = 8  # a verify block writes up to 8 positions past the committed length
+SPEC_MARGIN = 16  # a verify block writes up to 16 positions past the committed length (DSpine; DFlash2 8)
 KEEPALIVE_S = 10.0
 DUMP_DIR = os.environ.get("API_DUMP_DIR")  # debug: write every POST body there
 UI_PAGE = ROOT / "frontend/ui/index.html"
@@ -1604,7 +1604,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", 262144)))
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
     ap.add_argument("--kv-dtype", default=env("KV_DTYPE", "nvfp4"), choices=["bf16", "fp8", "nvfp4"])
-    ap.add_argument("--spec", default=env("SPEC", "dflash2"), choices=["dflash2", "none"])
+    ap.add_argument("--spec", default=env("SPEC", "dflash2"), choices=["dflash2", "dspine", "none"])
     ap.add_argument("--weights", default=env("WEIGHTS", "gdnfp4"),
                     help="gdnfp4: GDN projections in NVFP4, attention FP8 (Phase Q, scripts/build-gdnfp4.sh); nvidia: "
                          "FP8 GDN / attention projections; quasar: every linear in NVFP4; or a model directory")

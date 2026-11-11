@@ -74,6 +74,7 @@ def main():
     ap.add_argument("--frequency", type=float, default=0.0)
     ap.add_argument("--prompts", default=",".join(PROMPTS))
     ap.add_argument("--out", default="")
+    ap.add_argument("--draft", default="dflash2", choices=["dflash2", "dspine"])
     args = ap.parse_args()
     # Verify rows must be computed like decode rows: by default the skinny GEMMs split K differently for M = 1
     # and M > 1, and with W4A4 that shifts the sampled distributions measurably (e.g. P(first token 'The')
@@ -81,16 +82,17 @@ def main():
     os.environ.setdefault("Q27_SKINNY_EXACT", "1")
     # Tree verification (Q27_SPEC_PATHS > 1) runs its attention on CUDA cores, decode and chains on tensor cores: a
     # different summation order, which W4A4 carries to visibly different distributions. Both on CUDA cores here.
-    if int(os.environ.get("Q27_SPEC_PATHS", "1")) > 1:
+    # So do the 16-row chains of DSpine with BF16 KV (the tensor-core verify takes up to 8 rows there).
+    if int(os.environ.get("Q27_SPEC_PATHS", "1")) > 1 or args.draft == "dspine":
         os.environ.setdefault("Q27_ATTN_TC", "0")
 
     from transformers import AutoTokenizer
 
     from q27lib import Engine
-    from qwen27b.weights import DFLASH2, TARGET, snapshot
+    from qwen27b.weights import DFLASH2, DSPINE, TARGET, snapshot
 
     tok = AutoTokenizer.from_pretrained(snapshot(*TARGET))
-    eng = Engine(snapshot(*TARGET), max_tokens=1024, draft=snapshot(*DFLASH2))
+    eng = Engine(snapshot(*TARGET), max_tokens=1024, draft=snapshot(*(DSPINE if args.draft == "dspine" else DFLASH2)))
     smp = (args.temperature, args.top_k, args.top_p)
     more = dict(min_p=args.min_p, presence=args.presence, frequency=args.frequency)
     pen = bool(args.presence or args.frequency)

@@ -218,8 +218,8 @@ void* q27_mask_rows(void* m, int* words, int* rows) {
 }
 
 // Logprobs of the tokens the last q27_forward_sample / q27_spec_begin / q27_spec_step returned (lane -1), or of
-// lane z of the last q27_spec_step_lanes (Model::logprobs): returns their count (0: none were asked for), lp[8] the
-// tokens' own, top_id / top_lp [8][20] the top entries (the first *top of each are set: as many as were asked for).
+// lane z of the last q27_spec_step_lanes (Model::logprobs): returns their count (0: none were asked for), lp[16] the
+// tokens' own, top_id / top_lp [16][20] the top entries (the first *top of each are set: as many as were asked for).
 int q27_logprobs(void* m, int lane, int* top, float* lp, int32_t* top_id, float* top_lp) {
   const Logprobs& l = static_cast<Model*>(m)->logprobs(lane);
   *top = l.n ? l.top : 0;
@@ -239,7 +239,7 @@ int q27_penalty_init(void* m, const int32_t* ids, int n) {
   return guard([&] { static_cast<Model*>(m)->penalty_init(ids, n); });
 }
 
-// Speculative decoding: prompt + first token, then steps of 1..8 new tokens (out[8]; returns the count). masked: grammar
+// Speculative decoding: prompt + first token, then steps of 1..16 new tokens (out[16]; returns the count). masked: grammar
 // masks (q27_mask_rows, q27_spec_draft); until >= 0: a step ends at that token (SpecSampling::stop[2]); biased: the
 // running sequence's q27_bias_set list; ignore_eos: an end-of-sequence id does not end a step (SpecSampling).
 int q27_spec_begin(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, uint64_t seed,
@@ -271,7 +271,8 @@ int q27_spec_step2(void* m, int32_t* out, int ahead) {
   return n;
 }
 
-// A masked sequence's step, first part (Model::spec_draft): chain[8] the verify tokens; q27_spec_step verifies.
+// A masked sequence's step, first part (Model::spec_draft): chain[16] (the first q27_spec_block are set) the verify
+// tokens; q27_spec_step verifies.
 int q27_spec_draft(void* m, int32_t* chain) {
   return guard([&] { static_cast<Model*>(m)->spec_draft(chain); });
 }
@@ -316,6 +317,8 @@ int q27_spec_draft_lanes(void* m, const int32_t* lanes, int n, int32_t* chain) {
 }
 
 int q27_has_draft(void* m) { return static_cast<Model*>(m)->has_draft() ? 1 : 0; }
+// Rows of a single sequence's speculative step (the draft block: 8 for DFlash2, up to 16 for DSpine; 0: no draft).
+int q27_spec_block(void* m) { return static_cast<Model*>(m)->spec_block(); }
 
 // Speculative counters since the last call: steps, lookup steps, tokens.
 int q27_spec_stats(void* m, int64_t* out) {

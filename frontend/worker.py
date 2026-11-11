@@ -392,7 +392,7 @@ class Scheduler:
         self.send("config", self.settings(), None)
         log(f"{self.engine_seqs} sequences at once (target {self.max_seqs}, KV admission {'on' if self.admit_kv else 'off'}, "
             f"min {self.min_tps:g} tok/s per request), decode share {self.share}, quantum {self.quantum * 1000:.0f} ms, "
-            f"{'DFlash2' if self.spec else 'no speculative decoding'}, "
+            f"{'speculative decoding (' + str(self.engine.spec_block) + '-row blocks)' if self.spec else 'no speculative decoding'}, "
             f"{'batched decode steps' if self.batch else 'decode in turns'}")
         while True:
             self.poll(block=not self.alive and not self.waiting)
@@ -850,13 +850,13 @@ def write_mask(engine, m, row):
 
 
 def write_masks(engine, m, chain, row0, eos):
-    """Grammar masks of a speculative step's verify rows row0 .. row0 + 7 (chain: their tokens, Engine.spec_draft; the
+    """Grammar masks of a speculative step's verify rows row0 .. row0 + len(chain) - 1 (chain: their tokens, Engine.spec_draft; the
     first, the last output token, has been through matcher m): row i masks by what follows chain[1..i]. Rows past a
     drafted token the grammar does not allow, or an end-of-sequence id (eos), are left open: that token is rejected,
     or ends the step. (A matcher that consumed an end-of-sequence id does not roll back to the state before it.)"""
     k = m.validate_tokens(chain[1:])
     k = next((i for i, t in enumerate(chain[1:1 + k]) if t in eos), k)
-    for i in range(8):
+    for i in range(len(chain)):
         addr, size = engine.mask_row(row0 + i)
         if i and i <= k:
             m.consume_token(chain[i])

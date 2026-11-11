@@ -54,7 +54,7 @@ def test_vram_parts_add_up_to_the_device():
     parts = {p["name"]: p for p in v["parts"]}
     assert sum(p["bytes"] for p in v["parts"]) == 32 * GiB
     assert parts["weights"]["bytes"] == 18 * GiB and parts["KV cache"]["bytes"] == 10 * GiB
-    assert {p["name"] for p in parts["weights"]["parts"]} >= {"GDN layers", "draft model (DFlash2)", "MLP"}
+    assert {p["name"] for p in parts["weights"]["parts"]} >= {"GDN layers", "draft model", "MLP"}
     kv = {p["name"]: p["bytes"] for p in parts["KV cache"]["parts"]}
     page = 10 * GiB / 1024
     assert kv["parked state"] == 100 * page and kv["prefix cache only"] == 200 * page

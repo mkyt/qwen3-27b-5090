@@ -1027,7 +1027,7 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   __syncthreads();
   // Gated RMSNorm: warp t sums o^2 of row t over this CTA's 32 columns, the cluster adds the 4 parts
   // (DSMEM).
-  for (int t = warp; t < (kTree ? n : kRecWarps); t += kRecWarps) {
+  for (int t = warp; t < (kTree ? n : max(n, kRecWarps)); t += kRecWarps) {  // (chains of up to 16 rows: DSpine)
     const float o = t < n ? so[t][lane] : 0.f;
     float ss = o * o;
     for (int s = 16; s > 0; s >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, s);

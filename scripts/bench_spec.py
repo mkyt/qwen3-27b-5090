@@ -1,4 +1,4 @@
-"""Speculative decoding (DFlash2) of the engine, in-process: decode speed and acceptance length.
+"""Speculative decoding (DFlash2 or DSpine, --draft) of the engine, in-process: decode speed and acceptance length.
 
 Uses the decode prompts of bench_agentic.py (code / json / prose, chat template, thinking off) and the
 checkpoint's default sampling (temperature 1.0, top-k 20, top-p 0.95) unless --temperature is given.
@@ -106,6 +106,7 @@ def main():
     ap.add_argument("--kv-dtype", choices=["bf16", "fp8", "nvfp4"], default=None,
                     help="KV cache dtype; overrides --kv-fp8 when supplied")
     ap.add_argument("--weights", default="nvidia", help="weight profile (Phase Q): nvidia | quasar | a model directory")
+    ap.add_argument("--draft", default="dflash2", help="draft model: dflash2 | dspine | a directory")
     args = ap.parse_args()
     if args.profile:
         import os
@@ -115,7 +116,10 @@ def main():
     from transformers import AutoTokenizer
 
     from q27lib import Engine
-    from qwen27b.weights import DFLASH2, TARGET, engine_target, snapshot
+    from qwen27b.weights import DFLASH2, DSPINE, TARGET, engine_target, snapshot
+
+    def draft_dir(d):
+        return snapshot(*{"dflash2": DFLASH2, "dspine": DSPINE}[d]) if d in ("dflash2", "dspine") else d
 
     if args.check_greedy:
         import os
@@ -127,7 +131,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(snapshot(*TARGET))
     t0 = time.perf_counter()
     eng = Engine(engine_target(args.weights), max_tokens=8192,
-                 kv_dtype=args.kv_dtype or ("fp8" if args.kv_fp8 else "bf16"), draft=snapshot(*DFLASH2))
+                 kv_dtype=args.kv_dtype or ("fp8" if args.kv_fp8 else "bf16"), draft=draft_dir(args.draft))
     print(f"load {time.perf_counter() - t0:.1f} s", flush=True)
     names = args.prompts.split(",")
 

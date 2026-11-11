@@ -6,7 +6,7 @@ import pathlib
 import torch
 from safetensors import safe_open
 
-from .paths import (BF16, DFLASH2, GDNFP4, GDNFP4_DIR, HF_HUB, LOCAL_COPIES, QUASAR, TARGET,  # noqa: F401
+from .paths import (BF16, DFLASH2, DSPINE, GDNFP4, GDNFP4_DIR, HF_HUB, LOCAL_COPIES, QUASAR, TARGET,  # noqa: F401
                     engine_target, snapshot)
 from .quant import QLinear, dequant_fp8, dequant_nvfp4
 

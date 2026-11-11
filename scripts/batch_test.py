@@ -309,6 +309,8 @@ def main():
     ap.add_argument("--kv-dtype", default="fp8", choices=["bf16", "fp8", "nvfp4"])
     ap.add_argument("--weights", default="nvidia", help="weight profile: nvidia | gdnfp4 | quasar | a model directory")
     ap.add_argument("--max-tokens", type=int, default=16384)
+    ap.add_argument("--draft", default="dflash2", choices=["dflash2", "dspine"],
+                    help="draft model (check / kvfull with dspine: Q27_DRAFT_BLOCK=8, the batched steps' block, for the solo steps too)")
     ap.add_argument("--ctx", type=int, default=0, help="bench: tokens of a long document before each prompt")
     ap.add_argument("--profile", action="store_true", help="bench: per-op GPU time of the steps (Q27_PROFILE=1)")
     ap.add_argument("--out", default="", help="bench: result JSON (default bench/results/<UTC time>-custom-p6-10-batch.json)")
@@ -325,11 +327,13 @@ def main():
     from transformers import AutoTokenizer
 
     from q27lib import Engine, KvFull
-    from qwen27b.weights import DFLASH2, TARGET, engine_target, snapshot
+    from qwen27b.weights import DFLASH2, DSPINE, TARGET, engine_target, snapshot
+    if args.draft == "dspine" and args.part != "bench":
+        os.environ.setdefault("Q27_DRAFT_BLOCK", "8")
 
     tok = AutoTokenizer.from_pretrained(snapshot(*TARGET))
     t0 = time.time()
-    eng = Engine(engine_target(args.weights), max_tokens=args.max_tokens, kv_dtype=args.kv_dtype, draft=snapshot(*DFLASH2))
+    eng = Engine(engine_target(args.weights), max_tokens=args.max_tokens, kv_dtype=args.kv_dtype, draft=snapshot(*(DSPINE if args.draft == "dspine" else DFLASH2)))
     print(f"load {time.time() - t0:.1f} s, max lanes {eng.max_lanes}", flush=True)
     if args.part in ("check", "kvfull"):
         ok = check(eng, tok, args) if args.part == "check" else kvfull(eng, tok, args, KvFull)

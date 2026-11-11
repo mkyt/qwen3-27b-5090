@@ -329,9 +329,9 @@ struct Penalty {
 // `uniform` holds one U(0,1) number per row. pen (optional): penalties first, and the token is counted.
 // Log-probabilities of output tokens (OpenAI logprobs): the raw distribution of the row a token came from
 // (log-softmax of the logits, before the temperature, the penalties and the cuts), the token's own value and the
-// row's n most likely entries (n = the request's top_logprobs). One per step (up to 8 tokens: a speculative step).
+// row's n most likely entries (n = the request's top_logprobs). One per step (up to 16 tokens: a speculative step).
 constexpr int kMaxTopLogprobs = 20;
-constexpr int kLogprobTokens = 8;  // (kSpecBlock)
+constexpr int kLogprobTokens = 16;  // (kSpecBlock)
 struct Logprobs {
   int32_t n;    // tokens
   int32_t top;  // top entries per token

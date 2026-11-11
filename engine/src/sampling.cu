@@ -402,7 +402,7 @@ __global__ void spec_accept_lanes_kernel(int32_t* ids, int32_t* block_ids, const
   pdl_trigger();
   pdl_wait();
   if (threadIdx.x != 0) return;
-  const int z = blockIdx.x, r0 = kSpecBlock * z;
+  const int z = blockIdx.x, r0 = kLaneRows * z;
   DraftChoice ch;
   ch.cand = const_cast<int32_t*>(cand) + (r0 + 1) * kSpecSelK;
   ch.tree = trees + z;
@@ -562,9 +562,9 @@ __global__ void __launch_bounds__(kThreads) spec_logprobs_kernel(const float* lo
   Logprobs* o = out + 2 * z + par[z];
   if (i == 0 && threadIdx.x == 0) o->n = nc, o->top = n;
   if (i >= nc) return;
-  const int32_t* cp = cpath + kSpecBlock * z;
+  const int32_t* cp = cpath + kLaneRows * z;  // (a single sequence: z = 0)
   const int64_t row = int64_t(z) * rows + cp[i];
-  const int tok = i + 1 < nc ? trees[z].tok[cp[i + 1]] : ids[kSpecBlock * z];
+  const int tok = i + 1 < nc ? trees[z].tok[cp[i + 1]] : ids[kLaneRows * z];
   logprob_row(logits + row * V, V, tok, tv + row * ld, ti + row * ld, n, o, i);
 }
 

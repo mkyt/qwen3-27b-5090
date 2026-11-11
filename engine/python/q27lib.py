@@ -30,6 +30,7 @@ SIGNATURES = {
     "q27_seq_drop": ([P, I], I),
     "q27_seq_suspend": ([P, I], I),
     "q27_has_draft": ([P], I),
+    "q27_spec_block": ([P], I),
     "q27_max_lanes": ([P], I),
     "q27_max_tokens": ([P], I),
     "q27_spec_step_lanes": ([P, P, I, P, P], I),
@@ -247,7 +248,7 @@ class Engine:
         as the sampling asked for), the raw distribution (before the temperature, penalties and cuts). [] when the
         sampling asked for none."""
         top = ctypes.c_int()
-        lp, ids, tlp = (ctypes.c_float * 8)(), (ctypes.c_int32 * 160)(), (ctypes.c_float * 160)()
+        lp, ids, tlp = (ctypes.c_float * 16)(), (ctypes.c_int32 * 320)(), (ctypes.c_float * 320)()
         n = lib().q27_logprobs(self.h, lane, ctypes.byref(top), lp, ids, tlp)
         k = top.value
         return [(lp[i], list(zip(ids[20 * i:20 * i + k], tlp[20 * i:20 * i + k]))) for i in range(n)]
@@ -272,6 +273,12 @@ class Engine:
     def has_draft(self):
         return bool(lib().q27_has_draft(self.h))
 
+    @property
+    def spec_block(self):
+        """Rows of a single sequence's speculative step: the last token and the drafted ones (DFlash2 8, DSpine up to
+        16; batched steps take 8 per lane)."""
+        return lib().q27_spec_block(self.h)
+
     def spec_begin(self, ids, temperature=0.0, top_k=20, top_p=1.0, seed=0, uniform=0.5, max_new=0, min_p=0.0,
                    presence=0.0, frequency=0.0, logprobs=-1, masked=False, until=None, biased=False,
                    ignore_eos=False):
@@ -290,11 +297,11 @@ class Engine:
         return out.value
 
     def spec_draft(self):
-        """A masked sequence's step, first part: drafts it and returns its 8 verify tokens (the last token, then the
-        7 drafted ones). Write mask rows 0..7 (the grammar after each row's tokens), then spec_step verifies."""
-        out = (ctypes.c_int32 * 8)()
+        """A masked sequence's step, first part: drafts it and returns its spec_block verify tokens (the last token,
+        then the drafted ones). Write mask rows 0.. (the grammar after each row's tokens), then spec_step verifies."""
+        out = (ctypes.c_int32 * 16)()
         self._check(lib().q27_spec_draft(self.h, out), "q27_spec_draft")
-        return list(out)
+        return list(out[:self.spec_block])
 
     def spec_set_masked(self, area=None):
         """Grammar masks for a decoding sequence (None: the running one, else a parking area) from its next step on,
@@ -310,9 +317,9 @@ class Engine:
         return [list(out[8 * z:8 * z + 8]) for z in range(n)]
 
     def spec_step(self, ahead=True):
-        """One draft + verify step; returns the new tokens (1..8). ahead=False: the next step is not launched
+        """One draft + verify step; returns the new tokens (1..spec_block). ahead=False: the next step is not launched
         before returning (the caller switches to another sequence next)."""
-        out = (ctypes.c_int32 * 8)()
+        out = (ctypes.c_int32 * 16)()
         n = lib().q27_spec_step2(self.h, out, int(ahead)) if not ahead else lib().q27_spec_step(self.h, out)
         if n < 0:
             self._check(n, "q27_spec_step")

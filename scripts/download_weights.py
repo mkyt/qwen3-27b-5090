@@ -4,7 +4,7 @@ the Windows package runs it before the server (no huggingface_hub, uv or symlink
     python scripts/download_weights.py [--weights gdnfp4|nvidia|quasar|ORG/NAME[@REVISION]] [--no-draft] [--jobs 4]
                                        [--also nvidia|quasar|bf16|ORG/NAME[@REVISION]]...
 
---weights defaults to $WEIGHTS, else gdnfp4; the DFlash2 draft comes too unless --no-draft or SPEC=none. --also adds
+--weights defaults to $WEIGHTS, else gdnfp4; the draft of SPEC comes too (DFlash2, or DSpine with SPEC=dspine) unless --no-draft or SPEC=none. --also adds
 more checkpoints (bf16: the BF16 original; scripts/download-weights.sh uses it for --dev, --bf16, --quasar). A profile's
 revision is pinned (reference/qwen27b/paths.py); a repository's branch or tag (default main) is resolved to its
 commit, recorded under refs/ as huggingface_hub does. Before downloading a repository, its safetensors headers (a few
@@ -233,7 +233,7 @@ def main():
     ap.add_argument("--weights", default=os.environ.get("WEIGHTS") or "gdnfp4",
                     help="a profile (gdnfp4, nvidia, quasar) or a Hugging Face repository ORG/NAME[@REVISION]")
     ap.add_argument("--no-draft", action="store_true", default=os.environ.get("SPEC") == "none",
-                    help="without the DFlash2 draft (speculative decoding off: SPEC=none)")
+                    help="without the draft of SPEC (DFlash2 by default; speculative decoding off: SPEC=none)")
     ap.add_argument("--no-check", action="store_true", help="download a repository without the engine's check")
     ap.add_argument("--jobs", type=int, default=4, help="files downloaded at once")
     ap.add_argument("--also", action="append", default=[], metavar="WEIGHTS",
@@ -255,7 +255,7 @@ def main():
             sys.exit(f"{opt}: a profile ({', '.join(PROFILE_PINS)}) or ORG/NAME[@REVISION], not {w!r}")
         pins += [p for p in new if p not in pins]
     if not args.no_draft:
-        pins.append((*paths.DFLASH2, None))
+        pins.append((*paths.DRAFTS.get(os.environ.get("SPEC") or "dflash2", paths.DFLASH2), None))
 
     todo, total = [], 0
     for repo, rev, check in pins:

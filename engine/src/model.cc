@@ -110,7 +110,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   }
   // Batched steps (P6-10): the step scalars and page tables of up to MAX_SEQS lanes.
   size_t o_bsc = 0, o_bpt = 0, o_brng = 0, o_btree = 0;
-  constexpr int kLaneInts = 5 + 3 * kSpecBlock;  // pos, delta, par, ncommit, budget, ids, block ids, commit path
+  constexpr int kLaneInts = 5 + 3 * kLaneRows;  // pos, delta, par, ncommit, budget, ids, block ids, commit path
   if (lanes > 1) {
     o_bsc = state_.add("batch lane scalars", size_t(kMaxLanes) * kLaneInts * 4);
     o_bpt = state_.add("batch lane page tables", size_t(kMaxLanes) * max_pages_ * 4);
@@ -161,7 +161,7 @@ Model::Model(const Options& opt) : opt_(opt) {
     o_tv = act_.add("spec top-k values", size_t(vrows) * 64 * 4);
     o_ti = act_.add("spec top-k ids", size_t(vrows) * 64 * 4);
     o_cap = act_.add("draft context features", size_t(Tc) * ddims::kCtxFeatures * kHidden * 2);
-    draft_ = std::make_unique<Draft>(opt.draft_dir, dev_weights_, act_, int(Tc), lanes);
+    draft_ = std::make_unique<Draft>(opt.draft_dir, dev_weights_, act_, host_weights_, int(Tc), lanes);
   }
 
   // Prefix cache: a device staging copy of one checkpoint and the pinned host slots.
@@ -325,8 +325,8 @@ Model::Model(const Options& opt) : opt_(opt) {
   if (lanes > 1) {
     int32_t* sc = state_.at<int32_t>(o_bsc);
     b_pos_ = sc, b_delta_ = sc + kMaxLanes, b_par_ = sc + 2 * kMaxLanes, b_nc_ = sc + 3 * kMaxLanes;
-    b_budget_ = sc + 4 * kMaxLanes, b_ids_ = sc + 5 * kMaxLanes, b_blk_ = b_ids_ + kMaxLanes * kSpecBlock;
-    b_cpath_ = b_blk_ + kMaxLanes * kSpecBlock;
+    b_budget_ = sc + 4 * kMaxLanes, b_ids_ = sc + 5 * kMaxLanes, b_blk_ = b_ids_ + kMaxLanes * kLaneRows;
+    b_cpath_ = b_blk_ + kMaxLanes * kLaneRows;
     b_pt_ = state_.at<int32_t>(o_bpt);
     b_rng_ = state_.at<uint64_t>(o_brng);
     b_tree_ = state_.at<SpecTree>(o_btree);
@@ -387,6 +387,9 @@ void Model::configure() {
   lookup_.min_len = env_int("Q27_LOOKUP_MIN", 8);
   lookup_.agree = env_int("Q27_LOOKUP_AGREE", 2);
   spec_paths_ = std::clamp(env_int("Q27_SPEC_PATHS", 1), 1, kTreePaths);
+  // (trees: blocks of up to 8 rows; their walks' random numbers and rows are laid out for that)
+  if (draft_ && draft_->block() > ddims::kBlock) spec_paths_ = 1;
+  if (draft_ && draft_->dspine()) lookup_.on = 0;  // (the selector's lookup chains are DFlash2's 7 rows)
   spec_pipeline_ = env_int("Q27_SPEC_PIPELINE", 1) != 0;
   mlp_bf16_ = env_int("Q27_MLP_BF16", 1) != 0;
   mlp_fused_ = env_int("Q27_MLP_FUSED", 1) != 0;
@@ -877,7 +880,7 @@ bool Model::fused(int T) const { return (batch_n_ ? kLaneRows : T) <= kDecodeMax
 bf16* Model::cap_for(int i) const {
   if (!cap_) return nullptr;
   for (int f = 0; f < ddims::kCtxFeatures; f++)
-    if (ddims::kCtxLayers[f] + 1 == i) return cap_ + f * kHidden;
+    if (draft_->ctx_layer(f) + 1 == i) return cap_ + f * kHidden;
   return nullptr;
 }
 
@@ -1324,7 +1327,7 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
           target = std::min(target, int(p));
           break;
         }
-      const int skip = std::clamp(target - ddims::kWindow - pos_, 0, T);
+      const int skip = std::clamp(target - draft_->window() - pos_, 0, T);
       draft_->append_ctx(cap_ + size_t(skip) * ddims::kCtxFeatures * kHidden, T - skip, pos_dev_, skip - T, nullptr,
                          skinny_ws_, kSkinnyWsBytes, big1_, size_t(opt_.prefill_chunk) * kInter * 4, s_);
     }
@@ -1506,6 +1509,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   spec_smp_ = smp;
   if (!smp.ignore_eos) std::copy(stop_, stop_ + 2, spec_smp_.stop);
   if (spec_smp_.paths <= 0) spec_smp_.paths = spec_paths_;
+  if (draft_->block() > ddims::kBlock) spec_smp_.paths = 1;  // (see configure)
   if (spec_smp_.masked) spec_smp_.paths = 1;  // (the host masks a chain's rows)
   return first;
 }
@@ -1567,7 +1571,7 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
   }
   if (smp.paths > 1) kv_commit(kv_layers_dev_, kAttnLayers, opt_.kv_type, page_table_, pos_dev_, ncommit_, cpath_, s_);
   mark("draft context");
-  draft_->append_ctx(cap_buf_, kSpecBlock, pos_dev_, 0, ncommit_, skinny_ws_, kSkinnyWsBytes, nullptr, 0, s_, cpath_);
+  draft_->append_ctx(cap_buf_, draft_->block(), pos_dev_, 0, ncommit_, skinny_ws_, kSkinnyWsBytes, nullptr, 0, s_, cpath_);
   spec_advance(pos_dev_, ncommit_, par_, sbuf_, rng_, s_, budget_);
 }
 
@@ -2017,8 +2021,8 @@ void Model::batch_enter(const int32_t* lanes, int n) {
     if (a < 0) {  // the running sequence: its device scalars
       const std::pair<void*, const void*> cp[] = {{b_pos_ + z, pos_dev_},     {b_delta_ + z, rope_delta_},
                                                    {b_budget_ + z, budget_},  {b_rng_ + 2 * z, rng_},
-                                                   {b_blk_ + kSpecBlock * z, block_ids_}, {b_ids_ + kSpecBlock * z, ids_ver_}};
-      const size_t bytes[] = {4, 4, 4, 16, kSpecBlock * 4, kSpecBlock * 4};
+                                                   {b_blk_ + kLaneRows * z, block_ids_}, {b_ids_ + kLaneRows * z, ids_ver_}};
+      const size_t bytes[] = {4, 4, 4, 16, kLaneRows * 4, kLaneRows * 4};
       for (int i = 0; i < 6; i++)
         Q27_CUDA(cudaMemcpyAsync(cp[i].first, cp[i].second, bytes[i], cudaMemcpyDeviceToDevice, s_));
       bconv_[z] = conv_, bssm_[z] = ssm_buf_[sbuf_host_];
@@ -2031,8 +2035,8 @@ void Model::batch_enter(const int32_t* lanes, int n) {
       Q27_CUDA(cudaMemcpyAsync(b_delta_ + z, st.scalars + kScDelta, 4, cudaMemcpyHostToDevice, s_));
       Q27_CUDA(cudaMemcpyAsync(b_budget_ + z, st.scalars + kScBudget, 4, cudaMemcpyHostToDevice, s_));
       Q27_CUDA(cudaMemcpyAsync(b_rng_ + 2 * z, st.scalars + kScRng, 16, cudaMemcpyHostToDevice, s_));
-      Q27_CUDA(cudaMemcpyAsync(b_blk_ + kSpecBlock * z, st.scalars + kScBlock, kSpecBlock * 4, cudaMemcpyHostToDevice, s_));
-      Q27_CUDA(cudaMemcpyAsync(b_ids_ + kSpecBlock * z, st.scalars + kScIds, kSpecBlock * 4, cudaMemcpyHostToDevice, s_));
+      Q27_CUDA(cudaMemcpyAsync(b_blk_ + kLaneRows * z, st.scalars + kScBlock, kLaneRows * 4, cudaMemcpyHostToDevice, s_));
+      Q27_CUDA(cudaMemcpyAsync(b_ids_ + kLaneRows * z, st.scalars + kScIds, kLaneRows * 4, cudaMemcpyHostToDevice, s_));
       bssm_[z] = reinterpret_cast<float*>(st.dev);
       bconv_[z] = reinterpret_cast<float*>(st.dev + ssm_bytes_);
       bring_k_[z] = reinterpret_cast<bf16*>(st.dev + ssm_bytes_ + conv_bytes_);
@@ -2076,9 +2080,9 @@ void Model::batch_exit() {
     const int a = blanes_[z];
     if (a < 0) {
       const std::pair<void*, const void*> cp[] = {{pos_dev_, b_pos_ + z},      {budget_, b_budget_ + z},
-                                                   {rng_, b_rng_ + 2 * z},      {block_ids_, b_blk_ + kSpecBlock * z},
-                                                   {ids_ver_, b_ids_ + kSpecBlock * z}};
-      const size_t bytes[] = {4, 4, 16, kSpecBlock * 4, kSpecBlock * 4};
+                                                   {rng_, b_rng_ + 2 * z},      {block_ids_, b_blk_ + kLaneRows * z},
+                                                   {ids_ver_, b_ids_ + kLaneRows * z}};
+      const size_t bytes[] = {4, 4, 16, kLaneRows * 4, kLaneRows * 4};
       for (int i = 0; i < 5; i++)
         Q27_CUDA(cudaMemcpyAsync(cp[i].first, cp[i].second, bytes[i], cudaMemcpyDeviceToDevice, s_));
       if (!seq_pages_.empty())
@@ -2088,8 +2092,8 @@ void Model::batch_exit() {
       SeqState& st = parked_[a];
       Q27_CUDA(cudaMemcpyAsync(st.scalars + kScBudget, b_budget_ + z, 4, cudaMemcpyDeviceToHost, s_));
       Q27_CUDA(cudaMemcpyAsync(st.scalars + kScRng, b_rng_ + 2 * z, 16, cudaMemcpyDeviceToHost, s_));
-      Q27_CUDA(cudaMemcpyAsync(st.scalars + kScBlock, b_blk_ + kSpecBlock * z, kSpecBlock * 4, cudaMemcpyDeviceToHost, s_));
-      Q27_CUDA(cudaMemcpyAsync(st.scalars + kScIds, b_ids_ + kSpecBlock * z, kSpecBlock * 4, cudaMemcpyDeviceToHost, s_));
+      Q27_CUDA(cudaMemcpyAsync(st.scalars + kScBlock, b_blk_ + kLaneRows * z, kLaneRows * 4, cudaMemcpyDeviceToHost, s_));
+      Q27_CUDA(cudaMemcpyAsync(st.scalars + kScIds, b_ids_ + kLaneRows * z, kLaneRows * 4, cudaMemcpyDeviceToHost, s_));
     }
   }
   Q27_CUDA(cudaStreamSynchronize(s_));
@@ -2145,11 +2149,11 @@ void Model::batch_body(int n, int part) {
   const bool lp = std::any_of(ln.n, ln.n + n, [](int v) { return v >= 0; });
   K = pen ? 64 : std::max(K, *std::max_element(ln.n, ln.n + n));  // (see spec_body)
   topk_rows(logits_, W, kVocab, K, tv_, ti_, s_);
-  if (pen) penalize_rows(tv_, ti_, K, kSpecBlock, n, pl, b_tree_, s_, lp ? lpv_ : nullptr, lpi_);
+  if (pen) penalize_rows(tv_, ti_, K, kLaneRows, n, pl, b_tree_, s_, lp ? lpv_ : nullptr, lpi_);
   spec_accept_lanes(n, b_ids_, b_blk_, tv_, ti_, K, bacc_, draft_->lane_cand(), b_tree_, draft_->lane_src(), b_rng_,
                     b_nc_, b_cpath_, b_out_dev_, b_pos_, b_par_, b_budget_, s_);
   if (lp)
-    spec_logprobs(n, logits_, kVocab, pen ? lpv_ : tv_, pen ? lpi_ : ti_, pen ? kMaxTopLogprobs : K, kSpecBlock, ln,
+    spec_logprobs(n, logits_, kVocab, pen ? lpv_ : tv_, pen ? lpi_ : ti_, pen ? kMaxTopLogprobs : K, kLaneRows, ln,
                   b_tree_, b_cpath_, b_nc_, b_ids_, lp_dev_ + kLpLanes, b_par_, s_);
   mark("draft context");
   draft_->append_ctx_lanes(dl, cap_buf_, b_nc_, b_cpath_, skinny_ws_, kSkinnyWsBytes, s_);
@@ -2188,8 +2192,8 @@ void Model::batch_prepare(const int32_t* lanes, int n) {
   batch_enter(lanes, n);
   for (int z = 0; z < n; z++) {
     LaneRef r = lane_ref(z);
-    Q27_CHECK(*r.pos + kSpecBlock <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
-    ensure_pages_of(*r.pages, b_pt_ + size_t(z) * max_pages_, *r.pos + kSpecBlock);
+    Q27_CHECK(*r.pos + kLaneRows <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
+    ensure_pages_of(*r.pages, b_pt_ + size_t(z) * max_pages_, *r.pos + kLaneRows);
   }
 }
 
@@ -2211,9 +2215,9 @@ void Model::spec_draft_lanes(const int32_t* lanes, int n, int32_t* chain) {
   batch_prepare(lanes, n);
   Q27_CHECK(batch_masked(), "spec_draft_lanes: no masked lane");
   batch_part(n, 1);
-  Q27_CUDA(cudaMemcpyAsync(draft_host_, b_ids_, size_t(n) * kSpecBlock * 4, cudaMemcpyDeviceToHost, s_));
+  Q27_CUDA(cudaMemcpyAsync(draft_host_, b_ids_, size_t(n) * kLaneRows * 4, cudaMemcpyDeviceToHost, s_));
   Q27_CUDA(cudaStreamSynchronize(s_));
-  memcpy(chain, draft_host_, size_t(n) * kSpecBlock * 4);
+  memcpy(chain, draft_host_, size_t(n) * kLaneRows * 4);
   b_drafted_ = true;
 }
 
@@ -2246,7 +2250,7 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     const int k = so.n;
     Q27_CHECK(k >= 1 && k <= kSpecBlock, "spec_step_lanes: bad token count");
     LaneRef r = lane_ref(z);
-    int32_t* o = out + kSpecBlock * z;
+    int32_t* o = out + kLaneRows * z;
     for (int i = 0; i < k; i++) o[i] = so.tok[i];
     counts[z] = k;
     last_lp_[z].n = 0;

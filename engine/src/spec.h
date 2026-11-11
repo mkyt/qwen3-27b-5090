@@ -10,7 +10,8 @@
 
 namespace q27 {
 
-constexpr int kSpecBlock = 8;  // the draft block: the anchor and 7 drafted tokens (the deepest path)
+constexpr int kSpecBlock = 16;  // the longest draft block: the anchor and up to 15 drafted tokens (the deepest path;
+                                // DFlash2 drafts 8, DSpine up to 16, Draft::block()). Batched steps: kLaneRows
 constexpr int kSpecSelK = 16;  // selector candidates per position
 constexpr int kTreeMax = 32;   // verify rows: nodes of the draft tree (node 0 is the anchor)
 constexpr int kTreePaths = 4;  // root-to-leaf paths (draft walks)

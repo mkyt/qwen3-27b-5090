@@ -60,7 +60,7 @@ class Nvml:
 def weight_group(what):
     """The part of the model a weight tensor (a reservation of the weights pool) belongs to."""
     if what.startswith("draft"):
-        return "draft model (DFlash2)"
+        return "draft model"
     if "visual" in what:
         return "vision tower"
     if "lm_head" in what:

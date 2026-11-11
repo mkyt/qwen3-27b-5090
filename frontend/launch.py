@@ -13,10 +13,10 @@ import multiprocessing as mp
 import os
 import threading
 
-from qwen27b.paths import DFLASH2, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
+from qwen27b.paths import DRAFTS, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
 from tokenizer import fingerprint
 
-CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
+CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dflash2", "dspine", "none"), "vision": ("host", "fp8", "bf16", "off")}
 MAX_SEQS = 8                # (the engine's lanes of a batched step)
 MAX_CONTEXT = 262144        # max_position_embeddings of the checkpoint
 MIN_BUDGET_GIB = 4.0
@@ -144,7 +144,7 @@ class Launch:
     def config(self, s):
         """The engine's configuration (worker.run) for settings s; FileNotFoundError when weights are missing."""
         path = model_dir(s["weights"])
-        draft = snapshot(*DFLASH2) if s["spec"] == "dflash2" else None
+        draft = snapshot(*DRAFTS[s["spec"]]) if s["spec"] in DRAFTS else None
         eos = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))["eos_token_id"]
         env = {"VISION": s["vision"], "MAX_SEQS": str(s["max_seqs"]),
                "VRAM_BUDGET_GIB": None if s["vram_budget_gib"] is None else f"{s['vram_budget_gib']:g}",

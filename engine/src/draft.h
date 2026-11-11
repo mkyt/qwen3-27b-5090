@@ -1,7 +1,13 @@
-// DFlash2 draft model (incoai/Qwen3.8-27B-DFlash2) for speculative decoding: a 5-layer non-causal
-// block drafter that reads target hidden states (layers 5 / 19 / 33 / 47 / 61) as context, predicts
-// 7 tokens after the anchor in one pass, and a candidate selector that walks one path through the
-// top-16 candidates of each position.
+// Block draft models for speculative decoding (Draft::kind()):
+// - DFlash2 (incoai/Qwen3.8-27B-DFlash2): a 5-layer non-causal block drafter that reads target hidden
+//   states (layers 5 / 19 / 33 / 47 / 61) as context, predicts 7 tokens after the anchor in one pass,
+//   and a candidate selector that walks one path through the top-16 candidates of each position.
+// - DSpine (tencent/Qwen3.8-27B-DSpine-b16): the same backbone without the convolutions, block-causal,
+//   layers 1 / 16 / 31 / 46 / 61, an 8,192-token window and blocks of up to 16 rows. After every layer a
+//   code bridge writes each row's predecessor into it (a gated message from the predecessor's code: its
+//   hidden state read into a 1,024-dim code, the anchor's from a codebook). The proposals: the top-16
+//   candidates of each row, then the last layer's write is redone for every candidate of the predecessor
+//   (its codebook row as the code), giving a 16 x 16 table of logits per position that the selector walks.
 #pragma once
 
 #include <memory>
@@ -37,12 +43,20 @@ constexpr int kQkv = (kHeads + 2 * kKvHeads) * kHeadDim;      // 6144
 constexpr int kMaxK = kCtxFeatures * kHidden;                 // widest GEMM input (fc)
 constexpr float kRopeTheta = 1e7f;
 constexpr float kEps = 1e-6f;
+// DSpine
+constexpr int kMaxBlock = 16;  // trained block (anchor + 15); served blocks 2..16 (Q27_DRAFT_BLOCK)
+constexpr int kMaxDraft = kMaxBlock - 1;
+constexpr int kCode = 1024;    // code bridge: code size
+constexpr int kBridgeRank = 512;
+constexpr int kDSpineWindow = 8192;
+constexpr int kDSpineCtxLayers[kCtxFeatures] = {1, 16, 31, 46, 61};
 }  // namespace ddims
 
 // Precision of the draft's linear layers (Q27_DRAFT_QUANT): BF16 as in the checkpoint, or quantized
 // on the GPU at load with per-output-channel scales (NVFP4 also has 16-element block scales), with the
 // activations quantized dynamically per token.
 enum class DraftQuant : int { kBf16 = 0, kFp8 = 1, kFp4 = 2 };
+enum class DraftKind : int { kDFlash2 = 0, kDSpine = 1 };
 
 struct DLinear {
   const void* w = nullptr;      // bf16 [N][K] / e4m3 [N][K] / packed e2m1 [N][K/2]
@@ -87,7 +101,8 @@ class Draft {
  public:
   // Plans the weights and buffers in the given pools (committed by the caller); bind() and load() after.
   // lanes: blocks of a batched step (P6-10) the buffers are sized for.
-  Draft(const std::string& dir, Pool& weights, Pool& act, int max_ctx_rows, int lanes = 1);
+  // host: pinned host memory (DSpine's codebook, read through UVA).
+  Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int max_ctx_rows, int lanes = 1);
   void bind();
   void load(cudaStream_t s);
   // With a draft vocabulary (Q27_DRAFT_VOCAB): the compact candidate head from the target's lm_head
@@ -126,6 +141,13 @@ class Draft {
   int lanes() const { return lanes_; }
   void reset(cudaStream_t s);
   DraftQuant quant() const { return quant_; }
+  DraftKind kind() const { return kind_; }
+  bool dspine() const { return kind_ == DraftKind::kDSpine; }
+  // Rows of a draft block (anchor + drafted tokens) of a single sequence; a batched step's blocks have
+  // kBlock (8) rows (kLaneRows).
+  int block() const { return block_; }
+  int window() const { return window_; }  // the context ring: positions >= pos - (window - 1) are seen
+  int ctx_layer(int f) const { return ctx_layers_[f]; }  // target layers whose output is the context
   // The context ring of all layers (K, then V; part of a state checkpoint).
   void* ring_k() const { return ring_k_; }
   void* ring_v() const { return ring_v_; }
@@ -137,7 +159,23 @@ class Draft {
   std::unique_ptr<SafeTensors> ckpt_;
   Pool& wpool_;
   Pool& apool_;
+  Pool& hpool_;
   DraftQuant quant_ = DraftQuant::kFp4;
+  DraftKind kind_ = DraftKind::kDFlash2;
+  int block_ = ddims::kBlock, window_ = ddims::kWindow;
+  int ctx_layers_[ddims::kCtxFeatures] = {};
+  // DSpine: the code bridge (BF16 as in the checkpoint) and the codebook (pinned host).
+  const bf16 *early_read_ = nullptr, *last_read_ = nullptr;  // [4][1024][5120], [1024][5120]
+  const bf16* write_w_ = nullptr;                           // [5][5120][512]
+  const bf16* gate_b_ = nullptr;                            // [512]
+  DLinear packed_;                                          // gate | predecessor_gate | prev [1536][1024]
+  size_t codebook_off_ = 0;
+  const bf16* codebook_ = nullptr;                          // [vocab][1024]
+  void propose_dspine(int nb, int T, const DraftLanes& lanes, const int32_t* block_ids, const bf16* embed,
+                      const uint8_t* lm_w, const uint8_t* lm_sf, float lm_in_scale, float lm_alpha,
+                      const SpecSampling* smp, const SelectLanes* sl, const uint64_t* rng, int32_t* ids_out,
+                      SpecTree* trees, uint8_t* aq, uint8_t* asf, float* logits, void* ws, size_t ws_bytes,
+                      cudaStream_t s);
   std::vector<DraftLayer> layers_;
   const bf16 *hidden_norm_ = nullptr, *norm_ = nullptr;
   const bf16 *pred_cb_ = nullptr, *succ_cb_ = nullptr;
@@ -174,6 +212,7 @@ class Draft {
   struct Off {
     size_t x, h, hb, coef, act_q, act_sf, act_scale, qkv, q, kb, vb, part, o32, y, gu, ring_k, ring_v, ctx, ctxb, kv,
         hp, cand_v, cand_i, choice_q, choice_path, choice_src, lattice, sel_cnt, src_lanes;
+    size_t code, codeb, pk, msg, delta, raw, rms, cand_c, sid, ecode, egv, emsg, refined, rnorm;  // DSpine
   } off_{};
   int max_ctx_rows_;
   int lanes_ = 1;
@@ -183,6 +222,14 @@ class Draft {
   float *hp_ = nullptr, *cand_v_ = nullptr, *lattice_ = nullptr;
   int32_t *cand_i_ = nullptr, *sel_cnt_ = nullptr;
   bf16 *hb_ = nullptr, *ring_k_ = nullptr, *ring_v_ = nullptr, *ctxb_ = nullptr;
+  // DSpine: the bridge (code: read-out fp32, codeb: BF16 codes, pk: packed gate / predecessor gate / value,
+  // msg: messages, delta: their write), the last write's pre-write rows (raw, rms; q in pk), the refinement
+  // (cand_c: candidates as head rows, sid: senders, ecode: their codebook rows, egv: gate / value, emsg:
+  // messages, refined: the rewritten rows).
+  float *code_ = nullptr, *pk_ = nullptr, *delta_ = nullptr, *raw_ = nullptr, *rms_ = nullptr;
+  float *egv_ = nullptr, *refined_ = nullptr;
+  bf16 *codeb_ = nullptr, *msg_ = nullptr, *ecode_ = nullptr, *emsg_ = nullptr;
+  int32_t *cand_c_ = nullptr, *sid_ = nullptr;
   void* act_q_ = nullptr;
   uint8_t* act_sf_ = nullptr;
   float* act_scale_ = nullptr;
@@ -202,12 +249,14 @@ void draft_conv_out_norm(const float* y, const float* coef, const bf16* base, in
                          float* h, ActOut ao, bf16* hb, cudaStream_t s);
 // q / k norm + RoPE for the block at positions *pos + t: q [8][32][128] fp32, block K / V [8][8][128] fp32.
 void draft_qk_prep(const float* qkv, const bf16* q_norm, const bf16* k_norm, const int32_t* pos, float* q, float* kb,
-                   float* vb, cudaStream_t s);
-// Non-causal sliding-window attention of the 8 block rows over the context ring (positions
-// max(0, pos - 2047) .. pos - 1) and the block keys; out fp32 [8][4096].
+                   float* vb, cudaStream_t s, int T = ddims::kBlock);
+// Sliding-window attention of the T (8 or 16) block rows over the context ring (positions
+// max(0, pos - window + 1) .. pos - 1) and the block keys (all of them, or 0..t for row t when causal);
+// out fp32 [T][4096].
 void draft_attention(const float* q, const float* kb, const float* vb, const bf16* ring_k, const bf16* ring_v,
-                     const int32_t* pos, float* part, float* out, cudaStream_t s);
-size_t draft_attention_part_floats();
+                     const int32_t* pos, float* part, float* out, cudaStream_t s, int T = ddims::kBlock,
+                     int window = ddims::kWindow, bool causal = false);
+size_t draft_attention_part_floats(int rows);
 // Rows [T][K] (fp32 or BF16) into the next GEMM's input.
 void draft_quant_rows(const float* x, int T, int K, ActOut ao, cudaStream_t s);
 void draft_quant_rows(const bf16* x, int T, int K, ActOut ao, cudaStream_t s, const int32_t* rowmap = nullptr);
@@ -218,7 +267,7 @@ void draft_silu_mul(const float* gu, int64_t ld, int T, int I, ActOut ao, cudaSt
 // Context K/V: k_norm + RoPE of kv [rows][2048] (k | v of 8 heads) at positions *pos + pos_add + r into
 // the ring (slot = position % 2048); rows >= *n_dev are skipped when n_dev is given.
 void draft_ctx_write(const float* kv, int rows, const bf16* k_norm, const int32_t* pos, int pos_add,
-                     const int32_t* n_dev, bf16* ring_k, bf16* ring_v, cudaStream_t s);
+                     const int32_t* n_dev, bf16* ring_k, bf16* ring_v, cudaStream_t s, int window = ddims::kWindow);
 // Lattice scores and the walk (one kernel): writes the drafted tokens to ids_out[1..7] and the choice.
 // lattice: [7][16][16] scratch, counter: one int, zero between calls.
 void draft_select(const float* cand_v, const int32_t* cand_i, const float* hp, const bf16* pred_cb,
@@ -229,12 +278,38 @@ void draft_select(const float* cand_v, const int32_t* cand_i, const float* hp, c
 void draft_qk_prep_lanes(int lanes, const float* qkv, const bf16* q_norm, const bf16* k_norm, const int32_t* pos,
                          float* q, float* kb, float* vb, cudaStream_t s);
 void draft_attention_lanes(const DraftLanes& lanes, const float* q, const float* kb, const float* vb, float* part,
-                           float* out, cudaStream_t s);
+                           float* out, cudaStream_t s, int window = ddims::kWindow, bool causal = false);
 void draft_ctx_write_lanes(const DraftLanes& lanes, const float* kv, const bf16* k_norm, const int32_t* n_dev,
-                           cudaStream_t s);
+                           cudaStream_t s, int window = ddims::kWindow);
 void draft_select_lanes(int lanes, const SelectLanes& sl, const float* cand_v, const int32_t* cand_i, const float* hp,
                         const bf16* pred_cb, const bf16* succ_cb, const int32_t* anchor, const uint64_t* rng,
                         int32_t* ids_out, DraftChoice choice, float* lattice, int32_t* counter, cudaStream_t s);
+// DSpine (Draft::propose_dspine): rows of nb blocks of T rows (batched steps: T = 8, lanes true).
+// x += y, then RMSNorm(x) * w into the next GEMM's input.
+void dspine_add_norm(const float* y, float* x, const bf16* w, int T, ActOut ao, cudaStream_t s);
+// The bridge's read: f = x + y into x (and raw), rms, f / (rms + eps) in BF16 (nb).
+void dspine_read(const float* y, float* x, float* raw, float* rms, bf16* nb, int T, cudaStream_t s);
+// Codes (BF16): sqrt(C) * codebook[anchor] on a block's first row, sqrt(C) * proj / |proj| on the others.
+void dspine_codes(const float* proj, const int32_t* block_ids, const bf16* codebook, int rows, int T, bf16* codes,
+                  cudaStream_t s);
+// Messages (BF16 [rows][512]) from the packed projections pk [rows][1536].
+void dspine_msg(const float* pk, const bf16* gb, int rows, int T, bf16* msg, cudaStream_t s);
+// x += rms * delta (not on a block's first row), h = RMSNorm(x) * w (fp32 h optional, the next GEMM's input ao).
+void dspine_write_norm(const float* delta, const float* rms, int rows, int T, float* x, const bf16* w, float* h,
+                       ActOut ao, cudaStream_t s);
+// The refinement: candidate token ids and senders, the senders' codes, messages, and the 16 x 16 table.
+void dspine_cand(int nb, int T, bool lanes, const int32_t* cand_c, const int32_t* vocab_ids, const int32_t* block_ids,
+                 int32_t* cand_i, int32_t* sid, cudaStream_t s);
+void dspine_gather_codes(const bf16* codebook, const int32_t* ids, int rows, bf16* out, cudaStream_t s);
+void dspine_emsg(int nb, int T, bool lanes, const float* egv, const float* pk, const bf16* gb, bf16* emsg,
+                 cudaStream_t s);
+void dspine_table(int nb, int T, bool lanes, const float* raw, const float* rms, const float* delta,
+                  const bf16* norm_w, const int32_t* cand_c, const uint8_t* head_w, const uint8_t* head_sf,
+                  float wscale, float* lattice, cudaStream_t s);
+// The walk over the table (the selector's, see draft_select): one block (sl null) or nb lanes.
+void dspine_select(int nb, int nd, const SelectLanes* sl, const SpecSampling& smp, const int32_t* cand_i,
+                   const int32_t* anchor, const uint64_t* rng, int32_t* ids_out, DraftChoice choice, float* lattice,
+                   cudaStream_t s);
 // Weight quantization at load: rows [n][K] of BF16 w into rows row0.. of l (format fmt).
 void draft_quant_weight(const bf16* w, int n, int K, DraftQuant fmt, const DLinear& l, int row0, cudaStream_t s);
 // Rows ids[0..n) of an NVFP4 head [V][K] (packed values + swizzled block scales) into a compact head [n][K].

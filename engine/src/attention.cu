@@ -1502,8 +1502,11 @@ constexpr int kT8Conv = (kKvFp4<KV> ? 2 * kTcChunk * kHeadDim : 0) + kFaVtBytes;
 template <class KV>
 constexpr int kT8Smem = kT8Raw * 2 * kTcChunk * kKvRowBytes<KV> + 2 * kT8Conv<KV>;
 
-template <class KV, bool kBatch = false>
-__global__ void __launch_bounds__(kT8Grp * 32 + kTcProd, 1) attention_tc8_kernel(const float* q, const int32_t* pos_dev, int T,
+// kWide: up to 6 row tiles (T <= 16: DSpine's verify), launch bounds for 6 compute warps (other instances keep the
+// register budget of 4).
+constexpr int kT8MaxT = 16, kT8WideWarps = kT8MaxT * 6 / kT8Rows;
+template <class KV, bool kBatch = false, bool kWide = false>
+__global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kTcProd, 1) attention_tc8_kernel(const float* q, const int32_t* pos_dev, int T,
                                                                           const KV* kc, const KV* vc,
                                                                           const int32_t* page_table, int splits,
                                                                           DecPartial part, SeqLanes lanes) {
@@ -2011,6 +2014,10 @@ static bool tc_f8(KvType kv_type) {
                                   kT8Smem<uint8_t>));
     Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   kT8Smem<Fp4Kv>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t, false, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kT8Smem<uint8_t>));
+    Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<Fp4Kv, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  kT8Smem<Fp4Kv>));
     return true;
   }();
   (void)init;
@@ -2034,7 +2041,8 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
   // Chains of up to 8 tokens (decode, the chain verify; BF16 or FP8 KV): tensor cores, every chunk read once.
   // Q27_ATTN_TC=0: the CUDA-core kernel. The split count is fixed per process (bit-identical rows).
   const bool tc_on = !getenv("Q27_ATTN_TC") || atoi(getenv("Q27_ATTN_TC")) != 0;
-  const bool tc = tc_on && !tree && T <= kTcMaxT;
+  // (FP8 MMAs with NVFP4 KV, tc_f8: chains of up to 16 rows)
+  const bool tc = tc_on && !tree && (T <= kTcMaxT || (T <= kT8MaxT && tc_f8(kv_type)));
   const int tc_splits = getenv("Q27_ATTN_TC_SPLITS") ? atoi(getenv("Q27_ATTN_TC_SPLITS"))
                                                      : std::max(1, g_attn_sms / kKvHeads);
   const int splits = std::min(kDecodeMaxSplits,
@@ -2058,7 +2066,15 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
     (void)init;
     if (tc_f8(kv_type)) {
       const dim3 block8(tc8_warps(T) * 32 + kTcProd);
-      if (kv_type == KvType::NVFP4)
+      if (kv_type == KvType::NVFP4 && tc8_warps(T) > kT8Grp)
+        launch_pdl(attention_tc8_kernel<Fp4Kv, false, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, T,
+                   static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
+                   SeqLanes{});
+      else if (kv_type == KvType::FP8 && tc8_warps(T) > kT8Grp)
+        launch_pdl(attention_tc8_kernel<uint8_t, false, true>, grid, block8, kT8Smem<uint8_t>, s, q, pos_dev, T,
+                   static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
+                   SeqLanes{});
+      else if (kv_type == KvType::NVFP4)
         launch_pdl(attention_tc8_kernel<Fp4Kv>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, T,
                    static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
                    SeqLanes{});

@@ -108,7 +108,9 @@ everywhere above.
 | `PREFILL_CHUNK` | 2048 | Prefill chunk in tokens (8,192 is only 2.5% faster at 32K and needs 4x the activations, P5-4) |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16`. NVFP4 holds about 1.7x the tokens of FP8 (589,888 against 339,968 at 262K with gdnfp4), prefills as fast or faster (+1 / +6 / +9% at 19K / 73K / 194K, P7-8), and costs a little KL against the BF16 original (0.0470 against 0.0445 with FP8 KV); GSM8K, the Japanese set and needle retrieval are the same. BFCL `parallel` is about 3 points lower than FP8 on short prompts and the same after 32K / 96K of agent context (P4-11, P7-8, P7-9) |
 | `WEIGHTS` | `gdnfp4` | `gdnfp4`: GDN projections in NVFP4, attention projections FP8 ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), pinned revision, `scripts/download-weights.sh`; PQ-14). `nvidia`: NVIDIA's checkpoint as is (GDN / attention projections FP8). `quasar`: the QUASAR-QAT checkpoint, every projection NVFP4, weaker at parallel tool calls (`scripts/download-weights.sh --quasar`; its BF16 `lm_head` is replaced by NVIDIA's NVFP4 one through `Q27_LM_HEAD_CKPT`). Or another NVFP4 checkpoint of Qwen3.8-27B on the Hugging Face Hub, e.g. a fine-tune: `ORG/NAME` (its main branch) or `ORG/NAME@REVISION`, downloaded with `scripts/download_weights.py --weights ORG/NAME` (which first checks that the engine takes it) or `scripts/download-weights.sh --repo ORG/NAME` (see [Other checkpoints](#other-checkpoints)). Or a model directory inside the container. From Python: `qwen27b.weights.engine_target(...)`; scripts take `--weights` |
-| `SPEC` | `dflash2` | `dflash2` (speculative decoding with the DFlash2 draft) or `none` |
+| `SPEC` | `dflash2` | `dflash2` (speculative decoding with the DFlash2 draft), `dspine` (the DSpine draft, `tencent/Qwen3.8-27B-DSpine-b16`: blocks of 16) or `none` |
+| `Q27_DRAFT_BLOCK` | `16` | DSpine: rows of a single sequence's draft block (the last token and the drafted ones), 2..16 (DSpine was trained on 16; fewer rows verify faster). Batched steps (several sequences decoding) always draft 8 per sequence |
+| `Q27_DRAFT_WINDOW` | `8192` | DSpine: the draft's context window (its attention and context ring), 256..8192. The ring takes 160 MiB per sequence at 8,192 (DFlash2: 40 MiB at its 2,048) |
 | `Q27_DRAFT_QUANT` | `fp4` | Draft linear layers: `fp4`, `fp8` or `bf16` (same acceptance, FP4 is fastest) |
 | `Q27_DRAFT_VOCAB` | `bench/draft-vocab/vocab-128k.txt` | Candidate vocabulary of the draft (`tools/draft_vocab.py`); `none` for the full vocabulary |
 | `STATE_HOST_CACHE` | 4 | GiB of pinned host memory for prefix-cache checkpoints (4 = 21 checkpoints; 0 disables the cache; the server sets 4 when unset, the engine library defaults to 0). The slots are not allocated at startup (pinning 4 GiB takes about 1.8 s on WSL2): one by one while the server is idle, or when a checkpoint needs one |
@@ -236,7 +238,7 @@ variables:
 | --- | --- | --- |
 | `weights` | `WEIGHTS` | `gdnfp4`, `nvidia`, `quasar` (those downloaded), or the model directory the service started with |
 | `kv_dtype` | `KV_DTYPE` | `nvfp4`, `fp8`, `bf16` |
-| `spec` | `SPEC` | `dflash2`, `none` |
+| `spec` | `SPEC` | `dflash2`, `dspine`, `none` |
 | `vision` | `VISION` | `host`, `fp8`, `bf16`, `off` |
 | `max_seqs` | `MAX_SEQS` | 1 to 8 |
 | `max_tokens` | `MAX_TOKENS` | 2,048 to 262,144 (lowered to what the budget holds, `MAX_TOKENS_FIT`) |
