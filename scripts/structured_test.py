@@ -51,6 +51,9 @@ CASES = [  # (name, prompt, spec)
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gen", type=int, default=200)
+    ap.add_argument("--kv-dtype", default="nvfp4", choices=["bf16", "fp8", "nvfp4"],
+                    help="KV cache (the server's default; with bf16 / fp8 a verify block over 8 rows, DSpine's, is not bit-identical to decode)")
+    ap.add_argument("--draft", choices=["dspine", "dflash2"], help="draft model (default $SPEC, else dspine as the server)")
     ap.add_argument("--weights", default="nvidia", help="weight profile: nvidia | gdnfp4 | quasar | a model directory")
     ap.add_argument("--speed", action="store_true", help="also time the steps with and without the masks")
     args = ap.parse_args()
@@ -62,11 +65,11 @@ def main():
 
     import structured
     from q27lib import Engine
-    from qwen27b.weights import DFLASH2, TARGET, engine_target, snapshot
+    from qwen27b.weights import TARGET, draft_snapshot, engine_target, snapshot
     from worker import write_mask, write_masks
 
     tok = AutoTokenizer.from_pretrained(snapshot(*TARGET))
-    eng = Engine(engine_target(args.weights), max_tokens=4096, draft=snapshot(*DFLASH2))
+    eng = Engine(engine_target(args.weights), max_tokens=4096, kv_dtype=args.kv_dtype, draft=draft_snapshot(args.draft))
     eos = {tok.convert_tokens_to_ids("<|im_end|>"), tok.convert_tokens_to_ids("<|endoftext|>")}
     think_end = tok.convert_tokens_to_ids("</think>")
     lltok = llguidance.LLTokenizer(str(pathlib.Path(snapshot(*TARGET)) / "tokenizer.json"),
@@ -138,8 +141,8 @@ def main():
                         return None, None, steps
                     live = m
                     eng.spec_set_masked()
-            if len(out) >= args.gen:
-                return out, False, steps
+            if len(out) >= args.gen:  # (a step may give up to a block of tokens past the limit)
+                return out[:args.gen], False, steps
             if live is not None:
                 write_masks(eng, live, eng.spec_draft(), 0, eos)
             toks = eng.spec_step(ahead=ahead)
@@ -170,7 +173,7 @@ def main():
         ids = chat(prompt)
         p, pd = plain(ids, sp)
         s, sd, steps = spec(ids, sp)
-        good, text = valid(name, sp, s, sd)
+        good, text = valid(name, sp, s, sd, cut_ok=not pd)  # (cut at --gen like plain: the matcher took its tokens)
         diff = next((i for i, (a, b) in enumerate(zip(p, s)) if a != b), None)
         report(p == s and pd == sd, f"{name}: spec {len(s)} tokens in {steps} steps, plain {len(p)}: "
                + ("the same" if p == s else f"differ at {diff}"))

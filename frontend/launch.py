@@ -13,7 +13,7 @@ import multiprocessing as mp
 import os
 import threading
 
-from qwen27b.paths import DRAFTS, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
+from qwen27b.paths import DFLASH2, DRAFTS, DSPINE, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
 from tokenizer import fingerprint
 
 CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dspine", "dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
@@ -44,11 +44,27 @@ def set_engine_env(root):
         os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
 
 
+def downloaded(pin):
+    try:
+        return (snapshot(*pin) / "config.json").is_file()
+    except FileNotFoundError:
+        return False
+
+
+def default_spec():
+    """SPEC, else dspine; dflash2 when only DFlash2 is downloaded (a checkout updated from before DSpine became the
+    default, whose weights folder has DFlash2 alone: the server still starts, and logs how to get DSpine)."""
+    spec = os.environ.get("SPEC")
+    if spec:
+        return spec
+    return "dflash2" if not downloaded(DSPINE) and downloaded(DFLASH2) else "dspine"
+
+
 def env_settings():
     """The start settings from the variables, by default the server's."""
     env = os.environ.get
     budget = env("VRAM_BUDGET_GIB")
-    return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": env("SPEC", "dspine"),
+    return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": default_spec(),
             "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 8)), MAX_SEQS)),
             "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_budget_gib": float(budget) if budget else None}
 

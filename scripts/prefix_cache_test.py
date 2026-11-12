@@ -25,6 +25,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gen", type=int, default=48)
     ap.add_argument("--kv-fp8", action="store_true")
+    ap.add_argument("--draft", choices=["dspine", "dflash2"], help="draft model (default $SPEC, else dspine as the server)")
     ap.add_argument("--kv-dtype", choices=["bf16", "fp8", "nvfp4"], help="overrides --kv-fp8")
     ap.add_argument("--weights", default="nvidia", help="weight profile: nvidia | gdnfp4 | quasar | a model directory")
     args = ap.parse_args()
@@ -32,9 +33,9 @@ def main():
     os.environ.setdefault("CHECKPOINT_INTERVAL", "1024")
 
     from q27lib import Engine
-    from qwen27b.weights import DFLASH2, engine_target, snapshot
+    from qwen27b.weights import draft_snapshot, engine_target, snapshot
 
-    eng = Engine(engine_target(args.weights), max_tokens=8192, kv_fp8=args.kv_fp8, kv_dtype=args.kv_dtype, draft=snapshot(*DFLASH2))
+    eng = Engine(engine_target(args.weights), max_tokens=8192, kv_fp8=args.kv_fp8, kv_dtype=args.kv_dtype, draft=draft_snapshot(args.draft))
     prompts = [json.loads(line)["ids"] for line in open(ROOT / "bench/golden/prompts.jsonl")]
     base = max(prompts, key=len)
     # The longest prompt that differs from base in its first 64 tokens (several share a document).

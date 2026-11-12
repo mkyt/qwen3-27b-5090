@@ -40,6 +40,11 @@ def snapshot(repo: str, rev: str) -> pathlib.Path:
     return path
 
 
+def draft_snapshot(spec: str | None = None) -> pathlib.Path:
+    """The draft checkpoint of a SPEC value (dspine | dflash2; default $SPEC, else dspine, as the server)."""
+    return snapshot(*DRAFTS[spec or os.environ.get("SPEC") or "dspine"])
+
+
 PROFILES = ("gdnfp4", "nvidia", "quasar")
 # Another checkpoint of the model on the Hugging Face Hub, e.g. a fine-tune quantized like NVIDIA's (modelopt) or
 # QUASAR (compressed-tensors): "org/name" (its main branch) or "org/name@revision" (a commit, branch or tag).

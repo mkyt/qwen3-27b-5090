@@ -11,7 +11,7 @@ also saves its image embeddings (cache/vision/<case>.pt) for the engine's vision
     docker compose --profile dev run --rm dev python scripts/vision_check.py spec --tokens 128
     docker compose --profile dev run --rm dev python scripts/vision_check.py bench --out bench/results/<stamp>-vision.json
 
-`spec` checks that greedy speculative decoding (DFlash2) after an image prompt gives the plain greedy tokens
+`spec` checks that greedy speculative decoding (the --draft model) after an image prompt gives the plain greedy tokens
 (the verify rows rotate at index + the M-RoPE delta). `bench` times the engine's vision tower per image size (random pixels; median of 5 after a warm-up).
 """
 
@@ -148,11 +148,11 @@ def cmd_spec(args, tok, proc):
 
     from q27lib import Engine
     from qwen27b.vision import image_token_ids
-    from qwen27b.weights import DFLASH2, TARGET, snapshot
+    from qwen27b.weights import TARGET, draft_snapshot, snapshot
 
     os.environ.setdefault("VISION", "bf16")
     os.environ["Q27_SKINNY_EXACT"] = "1"  # (verify-sized GEMMs with the decode summation order, as bench_spec.py)
-    eng = Engine(snapshot(*TARGET), max_tokens=8192, kv_dtype=args.kv_dtype, draft=snapshot(*DFLASH2))
+    eng = Engine(snapshot(*TARGET), max_tokens=8192, kv_dtype=args.kv_dtype, draft=draft_snapshot(args.draft))
     ok = True
     for name in args.cases:
         ids, spans, pv, grid = build(name, tok, proc)
@@ -224,6 +224,7 @@ def main():
     ap.add_argument("--cases", nargs="+", default=list(CASES))
     ap.add_argument("--tokens", type=int, default=32, help="greedy tokens to generate")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--draft", choices=["dspine", "dflash2"], help="draft model (default $SPEC, else dspine as the server)")
     ap.add_argument("--kv-dtype", default="fp8")
     ap.add_argument("--prefill-chunk", type=int, default=2048, help="engine: prefill chunk (chunks cut images)")
     ap.add_argument("--engine-embeds", action="store_true",

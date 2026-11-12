@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT / "reference"))
 
 import structured  # noqa: E402
 import worker  # noqa: E402
-from launch import ENGINE_ENV_DEFAULTS, Launch, env_settings, model_dir, set_engine_env  # noqa: E402,F401
+from launch import ENGINE_ENV_DEFAULTS, Launch, default_spec, env_settings, model_dir, set_engine_env  # noqa: E402,F401
 from stats import HUB, request_meta  # noqa: E402
 from chat import (MARKS, STOP_REASON, THINK_END, AnthropicError, OutputParser, _partial_suffix, mark_strings,  # noqa: E402,F401
                   anthropic_messages, anthropic_template_kwargs, forced_call, new_id, normalize_messages,
@@ -1608,7 +1608,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", 262144)))
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
     ap.add_argument("--kv-dtype", default=env("KV_DTYPE", "nvfp4"), choices=["bf16", "fp8", "nvfp4"])
-    ap.add_argument("--spec", default=env("SPEC", "dspine"), choices=["dspine", "dflash2", "none"])
+    ap.add_argument("--spec", default=default_spec(), choices=["dspine", "dflash2", "none"])
     ap.add_argument("--weights", default=env("WEIGHTS", "gdnfp4"),
                     help="gdnfp4: GDN projections in NVFP4, attention FP8 (Phase Q, scripts/build-gdnfp4.sh); nvidia: "
                          "FP8 GDN / attention projections; quasar: every linear in NVFP4; or a model directory")
@@ -1645,6 +1645,11 @@ def main():
                                max_seqs=max(1, min(args.max_seqs, 8)), max_tokens=args.max_tokens),
                     tokenizer=fingerprint(path))
     HUB.start()
+    if not os.environ.get("SPEC") and args.spec == "dflash2":  # (default_spec: DSpine is not downloaded)
+        note = ("the DSpine draft (the default) is not downloaded, so the DFlash2 draft is used: "
+                "scripts/download-weights.sh gets DSpine (4.1 GB), or set SPEC=dflash2 to keep DFlash2")
+        log(note)
+        HUB.add_log("admin", None, note, level="warn")
     engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0",
                           idle_unload=max(0.0, args.idle_unload))
     HUB.engine_idle = engine.idle_state

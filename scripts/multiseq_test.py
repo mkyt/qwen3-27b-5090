@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "reference"))
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gen", type=int, default=96)
+    ap.add_argument("--draft", choices=["dspine", "dflash2"], help="draft model (default $SPEC, else dspine as the server)")
     ap.add_argument("--kv-dtype", default="fp8", choices=["bf16", "fp8", "nvfp4"])
     ap.add_argument("--weights", default="nvidia", help="weight profile: nvidia | gdnfp4 | quasar | a model directory")
     ap.add_argument("--seed", type=int, default=1)
@@ -37,9 +38,9 @@ def main():
     os.environ.setdefault("KV_POOL_TOKENS", "24576")  # (part 2 fills it; part 1 fits)
 
     from q27lib import Engine, KvFull
-    from qwen27b.weights import DFLASH2, TARGET, engine_target, snapshot
+    from qwen27b.weights import TARGET, draft_snapshot, engine_target, snapshot
 
-    eng = Engine(engine_target(args.weights), max_tokens=16384, kv_dtype=args.kv_dtype, draft=snapshot(*DFLASH2))
+    eng = Engine(engine_target(args.weights), max_tokens=16384, kv_dtype=args.kv_dtype, draft=draft_snapshot(args.draft))
     chunk = 2048
     prompts = [json.loads(line)["ids"] for line in open(ROOT / "bench/golden/prompts.jsonl")]
     by_len = sorted(prompts, key=len)

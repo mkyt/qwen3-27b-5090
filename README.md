@@ -142,6 +142,8 @@ first in either case.
 
 - **What to expect:** the weights in `./hf` stay where they are and are not downloaded again. Replacing the container
   ends the requests in progress and reloads the engine.
+  Updating from a version before DSpine became the default draft: run `scripts/download-weights.sh` to add it (4.1 GB);
+  until then the server keeps using DFlash2 and says so in its log.
 - **Which version is running:** this prints the commit of the image you have, to compare with the
   [commits](https://github.com/mkyt/qwen3-27b-5090/commits/main). (The output is empty for an image built here with
   `--build`.)

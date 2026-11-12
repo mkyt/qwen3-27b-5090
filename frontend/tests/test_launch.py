@@ -180,3 +180,21 @@ def test_tokenizer_template_of_other_weights():
     with pytest.raises(Exception, match="System message must be at the beginning"):
         Tokenizer(own).render(msgs)
     assert mixed.encode("na\u0308ive text") == Tokenizer(own).encode("na\u0308ive text")  # (a combining mark)
+
+
+def test_default_spec_falls_back_to_a_downloaded_dflash2(monkeypatch):
+    # A checkout updated from before DSpine became the default has DFlash2 alone: the server still starts.
+    have = set()
+    monkeypatch.setattr(launch, "downloaded", lambda pin: pin in have)
+    monkeypatch.delenv("SPEC", raising=False)
+    assert launch.default_spec() == "dspine"  # (nothing downloaded: the error names DSpine)
+    have.add(launch.DFLASH2)
+    assert launch.default_spec() == "dflash2"
+    have.add(launch.DSPINE)
+    assert launch.default_spec() == "dspine"
+    monkeypatch.setenv("SPEC", "")  # (compose.yaml passes an empty SPEC when unset)
+    assert launch.default_spec() == "dspine"
+    have.discard(launch.DSPINE)
+    monkeypatch.setenv("SPEC", "dspine")  # (asked for: no fallback)
+    assert launch.default_spec() == "dspine"
+    assert launch.env_settings()["spec"] == "dspine"
