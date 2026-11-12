@@ -21,6 +21,9 @@ on:
 
 permissions:
   contents: write  # (the Release of a tag)
+  id-token: write  # (the attestations: a Sigstore signing certificate from the workflow's OIDC token)
+  attestations: write
+  artifact-metadata: write
 
 env:
   CUDA_VERSION: 13.3.1
@@ -86,6 +89,14 @@ jobs:
           if ($errs) { throw "update.ps1: $errs" }
           if ((Get-Content "$app\VERSION") -ne $env:VERSION) { throw "app\VERSION is not $env:VERSION" }
           (Get-FileHash -Algorithm SHA256 "dist\$env:PKG.zip").Hash.ToLower() + "  $env:PKG.zip" | Set-Content -Encoding ascii "dist\$env:PKG.zip.sha256"
+      # Build provenance (SLSA, signed through Sigstore) for the zip and the two binaries built here, so a download can
+      # be checked against this workflow and commit: gh attestation verify <file> --repo mkyt/qwen3-27b-5090
+      - uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/${{ env.PKG }}.zip
+            dist/qwen3-27b-5090-windows-x64/qwen3-27b-tray.exe
+            dist/qwen3-27b-5090-windows-x64/app/engine/build/q27.dll
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PKG }}

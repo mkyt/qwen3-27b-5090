@@ -155,6 +155,14 @@ first in either case.
   docker image inspect ghcr.io/mkyt/qwen3-27b-5090:latest --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
   ```
 
+- **Where the image comes from:** from v0.5.0, every image that GitHub Actions publishes carries a signed build
+  provenance attestation, which the [GitHub CLI](https://cli.github.com/) checks against this repository (it prints
+  the workflow and commit that built it):
+
+  ```bash
+  gh attestation verify oci://ghcr.io/mkyt/qwen3-27b-5090:latest --repo mkyt/qwen3-27b-5090
+  ```
+
 - **Going back to another version:** set `SERVE_TAG` to a release version or `sha-<commit>` (the
   [package](https://github.com/mkyt/qwen3-27b-5090/pkgs/container/qwen3-27b-5090) lists them) on both commands. It only
   applies to the command it is on, so a later `docker compose up -d serve` without it uses `latest` again.
@@ -185,7 +193,10 @@ the state, and its menu starts and stops the server, changes its settings, opens
 the start at logon. The
 server then takes no VRAM until the first request and frees it after 30 minutes without one
 ([docs/configuration.md](docs/configuration.md#tray-app)). The program is not signed, so Windows may warn about it at the
-first start (compare the zip's SHA-256 with the release's).
+first start. To check the download, compare the zip's SHA-256 with the release's, or, from v0.5.0, check its signed
+build provenance with the [GitHub CLI](https://cli.github.com/): `gh attestation verify
+qwen3-27b-5090-v0.5.0-windows-x64.zip --repo mkyt/qwen3-27b-5090` (also for `qwen3-27b-tray.exe` and
+`app\engine\build\q27.dll` in it).
 
 Or run `start.cmd`, which keeps the server in a console window and loads the engine at once. The first start downloads
 the weights (23 GB, into the folder; an interrupted download resumes), then the server listens on http://127.0.0.1:8000

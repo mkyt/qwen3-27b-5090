@@ -20,6 +20,9 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write  # (the attestation: a Sigstore signing certificate from the workflow's OIDC token)
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   build:
@@ -44,7 +47,8 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
             type=semver,pattern={{version}}
-      - uses: docker/build-push-action@v7
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -52,3 +56,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           # (the largest CUDA files take a few GB of RAM each to compile; the runner has 16 GB)
           build-args: BUILD_JOBS=3
+      # Build provenance (SLSA, signed through Sigstore) of the pushed image, stored with it in the registry:
+      # gh attestation verify oci://ghcr.io/mkyt/qwen3-27b-5090:<tag> --repo mkyt/qwen3-27b-5090
+      - uses: actions/attest@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
