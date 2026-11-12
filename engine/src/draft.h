@@ -31,6 +31,10 @@ constexpr int kLayers = 5;
 constexpr int kBlock = 8;          // anchor + 7 drafted tokens
 constexpr int kDraft = kBlock - 1;
 constexpr int kWindow = 2048;      // sliding window (window_left = 2047) and the context ring
+// The context ring has kRingPad slots past the window: a step launched ahead and dropped (spec_flush) has
+// written up to a block of rows past the position, which must not land on the slots of positions still in
+// the window (position p is slot p % (window + kRingPad)).
+constexpr int kRingPad = 16;
 constexpr int kGroups = 320;       // conv groups of 16 channels
 constexpr int kTaps = 2;
 constexpr int kCoef = 2 * kTaps * kGroups;  // kernel_projection outputs: [side][tap][group]

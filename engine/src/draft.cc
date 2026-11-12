@@ -182,7 +182,7 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
   off_.o32 = f32("attention out", B * kHeads * kHeadDim);
   off_.y = f32("y", B * kHidden);
   off_.gu = f32("gate_up", B * 2 * kInter);
-  ring_bytes_ = size_t(window_) * kKvHeads * kHeadDim * 2;
+  ring_bytes_ = size_t(window_ + kRingPad) * kKvHeads * kHeadDim * 2;  // (kRingPad: a dropped step's rows)
   off_.ring_k = act.add("draft ring K", ring_bytes_ * kLayers);
   off_.ring_v = act.add("draft ring V", ring_bytes_ * kLayers);
   off_.ctx = f32("ctx", int64_t(R) * kHidden);

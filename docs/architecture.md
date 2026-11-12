@@ -138,7 +138,7 @@ At startup the engine computes a plan, allocates each pool once and never calls 
   5. **The KV pool**: everything left, in pages of 64 tokens. With the defaults (`gdnfp4`, NVFP4 KV,
      `MAX_SEQS=8`, `VISION=host`) it holds 605,504 tokens.
 - **Parking areas live inside the KV pool.** Each request that is not running keeps its GDN, convolution and
-  draft state (189.6 MiB) in a parking area; there are `MAX_SEQS - 1` of them. While an area is unused, its pages
+  draft state (189.9 MiB) in a parking area; there are `MAX_SEQS - 1` of them. While an area is unused, its pages
   hold KV cache like any other page. The KV pool is laid out page-major in blocks (a block holds all 32 slices,
   16 layers x K / V, of G consecutive pages, with G = 57 for NVFP4 so that a slice is at least 2 MiB), so a run of
   consecutive pages is also contiguous memory and a parking area is simply the top N pages of the pool
@@ -290,7 +290,7 @@ At 19K tokens prefill runs at 11,295 tok/s; at 194K, 5,875 tok/s, where attentio
 In a hybrid model, attention's KV cache can be reused from any position, but the GDN state exists only where it
 was saved. The cache is therefore a list of **checkpoints**: a token sequence `[0, pos)`, the KV pages that cover
 it (reference-counted, shared between checkpoints of the same conversation) and a copy of the state (GDN in FP32,
-convolution, the draft's context ring: 189.6 MiB).
+convolution, the draft's context ring: 189.9 MiB).
 
 - **Where checkpoints are taken**: at message boundaries the server marks (the end of the first message, which
   holds the system prompt and tools; the starts of the last message and of the generation prompt), where the prompt diverges from the previous

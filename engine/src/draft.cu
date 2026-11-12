@@ -317,7 +317,7 @@ __global__ void __launch_bounds__(kBlock * 32) attn_kernel(const float* q, const
     if (j < nctx) {
       const int p = pos - nctx + j;
       if (p < lo) continue;
-      const int64_t idx = (int64_t(p % kWindow) * kKvHeads + g) * kHeadDim + d0;
+      const int64_t idx = (int64_t(p % (kWindow + kRingPad)) * kKvHeads + g) * kHeadDim + d0;
       uint2 kr = *reinterpret_cast<const uint2*>(ring_k + idx), vr = *reinterpret_cast<const uint2*>(ring_v + idx);
       const __nv_bfloat162* kh = reinterpret_cast<const __nv_bfloat162*>(&kr);
       const __nv_bfloat162* vh = reinterpret_cast<const __nv_bfloat162*>(&vr);
@@ -372,8 +372,8 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float a, float b) {
   return *reinterpret_cast<uint32_t*>(&v);
 }
 
-// kT: rows of a block (8: DFlash2 and batched steps; 16: DSpine), 2 warps per 8 rows. window: the context
-// ring's size (positions >= pos + t - (window - 1) are seen); causal: block row t sees block keys 0..t only
+// kT: rows of a block (8: DFlash2 and batched steps; 16: DSpine), 2 warps per 8 rows. window: positions
+// >= pos + t - (window - 1) are seen (the ring has window + kRingPad slots); causal: block row t sees block keys 0..t only
 // (DSpine) instead of all of them.
 template <bool kBatch = false, int kT = kBlock>
 __global__ void __launch_bounds__(kT * 8) attn_tc_kernel(const float* q, const float* kb, const float* vb,
@@ -417,7 +417,7 @@ __global__ void __launch_bounds__(kT * 8) attn_tc_kernel(const float* q, const f
         const uint32_t dk = uint32_t(__cvta_generic_to_shared(&sk[b][kr][col]));
         const uint32_t dv = uint32_t(__cvta_generic_to_shared(&sv[b][kr][col]));
         if (j < k1 && j < nctx) {
-          const int64_t idx = (int64_t((pos - nctx + j) % window) * kKvHeads + g) * kHeadDim + col;
+          const int64_t idx = (int64_t((pos - nctx + j) % (window + kRingPad)) * kKvHeads + g) * kHeadDim + col;
           cp_async16z(dk, ring_k + idx, true);
           cp_async16z(dv, ring_v + idx, true);
         } else if (j < k1) {  // a block key (fp32)
@@ -672,7 +672,7 @@ __global__ void __launch_bounds__(kHeadDim) ctx_write_kernel(const float* kv, co
   const int pos = *pos_dev + pos_add + rl;
   const float* row = kv + int64_t(r) * 2 * kKvHeads * kHeadDim;
   const float x = head_norm_rope(row[h * kHeadDim + d], k_norm, pos, xs, red);
-  const int64_t idx = (int64_t(pos % window) * kKvHeads + h) * kHeadDim + d;
+  const int64_t idx = (int64_t(pos % (window + kRingPad)) * kKvHeads + h) * kHeadDim + d;
   ring_k[idx] = __float2bfloat16(x);
   ring_v[idx] = __float2bfloat16(row[kKvHeads * kHeadDim + h * kHeadDim + d]);
 }

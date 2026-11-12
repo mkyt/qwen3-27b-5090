@@ -1444,7 +1444,8 @@ void Model::spec_flush() {
     // A step launched ahead (spec_step) is dropped. It began by replaying the last returned step's
     // commit into the other state buffer and the conv state, and flipped sbuf, as a flush would; its
     // own rows are discarded: nothing pending, the position back to the host's. (Its KV, draft context
-    // and history writes lie past the position and are overwritten later.)
+    // and history writes lie past the position and are overwritten later; the draft's context ring has
+    // ddims::kRingPad slots past its window for them.)
     Q27_CUDA(cudaStreamSynchronize(s_));
     spec_inflight_ = false;
     set_sbuf(sbuf_host_ ^ 1);
