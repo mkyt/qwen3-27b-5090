@@ -1513,8 +1513,14 @@ constexpr int kT8Smem = kT8Raw * 2 * kTcChunk * kKvRowBytes<KV> + 2 * kT8Conv<KV
 // kWide: up to 6 row tiles (T <= 16: DSpine's verify), launch bounds for 6 compute warps (other instances keep the
 // register budget of 4).
 constexpr int kT8MaxT = 16, kT8WideWarps = kT8MaxT * 6 / kT8Rows;
+#ifndef Q27_X_T8WPROD
+#define Q27_X_T8WPROD 2
+#endif
+// Producer threads: kWide has 2 producer warps (8 warps, 2 per SMSP: the full 255 registers, no spill).
+template <bool kWide>
+constexpr int kT8Prod = kWide ? Q27_X_T8WPROD * 32 : kTcProd;
 template <class KV, bool kBatch = false, bool kWide = false>
-__global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kTcProd, 1) attention_tc8_kernel(const float* q, const int32_t* pos_dev, int T,
+__global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod<kWide>, 1) attention_tc8_kernel(const float* q, const int32_t* pos_dev, int T,
                                                                           const KV* kc, const KV* vc,
                                                                           const int32_t* page_table, int splits,
                                                                           DecPartial part, SeqLanes lanes) {
@@ -1531,11 +1537,12 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kTcProd
   constexpr int kUnits = kTcChunk * (kRowBytes / 16);
   constexpr int kStageBytes = 2 * kTcChunk * kRowBytes;
   constexpr int kR = kT8Raw, kAhead = kT8Ahead<KV>;
+  constexpr int kProd = kT8Prod<kWide>;
   extern __shared__ __align__(128) uint8_t tc_smem[];
   const uint32_t sbase = uint32_t(__cvta_generic_to_shared(tc_smem));
   const uint32_t cbase = sbase + kR * kStageBytes;
   const int g = blockIdx.x, split = blockIdx.y;
-  const int ncw = blockDim.x / 32 - kTcProdWarps;
+  const int ncw = blockDim.x / 32 - kProd / 32;
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int pos0 = *pos_dev, kmax = pos0 + T;
   const int nchunks = (kmax + kTcChunk - 1) / kTcChunk;
@@ -1551,9 +1558,9 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kTcProd
       const int c = split + i * splits;
       const uint32_t st = sbase + (i % kR) * kStageBytes;
 #pragma unroll
-      for (int j = 0; j < (kUnits + kTcProd - 1) / kTcProd; j++) {
-        const int u = ptid + j * kTcProd, r = u / (kRowBytes / 16), col = u % (kRowBytes / 16);
-        if (kUnits % kTcProd != 0 && u >= kUnits) break;
+      for (int j = 0; j < (kUnits + kProd - 1) / kProd; j++) {
+        const int u = ptid + j * kProd, r = u / (kRowBytes / 16), col = u % (kRowBytes / 16);
+        if (kUnits % kProd != 0 && u >= kUnits) break;
         const int key = c * kTcChunk + r;
         if (phase == 0 && key >= pos0) continue;
         if (phase == 1 && key < pos0) continue;
@@ -1581,12 +1588,12 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kTcProd
           cp_wait<0>();
         else
           cp_wait<kAhead>();
-        asm volatile("bar.sync 1, %0;" ::"n"(kTcProd));  // every producer's copies of chunk i landed
+        asm volatile("bar.sync 1, %0;" ::"n"(kProd));  // every producer's copies of chunk i landed
         const uint32_t src = sbase + (i % kR) * kStageBytes, slot = cbase + (i % 2) * kT8Conv<KV>;
         uint32_t vraw = src + kTcChunk * kRowBytes;
         if constexpr (kFp4) {
-          fp4_chunk_to_e4m3<kTcChunk, kTcProd>(src, slot, ptid);
-          asm volatile("bar.sync 1, %0;" ::"n"(kTcProd));
+          fp4_chunk_to_e4m3<kTcChunk, kProd>(src, slot, ptid);
+          asm volatile("bar.sync 1, %0;" ::"n"(kProd));
           vraw = slot + kTcChunk * kHeadDim;
         }
         const uint32_t vtbase = slot + kT8Conv<KV> - kFaVtBytes;
@@ -1595,8 +1602,8 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kTcProd
 #endif
         // V^T as in attention_fa_kernel: thread = (4 dims, key group j, half hh).
 #pragma unroll
-        for (int x = 0; x < kHeadDim / 4 * 4 * 2 / kTcProd; x++) {
-          const int u = ptid + x * kTcProd, j = u & 3, rest = u >> 5;
+        for (int x = 0; x < kHeadDim / 4 * 4 * 2 / kProd; x++) {
+          const int u = ptid + x * kProd, j = u & 3, rest = u >> 5;
           const int dg = (rest & 7) * 8 + (u >> 2 & 7), hh = rest >> 3;
           uint32_t w[4];
 #pragma unroll
@@ -2074,7 +2081,7 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
     }();
     (void)init;
     if (tc_f8(kv_type)) {
-      const dim3 block8(tc8_warps(T) * 32 + kTcProd);
+      const dim3 block8(tc8_warps(T) * 32 + (tc8_warps(T) > kT8Grp ? kT8Prod<true> : kTcProd));
       if (kv_type == KvType::NVFP4 && tc8_warps(T) > kT8Grp)
         launch_pdl(attention_tc8_kernel<Fp4Kv, false, true>, grid, block8, kT8Smem<Fp4Kv>, s, q, pos_dev, T,
                    static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part,
