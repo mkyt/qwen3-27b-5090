@@ -1525,7 +1525,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   if (draft_->block() > ddims::kBlock) spec_smp_.paths = 1;  // (see configure)
   if (spec_smp_.masked) spec_smp_.paths = 1;  // (the host masks a chain's rows)
   // The full block first; the average starts between the thresholds.
-  spec_smp_.block = spec_smp_.block_next = draft_->block();
+  spec_smp_.block = spec_smp_.block_next = spec_smp_.block_due = draft_->block();
   spec_smp_.accept_ema = 0.5f * (adapt_up_ + adapt_down_);
   return first;
 }
@@ -1596,8 +1596,9 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
 int Model::spec_step(int32_t* out, bool allow_ahead) {
   Q27_CHECK(draft_, "spec_step: no draft model loaded");
   batch_exit();
-  // A width change waits until no step is in flight (that step was launched with the old one).
-  if (!spec_inflight_ && spec_smp_.block_next != spec_smp_.block) spec_smp_.block = spec_smp_.block_next;
+  // A step not launched ahead takes the width decided after the step before the last (block_due): a step launched
+  // ahead could only use that one, and the widths must not depend on it (SpecSampling).
+  if (!spec_inflight_) spec_smp_.block = spec_smp_.block_due;
   const SpecSampling smp = spec_smp_;
   Q27_CHECK(pos_ + spec_rows(smp) <= max_pages_ * kPageTokens, "sequence longer than max_tokens");
   // Pages for this step's rows and for the one launched ahead (the position advances by <= 8).
@@ -1712,6 +1713,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
 // The adaptive verify width: the moving average of the tokens per step picks the next block (with hysteresis).
 void Model::spec_adapt(SpecSampling& smp, int n) const {
   if (!adapt_on_ || smp.masked) return;
+  smp.block_due = smp.block_next;
   smp.accept_ema += adapt_alpha_ * (float(n) - smp.accept_ema);
   const int full = draft_->block();
   if (smp.block_next == full && smp.accept_ema < adapt_down_)
@@ -1783,7 +1785,7 @@ void Model::spec_set_masked(int area) {
   Q27_CHECK(area < 0 || parked_[area].used, "spec_set_masked: no such sequence");
   if (area < 0) spec_flush();
   smp.masked = true, smp.paths = 1;
-  smp.block = smp.block_next = draft_->block();  // (a masked chain keeps the full block: the host masks its rows)
+  smp.block = smp.block_next = smp.block_due = draft_->block();  // (a masked chain keeps the full block: the host masks its rows)
   smp.stop[2] = -1;  // (the reasoning has ended)
 }
 

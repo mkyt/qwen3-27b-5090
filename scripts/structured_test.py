@@ -134,6 +134,8 @@ def main():
         toks = [t]
         while True:
             for i, t in enumerate(toks):
+                if len(out) >= args.gen:  # (a step may give up to a block of tokens past the limit: cut there like plain)
+                    break
                 if take(live, out, [t]):
                     return out, True, steps
                 if live is None and t == after:  # (until: the step ends there)
@@ -141,7 +143,7 @@ def main():
                         return None, None, steps
                     live = m
                     eng.spec_set_masked()
-            if len(out) >= args.gen:  # (a step may give up to a block of tokens past the limit)
+            if len(out) >= args.gen:
                 return out[:args.gen], False, steps
             if live is not None:
                 write_masks(eng, live, eng.spec_draft(), 0, eos)

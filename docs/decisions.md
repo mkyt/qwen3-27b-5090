@@ -105,6 +105,14 @@ gate without an explicit decision, recorded below with its numbers.
   decode +0.2 to 1.4%. Golden on the decode path against the BF16 original: KL 0.0344 -> 0.0359; needle retrieval
   at 256K 56 -> 57 of 64. With the FP8 KV cache the verify is already near its read time and gains 0 to 2%, so it
   is not the default there (`Q27_ATTN_TC_F8=1`). Rows of one token stay bit-identical across 1 to 8 tokens.
+- **P3-36: the 16-row verify attention (DSpine).** A verify of 11 to 16 rows needs 5 or 6 compute warps of 16 rows.
+  With 4 producer warps that instance was capped at 168 registers (3 warps per SMSP) and spilled; with 2 producer
+  warps it keeps 255 registers: one NVFP4 layer at 32K keys, 16 rows, 93.9 -> 50.2 us (8 rows: 44.4 us), DSpine's
+  step on code at 32K 15.02 -> 14.50 ms with the same tokens. The FP8 MMAs are now also the default with the FP8 KV
+  cache: the BF16 / F16 kernel took a 16-row verify as two launches of 8 rows (106 vs 63 us per layer at 32K), while
+  1 and 8 rows are as fast or faster (golden on the decode path unchanged: KL 0.0336 -> 0.0332, P7-7).
+  The adaptive verify width now switches at a step that does not depend on the scheduling (a step launched ahead or
+  dropped by a parked sequence), so a sequence takes the same steps alone or interleaved with others.
 - **P5-11 for decode: not adopted.** The block-scaled FP8 MMA is twice as fast for prefill, but decode is
   bandwidth-bound and gained nothing, so the skinny GEMMs kept the plain FP8 MMA.
 

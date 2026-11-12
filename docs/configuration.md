@@ -136,7 +136,7 @@ everywhere above.
 | --- | --- | --- |
 | `Q27_ATTN_FP8` | empty | Prefill attention MMAs, read per call. Empty: `2` with FP8 KV, `3` with NVFP4 KV (`2` without the staging buffer). FP8 KV: `2` QK^T and P·V in FP8, `1` P·V only, `0` BF16. NVFP4 KV: `3` QK^T on native FP4 MMAs (Q quantized to NVFP4, K as cached, V from the E4M3 staging buffer; P7-8), `2` K and V rounded to E4M3 for FP8 MMAs, otherwise exact in f16 |
 | `Q27_ATTN_FP4_STAGE` | 1 | NVFP4 KV prefill: `1` converts the context to an E4M3 staging buffer once per layer and chunk (mode 3: V only, 1 KiB per token of `max_tokens`, 256 MiB at 262K; with `Q27_ATTN_FP8=2` at startup K and V, 2 KiB per token, bit-identical to per-CTA conversion). `0`: convert in every CTA (mode 2). Sized at startup, read per call |
-| `Q27_ATTN_TC_F8` | empty | Decode / verify attention MMAs, read per call. Empty: FP8 with NVFP4 KV (P7-7), `1`: FP8 also with FP8 KV, `0`: BF16 / f16. FP8 means Q in E4M3 with per-row scales, NVFP4 KV re-rounded to E4M3, P in E4M3: 8% faster speculative steps at 131K and at 8 x 32K, no change on golden or needle retrieval |
+| `Q27_ATTN_TC_F8` | empty | Decode / verify attention MMAs, read per call. Empty or `1`: FP8 with FP8 and NVFP4 KV (P7-7; FP8 KV since P3-36), `0`: BF16 / f16 (a 16-row verify then takes two launches with FP8 KV). FP8 means Q in E4M3 with per-row scales, NVFP4 KV re-rounded to E4M3, P in E4M3: 8% faster speculative steps at 131K and at 8 x 32K, no change on golden or needle retrieval |
 
 ## Concurrency
 
@@ -427,7 +427,7 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_DECODE_MEMCPY=1` | Decode inputs and outputs by copies instead of mapped pinned memory |
 | `Q27_ATTN_TC=0` | Decode / verify attention on CUDA cores (tree verification always uses them) |
 | `Q27_ATTN_TC_DEC=0` | Decode (T = 1) attention with one warp per token (same result) |
-| `Q27_ATTN_TC8_GRP=0` | With `Q27_ATTN_TC_F8=1`, compute T <= 2 in one warp instead of four (same result; static) |
+| `Q27_ATTN_TC8_GRP=0` | With the FP8 MMAs (`Q27_ATTN_TC_F8`), compute T <= 2 in one warp instead of four (same result; static) |
 | `Q27_KV_BLOCK=N` | Pages per block of the KV pool (P7-13; default the smallest count whose slice is >= 2 MiB: 57 for NVFP4, 32 for FP8, 16 for BF16). 1 lays pages out one by one (long-context decode 1.5% slower). Read at startup |
 | `Q27_PAGES_HIGH=1` | Hand out KV pages from the top (tests, P7-13): the KV cache then occupies the parking areas, so every park moves pages. Read at startup |
 | `Q27_ATTN_PREFILL_TC=0` | Prefill attention on CUDA cores (static) |

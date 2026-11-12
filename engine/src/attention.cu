@@ -1495,7 +1495,7 @@ __global__ void kv_fp4_to_e4m3_kernel(const Fp4Kv* kc, const Fp4Kv* vc, const in
 // (attention_fa_kernel, mode 2): rows = the 6 T (token, head) pairs, 16 to a compute warp (A fragments:
 // Q in E4M3 with a scale per row), S = Q K^T with K's E4M3 rows (FP8 KV: the staged rows, sw8; NVFP4:
 // rounded to E4M3 by the producers), the softmax in base 2, P x 256 in E4M3 and O += P V with V^T
-// (transposed by the producers, keys in the order of the P fragments). Default for NVFP4 KV (tc_f8).
+// (transposed by the producers, keys in the order of the P fragments). Default for FP8 and NVFP4 KV (tc_f8).
 constexpr int kT8Rows = 16;
 #ifndef Q27_X_T8RAW
 #define Q27_X_T8RAW 3
@@ -2017,8 +2017,8 @@ static int tc8_warps(int T) {
   const int tiles = ceil_div(T * kGqa, kT8Rows);
   return tiles == 1 && grp ? kT8Grp : tiles;
 }
-// Q27_ATTN_TC_F8 (read per launch): unset or empty = on for NVFP4 KV only (P7-7: the verify is MMA-bound
-// there; FP8 KV is near its read bound), 1 = on for FP8 and NVFP4 KV, 0 = off.
+// Q27_ATTN_TC_F8 (read per launch): unset, empty or 1 = on for FP8 and NVFP4 KV (P7-7: the verify is MMA-bound
+// with NVFP4 KV; with FP8 KV, the 16-row verify is one launch instead of two), 0 = off.
 static bool tc_f8(KvType kv_type) {
   static const bool init = [] {
     Q27_CUDA(cudaFuncSetAttribute(attention_tc8_kernel<uint8_t>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2038,7 +2038,7 @@ static bool tc_f8(KvType kv_type) {
   (void)init;
   if (kv_type == KvType::BF16) return false;
   const char* e = getenv("Q27_ATTN_TC_F8");
-  if (!e || !*e) return kv_type == KvType::NVFP4;
+  if (!e || !*e) return true;
   return atoi(e) != 0;
 }
 
@@ -2056,8 +2056,8 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
   // Chains of up to 16 tokens (decode, the chain verify): tensor cores, every chunk read once per 8 tokens.
   // Q27_ATTN_TC=0: the CUDA-core kernel. The split count is fixed per process (bit-identical rows).
   const bool tc_on = !getenv("Q27_ATTN_TC") || atoi(getenv("Q27_ATTN_TC")) != 0;
-  // (FP8 MMAs with NVFP4 KV, tc_f8: chains of up to 16 rows)
-  // (BF16 / FP8 KV: 9..16 rows, DSpine's verify, in two launches of attention_tc_kernel)
+  // (FP8 MMAs with FP8 / NVFP4 KV, tc_f8: chains of up to 16 rows)
+  // (BF16 KV, or FP8 KV with Q27_ATTN_TC_F8=0: 9..16 rows, DSpine's verify, in two launches of attention_tc_kernel)
   const bool tc = tc_on && !tree && T <= kT8MaxT;
   const int tc_splits = getenv("Q27_ATTN_TC_SPLITS") ? atoi(getenv("Q27_ATTN_TC_SPLITS"))
                                                      : std::max(1, g_attn_sms / kKvHeads);
