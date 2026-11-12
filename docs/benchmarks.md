@@ -1,22 +1,22 @@
 # Benchmarks
 
 Speed and quality of the default configuration (`docker compose up -d serve` with no settings changed: weights
-`gdnfp4`, KV cache `nvfp4`, DFlash2 speculative decoding, `MAX_SEQS=8`, `MAX_TOKENS=262144`), and how to reproduce
+`gdnfp4`, KV cache `nvfp4`, DSpine speculative decoding, `MAX_SEQS=8`, `MAX_TOKENS=262144`), and how to reproduce
 each number. The JSON files of the speed numbers are in [results/](results/).
 
-These numbers were measured with the DFlash2 draft, the default until DSpine replaced it (`SPEC=dflash2` reproduces
-them). With DSpine, one request decodes code about 1.2 times and JSON about 1.4 times as fast, prose and Japanese about
-the same at short contexts; at a 32K context prose is about 7% slower and four concurrent requests 1-3% slower
-([decisions.md](decisions.md#speculative-decoding)).
+The speed through the server was measured again when DSpine became the default draft (2026-11-13), together with
+DFlash2, the previous default (`SPEC=dflash2`), on the same build. The in-process table by context length runs
+without speculative decoding and is from 2026-10-11; the comparison with other engines and the power limit section
+keep their own dates.
 
 ## Conditions
 
 | | |
 | --- | --- |
 | GPU | RTX 5090 (32 GB), power limit **400 W** (below the card's default 575 W; every number here is at 400 W) |
-| Host | WSL2 (kernel 6.18), NVIDIA driver 617.42, Docker with the NVIDIA Container Toolkit |
-| Build | the `dev` image: CUDA 13.3 |
-| Date | 2026-10-11 |
+| Host | WSL2 (kernel 6.18), Docker with the NVIDIA Container Toolkit; NVIDIA driver 621.14 (2026-11-13), 617.42 (2026-10-11) |
+| Build | the serving image (CUDA 13.3), code `9e74583` (2026-11-13) |
+| Date | 2026-11-13 through the server; 2026-10-11 in-process and against other engines |
 
 Prefill is power-bound at 400 W: the FP4 / FP8 GEMMs and attention all run at the power limit. The card's default
 575 W limit and the energy per token at both limits are in [Power limit and energy](#power-limit-and-energy).
@@ -29,14 +29,15 @@ Through the server (`scripts/bench_agentic.py --scenarios decode`): three short 
 checkpoint's default sampling (temperature 1.0, top-k 20, top-p 0.95), thinking off, three runs each. Decode tok/s is
 (tokens - 1) / (time of the last token - time of the first).
 
-| Prompt | Decode tok/s |
-| --- | ---: |
-| code | 328 / 395 / 386 |
-| JSON | 500 / 497 / 505 |
-| prose | 267 / 258 / 258 |
+| Prompt | DSpine (default), decode tok/s | DFlash2 | DSpine / DFlash2 (median) |
+| --- | ---: | ---: | ---: |
+| code | 389 / 457 / 410 | 325 / 392 / 382 | 1.07 |
+| JSON | 734 / 663 / 674 | 496 / 493 / 501 | 1.36 |
+| prose | 267 / 263 / 258 | 265 / 257 / 256 | 1.02 |
 
 The speed depends on how many draft tokens are accepted, which depends on the text: structured output goes faster
-than prose. Without speculative decoding (`SPEC=none`) one request decodes at about 93 tok/s at a 19K-token context.
+than prose. DSpine drafts blocks of 16 tokens and verifies 16 or 8 rows depending on how many it has been getting
+accepted, so it gains most where long runs of tokens are predictable (JSON, code). Without speculative decoding (`SPEC=none`) one request decodes at about 93 tok/s at a 19K-token context.
 
 ### Prefill and decode by context length
 
@@ -56,13 +57,16 @@ Through the server (`scripts/bench_concurrent.py`): C requests start together on
 distinct seeds, 4,096 output tokens each, the default sampling. "Sum" adds each stream's own decode rate; "wall"
 divides all output tokens by the time from the start to the last response. Two runs each.
 
-| C | Sum tok/s | Per request (p50) | Wall tok/s |
-| ---: | ---: | ---: | ---: |
-| 1 | 312–313 | 312–313 | 311 |
-| 4 | 935–936 | 233 | 913–914 |
-| 8 | 1,395–1,397 | 172 | 1,334–1,337 |
+| C | Sum tok/s | Per request (p50) | Wall tok/s | DFlash2, sum tok/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 355–356 | 355–356 | 354 | 310 |
+| 4 | 892–893 | 223 | 843–844 | 928–930 |
+| 8 | 1,304–1,306 | 162 | 1,244–1,246 | 1,391–1,393 |
 
-All C requests run as one batch, and each request's tokens are bit-identical to running it alone.
+All C requests run as one batch, and each request's tokens are bit-identical to running it alone. In a batch, every
+request drafts 8 tokens per step with either draft; DSpine accepts fewer of them here, so with four or eight requests
+at once DFlash2 is 4% and 7% faster. `SPEC=dflash2` is the better choice for a server that mostly runs many
+requests at once.
 
 ### Agent sessions and long documents
 
@@ -70,14 +74,15 @@ Through the server (`scripts/bench_agentic.py --scenarios agent,longctx`).
 
 - **agent**: sessions that share a 4,000-token system prompt and 20 tools, each running 8 turns of tool calls with
   800–3,000-token tool results (the history grows to about 20K tokens). One session: time to the first token of a
-  later turn 0.19 s (p50), decode 368 tok/s, prefix cache hit rate 84% of the prompt tokens, 100% of the ones that
-  can be reused. Four at once: 0.24 s, 145 tok/s each, 98% of the reusable tokens.
-- **longctx**: a long unique document, then a follow-up question on it. 19.5K tokens: first token after 1.86 s cold,
-  0.06 s for the follow-up. 73K tokens: 8.75 s cold, 0.14 s for the follow-up.
+  later turn 0.22 s (p50), decode 283 tok/s (DFlash2 256), prefix cache hit rate 84% of the prompt tokens, 99% of the
+  ones that can be reused. Four at once: 0.23 s, 170 tok/s each (DFlash2 158), 98% of the reusable tokens. The turns
+  differ between runs (the model decides when to call tools), so the decode rates are rough.
+- **longctx**: a long unique document, then a follow-up question on it. 19.5K tokens: first token after 1.75 s cold,
+  0.05 s for the follow-up. 73K tokens: 8.27 s cold, 0.12 s for the follow-up.
 
 ### KV cache capacity
 
-The KV pool holds 605,504 tokens with the defaults (the server log prints the memory plan at startup). One request can
+The KV pool holds 601,856 tokens with the defaults (605,504 with `SPEC=dflash2`: DSpine's tables take 0.25 GiB more) (the server log prints the memory plan at startup). One request can
 use the full 262,144-token context; the scheduler admits a new request only when the free KV cache can hold its prompt
 plus 4,096 output tokens, so eight long requests wait in line instead of evicting each other.
 
@@ -89,35 +94,40 @@ uv run scripts/bench_agentic.py --label decode --scenarios decode --decode-reps 
 uv run scripts/bench_concurrent.py --label concurrent --prompts reason --concurrency 1,4,8 --max-tokens 4096 --reps 2 \
   --extra-body '{"temperature":1.0,"top_p":0.95,"top_k":20,"presence_penalty":0}'
 uv run scripts/bench_agentic.py --label agent --scenarios agent,longctx
+uv run scripts/bench_agentic.py --label prefill-s0 --seed 0 --scenarios longctx --longctx-tokens 32000,120000,250000
+SPEC=dflash2 docker compose up -d serve   # the DFlash2 columns: the first three commands again
 docker compose stop serve
 docker compose --profile dev run --rm dev python scripts/bench_decode.py --weights gdnfp4 --kv-dtype nvfp4 \
   --ctx 19000,73000,194000 --tokens 64 --prefill-reps 2
 ```
 
-The results go to `bench/results/`. The runs above are
-[results/20261011-155743-pr4-release-decode.json](results/20261011-155743-pr4-release-decode.json),
-[results/20261011-155943-pr4-release-concurrent.json](results/20261011-155943-pr4-release-concurrent.json),
-[results/20261011-160026-pr4-release-agent.json](results/20261011-160026-pr4-release-agent.json) and
-[results/20261011-pr4-prefill-decode.json](results/20261011-pr4-prefill-decode.json).
+The results go to `bench/results/`. The runs above are [results/](results/) `20261113-*-dspine-release-*.json`
+(DSpine), `20261113-*-dflash2-release-*.json` (DFlash2) and
+[results/20261011-pr4-prefill-decode.json](results/20261011-pr4-prefill-decode.json) (by context length). The
+measurements with DFlash2 as the default on 2026-10-11 are `20261011-*-pr4-release-*.json`.
 
 ### Other engines
 
-The same three scripts against each engine's own serving setup, on the same day, GPU, driver and 400 W limit, with
+The same three scripts against each engine's own serving setup, on the same day (2026-10-11), GPU, driver and 400 W
+limit, with
 the sampling pinned for all of them (`--extra-body '{"temperature":1.0,"top_p":0.95,"top_k":20,"presence_penalty":0}'`).
 Each engine runs its own weights and KV cache type, and some need different settings for different scenarios
-because one configuration cannot do everything; the settings are listed below the table.
+because one configuration cannot do everything; the settings are listed below the table. The first column is this
+engine with today's default (DSpine, 2026-11-13, the same scripts and settings); the second is the same-day run
+with DFlash2, the default then.
 
-| | This engine | [NInfer](https://github.com/Neroued/ninfer) | [SGLang](https://github.com/sgl-project/sglang) | [vLLM](https://github.com/vllm-project/vllm) |
-| --- | ---: | ---: | ---: | ---: |
-| Context limit / KV cache, tokens | 262,144 / 605,504 | 16,384 / 43,904 (x8), 94,208 / 96,128 (x4) | 90,000 / 98,134 (fast), 196,608 / 214,219 (agent) | 160,000 / 173,913 |
-| Decode, one request, code / JSON / prose (tok/s) | **386 / 500 / 258** | 285 / 362 / 197 | 246 / 320 / 167 (fast) | 154 / 180 / 128 |
-| Concurrent, sum at C=1 (tok/s) | **312–313** | 234 | 197–205 (fast) | 124 |
-| Concurrent, sum at C=4 | **935–936** | 761–796 | 457–466 (agent) | 498–500 |
-| Concurrent, sum at C=8 | **1,395–1,397** | 1,260–1,277 | 837–851 (parallel) | 912–930 |
-| Agent turn, time to first token, 1 / 4 sessions (p50) | **0.19 / 0.24 s** | 0.39 / 0.75 s (x4) | 0.31 / 0.46 s (agent) | 0.57 / 1.59 s |
-| A second question on a 19.5K / 73K-token document, time to first token | **0.06 / 0.14 s** | 2.20 / 10.94 s (x4) | 0.22 / 0.49 s (agent) | 0.39 / 1.01 s |
+| | This engine, DSpine (2026-11-13) | This engine, DFlash2 | [NInfer](https://github.com/Neroued/ninfer) | [SGLang](https://github.com/sgl-project/sglang) | [vLLM](https://github.com/vllm-project/vllm) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Context limit / KV cache, tokens | 262,144 / 601,856 | 262,144 / 605,504 | 16,384 / 43,904 (x8), 94,208 / 96,128 (x4) | 90,000 / 98,134 (fast), 196,608 / 214,219 (agent) | 160,000 / 173,913 |
+| Decode, one request, code / JSON / prose (tok/s) | **410 / 674 / 263** | 386 / 500 / 258 | 285 / 362 / 197 | 246 / 320 / 167 (fast) | 154 / 180 / 128 |
+| Concurrent, sum at C=1 (tok/s) | **355–356** | 312–313 | 234 | 197–205 (fast) | 124 |
+| Concurrent, sum at C=4 | 892–893 | **935–936** | 761–796 | 457–466 (agent) | 498–500 |
+| Concurrent, sum at C=8 | 1,304–1,306 | **1,395–1,397** | 1,260–1,277 | 837–851 (parallel) | 912–930 |
+| Agent turn, time to first token, 1 / 4 sessions (p50) | 0.22 / **0.23 s** | **0.19** / 0.24 s | 0.39 / 0.75 s (x4) | 0.31 / 0.46 s (agent) | 0.57 / 1.59 s |
+| A second question on a 19.5K / 73K-token document, time to first token | **0.05 / 0.12 s** | 0.06 / 0.14 s | 2.20 / 10.94 s (x4) | 0.22 / 0.49 s (agent) | 0.39 / 1.01 s |
 
-Decode is the median of three runs; the concurrent sums are two runs; prefill is below. The agent scenario's turns
+Decode is the median of three runs; the concurrent sums are two runs; prefill is below. With DFlash2 on 2026-11-13
+the agent turn took 0.22 / 0.38 s, so the time to the first token moved with the day, not with the draft. The agent scenario's turns
 differ in length between engines (the model decides when to call tools), so only the time to the first token of a
 later turn is compared.
 
@@ -129,14 +139,14 @@ measure: prompt tokens divided by the time to the first token, an average over t
 grows with the position, the speed at a given depth is lower; the second set of rows gives the speed between two
 lengths, (difference in tokens) / (difference in time), the mean of the two seeds.
 
-| Prompt tokens | This engine | NInfer | SGLang | vLLM |
-| --- | ---: | ---: | ---: | ---: |
-| 19.5K, average tok/s (time to first token) | **10,705–10,929** (1.78–1.82 s) | 9,271–9,735 (2.00–2.11 s) | 7,231–7,804 (2.50–2.69 s) | 7,530–7,789 (2.50–2.59 s) |
-| 73K | **8,519–8,675** (8.41–8.56 s) | 6,861–7,048 (10.35–10.63 s) | 4,771–4,854 (15.03–15.28 s) | 4,704–4,814 (15.16–15.50 s) |
-| 152K | **6,508–6,575** (23.1–23.4 s) | 4,889–4,941 (30.8–31.1 s) | 2,993–3,022 (50.3–50.8 s) | 2,707–2,741 (55.5–56.1 s) |
-| 0 → 19.5K, tok/s in the interval | **10,817** | 9,503 | 7,517 | 7,659 |
-| 19.5K → 73K | **7,998** | 6,335 | 4,256 | 4,182 |
-| 73K → 152K | **5,359** | 3,868 | 2,234 | 1,953 |
+| Prompt tokens | This engine, DSpine (2026-11-13) | This engine, DFlash2 | NInfer | SGLang | vLLM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 19.5K, average tok/s (time to first token) | **11,438–11,594** (1.68–1.71 s) | 10,705–10,929 (1.78–1.82 s) | 9,271–9,735 (2.00–2.11 s) | 7,231–7,804 (2.50–2.69 s) | 7,530–7,789 (2.50–2.59 s) |
+| 73K | **9,029–9,193** (7.94–8.08 s) | 8,519–8,675 (8.41–8.56 s) | 6,861–7,048 (10.35–10.63 s) | 4,771–4,854 (15.03–15.28 s) | 4,704–4,814 (15.16–15.50 s) |
+| 152K | **6,796–6,864** (22.1–22.4 s) | 6,508–6,575 (23.1–23.4 s) | 4,889–4,941 (30.8–31.1 s) | 2,993–3,022 (50.3–50.8 s) | 2,707–2,741 (55.5–56.1 s) |
+| 0 → 19.5K, tok/s in the interval | **11,516** | 10,817 | 9,503 | 7,517 | 7,659 |
+| 19.5K → 73K | **8,466** | 7,998 | 6,335 | 4,256 | 4,182 |
+| 73K → 152K | **5,548** | 5,359 | 3,868 | 2,234 | 1,953 |
 
 The settings are those in the table below, except NInfer, which ran without speculative decoding (`--max-context
 262144 --max-concurrency 1`): 152K does not fit with DFlash2 under WSL2. Without speculative decoding it also skips
@@ -146,12 +156,13 @@ tokenization and the first decode step, so these are slightly below the in-proce
 
 | Engine | Version | Weights | KV cache | Speculative decoding | Settings |
 | --- | --- | --- | --- | --- | --- |
-| This engine | this repository | `gdnfp4` | NVFP4 | DFlash2, 8-token blocks | defaults (`MAX_SEQS=8`) |
+| This engine | this repository (`9e74583` / 2026-10-11) | `gdnfp4` | NVFP4 | DSpine, 16-token blocks (adaptive 16 / 8 rows) / DFlash2, 8-token blocks | defaults (`MAX_SEQS=8`) |
 | [NInfer](https://github.com/Neroued/ninfer) | [`81c8ce0`](https://github.com/Neroued/ninfer/commit/81c8ce093b2c1646a87566a8e59d807fcf0ec95c), built on this repository's `dev` image | `neroued/Qwen3.8-27B-nvfp4-NInfer` | FP8 | DFlash2, 7 draft tokens, `--lm-head-draft` | x8: `--max-context 16384 --max-concurrency 8 --device-state-slots 0` (decode, concurrency); x4: `--max-context 94208 --max-concurrency 4` (agent, documents); larger settings do not fit under WSL2 |
 | [SGLang](https://github.com/sgl-project/sglang) | [v0.5.21](https://github.com/sgl-project/sglang/releases/tag/v0.5.21) with two unmerged patches: embedding in host memory ([#37826](https://github.com/sgl-project/sglang/pull/37826), backported) and MTP weight sharing ([#37155](https://github.com/sgl-project/sglang/pull/37155)) | `nvidia/Qwen3.8-27B-NVFP4` | FP8 | fast: DFlash2 (one request at a time); agent / parallel: the checkpoint's MTP head, 5 steps | fast: 90K, 1 request; agent: 196K, 4 requests; parallel: 160K, 8 requests |
 | [vLLM](https://github.com/vllm-project/vllm) | [v0.29.0](https://github.com/vllm-project/vllm/releases/tag/v0.29.0) | `nvidia/Qwen3.8-27B-NVFP4` | FP8 | MTP, 3 tokens | 160K, 8 requests, a fixed 6.5 GiB KV cache |
 
-The JSON files are in [results/](results/) (`20261011-1*-pr6-*.json`). Notes:
+The JSON files are in [results/](results/) (`20261011-1*-pr6-*.json`, this engine on 2026-11-13
+`20261113-*-dspine-release-*.json`). Notes:
 
 - NInfer sizes its memory from what `cudaMemGetInfo` reports free minus a 1 GiB margin. Under WSL2 that leaves
   9.5 GB after its weights, which limits the context with several requests. It reuses a prefix only at the end of a

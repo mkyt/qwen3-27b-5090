@@ -136,7 +136,7 @@ At startup the engine computes a plan, allocates each pool once and never calls 
   3. The running sequence's state: GDN states (FP32), convolution states, the draft's context ring.
   4. Per-lane buffers of batched steps ([§10](#10-scheduler-and-concurrency)), about 0.25 GiB for eight lanes.
   5. **The KV pool**: everything left, in pages of 64 tokens. With the defaults (`gdnfp4`, NVFP4 KV,
-     `MAX_SEQS=8`, `VISION=host`) it holds 605,504 tokens.
+     `MAX_SEQS=8`, `VISION=host`, DSpine) it holds 601,856 tokens (605,504 with DFlash2).
 - **Parking areas live inside the KV pool.** Each request that is not running keeps its GDN, convolution and
   draft state (189.9 MiB) in a parking area; there are `MAX_SEQS - 1` of them. While an area is unused, its pages
   hold KV cache like any other page. The KV pool is laid out page-major in blocks (a block holds all 32 slices,
@@ -303,7 +303,7 @@ convolution, the draft's context ring: 189.9 MiB).
 - **Exactness**: the state is kept in FP32 and the boundaries follow the GDN chunks, so a request resumed from a
   checkpoint produces exactly the tokens it would produce without the cache (`scripts/prefix_cache_test.py`).
 
-An agent's turn after a 20K-token conversation reaches its first token in 0.19 s: everything but the new tool
+An agent's turn after a 20K-token conversation reaches its first token in about 0.2 s: everything but the new tool
 output and user message comes from the cache.
 
 ## 10. Scheduler and concurrency

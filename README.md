@@ -7,15 +7,16 @@ Anthropic-compatible APIs with images, so coding agents such as Claude Code and 
 It is not a general engine: the kernels, the memory plan and the scheduler are written for this one model on this one
 GPU. That buys two things:
 
-- **Speed.** Faster than [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [NInfer](https://github.com/Neroued/ninfer) on the same card in every scenario measured: 1.3–2.8x the
-  single-request decode, 1.1–1.7x the throughput of eight concurrent requests, and a 152K-token prompt answered in
-  23 s instead of 31–56 s.
-- **The full 262K context with room to spare.** A 605K-token KV cache on a 32 GB card, 2.8–6.3x what the other
+- **Speed.** Faster than [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [NInfer](https://github.com/Neroued/ninfer) on the same card in every scenario measured: 1.3–3.7x the
+  single-request decode, 1.02–1.6x the throughput of eight concurrent requests, and a 152K-token prompt answered in
+  22 s instead of 31–56 s.
+- **The full 262K context with room to spare.** A 602K-token KV cache on a 32 GB card, 2.8–6.3x what the other
   engines fit, with up to eight requests, images and speculative decoding all enabled at once. Of the others, only
   NInfer reached the model's whole 262,144-token context here, serving one request without speculative decoding.
 
-All numbers are measured at a **400 W power limit** (the card's default is 575 W), on the same day, driver and scripts
-for every engine. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, each engine's settings and the
+All numbers are measured at a **400 W power limit** (the card's default is 575 W) with the same scripts: the other
+engines on 2026-10-11, this engine with its current default draft (DSpine) on 2026-11-13; the same-day numbers with
+the previous default are in the benchmarks too. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, each engine's settings and the
 commands that reproduce them. At 575 W the engine is only 1–2% faster for one request and 9–26% faster for prefill
 and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 ([Power limit and energy](docs/benchmarks.md#power-limit-and-energy)).
@@ -24,15 +25,17 @@ and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 
 | On one RTX 5090 at 400 W | This engine | NInfer | SGLang | vLLM |
 | --- | ---: | ---: | ---: | ---: |
-| Decode, one request: code / JSON / prose (tok/s) | **386 / 500 / 258** | 285 / 362 / 197 | 246 / 320 / 167 | 154 / 180 / 128 |
-| Eight concurrent requests, total (tok/s) | **1,395** | 1,260–1,277 | 837–851 | 912–930 |
-| Time to first token, 152K-token document | **23 s** | 31 s | 50 s | 56 s |
-| Time to first token, agent turn after a 20K-token history | **0.19 s** | 0.39 s | 0.31 s | 0.57 s |
-| Follow-up question on a 73K-token document | **0.14 s** | 10.9 s | 0.49 s | 1.01 s |
+| Decode, one request: code / JSON / prose (tok/s) | **410 / 674 / 263** | 285 / 362 / 197 | 246 / 320 / 167 | 154 / 180 / 128 |
+| Eight concurrent requests, total (tok/s) | **1,305** (1,392 with `SPEC=dflash2`) | 1,260–1,277 | 837–851 | 912–930 |
+| Time to first token, 152K-token document | **22 s** | 31 s | 50 s | 56 s |
+| Time to first token, agent turn after a 20K-token history | **0.22 s** | 0.39 s | 0.31 s | 0.57 s |
+| Follow-up question on a 73K-token document | **0.12 s** | 10.9 s | 0.49 s | 1.01 s |
 
 - **Speculative decoding** with the [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) block drafter (blocks of up to
   16 tokens, the verify width adapting to the acceptance; [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) with
   `SPEC=dflash2`), batched across concurrent requests; each request's tokens are bit-identical to running it alone.
+  DSpine is faster for one request (JSON 1.36x, code 1.07x); with four or eight requests at once DFlash2 is 4–7%
+  faster, so a server that mostly runs many requests at once may prefer `SPEC=dflash2`.
 - **NVFP4 weights including the Gated DeltaNet projections**
   ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), GPTQ from the BF16 original;
   the attention projections stay FP8 because quantizing them cost parallel tool calls): decode reads 14 GiB of
@@ -44,9 +47,9 @@ and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 
 | | This engine | NInfer | SGLang | vLLM |
 | --- | ---: | ---: | ---: | ---: |
-| KV cache (tokens) | **605,504** | 96,128 | 214,219 | 173,913 |
+| KV cache (tokens) | **601,856** | 96,128 | 214,219 | 173,913 |
 | Longest context of one request | **262,144** (the model's limit) | 94,208 | 196,608 | 160,000 |
-| ... at the same time as | 8 concurrent requests, images, DFlash2 | 4 requests | 4 requests, MTP | 8 requests, MTP |
+| ... at the same time as | 8 concurrent requests, images, DSpine | 4 requests | 4 requests, MTP | 8 requests, MTP |
 
 The other engines' columns are the largest settings with concurrency and speculative decoding that ran on this
 machine; NInfer and SGLang need other configurations for other scenarios (NInfer: 262K for one request without

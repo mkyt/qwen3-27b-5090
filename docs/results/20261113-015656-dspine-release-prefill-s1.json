@@ -1,0 +1,94 @@
+{
+  "label": "dspine-release-prefill-s1",
+  "model": "qwen3.8-27b",
+  "started": "2026-11-13T01:56:20.873443",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "dspine-release-prefill-s1",
+    "scenarios": "longctx",
+    "seed": 1,
+    "thinking": false,
+    "decode_reps": 2,
+    "decode_max_tokens": 1024,
+    "agent_sessions": "1,4",
+    "agent_turns": 8,
+    "agent_max_tokens": 512,
+    "system_tokens": 4000,
+    "tools": 20,
+    "tool_output_min": 800,
+    "tool_output_max": 3000,
+    "longctx_tokens": "32000,120000,250000",
+    "longctx_max_tokens": 256,
+    "extra_body": "{}"
+  },
+  "results": {
+    "longctx": [
+      {
+        "target_tokens": 32000,
+        "cold": {
+          "prompt_tokens": 19524,
+          "ttft": 1.707,
+          "prefill_tps": 11438.8,
+          "decode_tps": 211.59
+        },
+        "warm": {
+          "prompt_tokens": 19520,
+          "ttft": 0.056,
+          "prefill_tps": 350794.2,
+          "decode_tps": 392.83
+        },
+        "prefix_cache_hit_rate": 0.4983,
+        "prefix_cache_hits": 19456,
+        "prefix_cache_queries": 39044,
+        "prefix_cache_reusable": 19509,
+        "prefix_cache_hit_of_reusable": 0.9973,
+        "spec_mean_accept_len": 3.538,
+        "spec_draft_acceptance": null
+      },
+      {
+        "target_tokens": 120000,
+        "cold": {
+          "prompt_tokens": 72909,
+          "ttft": 8.075,
+          "prefill_tps": 9028.8,
+          "decode_tps": 169.28
+        },
+        "warm": {
+          "prompt_tokens": 72905,
+          "ttft": 1.143,
+          "prefill_tps": 63776.1,
+          "decode_tps": 494.55
+        },
+        "prefix_cache_hit_rate": 0.4494,
+        "prefix_cache_hits": 65536,
+        "prefix_cache_queries": 145814,
+        "prefix_cache_reusable": 72893,
+        "prefix_cache_hit_of_reusable": 0.8991,
+        "spec_mean_accept_len": 3.233,
+        "spec_draft_acceptance": null
+      },
+      {
+        "target_tokens": 250000,
+        "cold": {
+          "prompt_tokens": 151973,
+          "ttft": 22.362,
+          "prefill_tps": 6796.1,
+          "decode_tps": 154.93
+        },
+        "warm": {
+          "prompt_tokens": 151969,
+          "ttft": 0.252,
+          "prefill_tps": 603298.0,
+          "decode_tps": 351.75
+        },
+        "prefix_cache_hit_rate": 0.4999,
+        "prefix_cache_hits": 151936,
+        "prefix_cache_queries": 303942,
+        "prefix_cache_reusable": 151957,
+        "prefix_cache_hit_of_reusable": 0.9999,
+        "spec_mean_accept_len": 3.0,
+        "spec_draft_acceptance": null
+      }
+    ]
+  }
+}

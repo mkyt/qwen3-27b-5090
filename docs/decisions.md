@@ -126,7 +126,10 @@ gate without an explicit decision, recorded below with its numbers.
   1.06 and prose 1.00 times (one request, sampled), after two fixes in the draft: its table kernel decoded FP4 through
   a table in local memory (270 -> 37 us), and the candidates' sender projections now come from a table built at load
   for the draft vocabulary (256 MB) instead of codebook rows read over PCIe. Batched steps of several
-  requests draft 8 rows each, on par with DFlash2. The width depends only on past steps, so the output distribution
+  requests draft 8 rows each; there DSpine accepts fewer tokens than DFlash2, and through the server the sum of
+  four and eight concurrent sampled requests is 0.96 and 0.94 times DFlash2's (one request 1.15 times; 2026-11-13,
+  [benchmarks.md](benchmarks.md#concurrent-requests)). DSpine stays the default because one request at a time is
+  the common case (a coding agent), and `SPEC=dflash2` remains for servers that mostly batch. The width depends only on past steps, so the output distribution
   is unchanged (greedy output is identical to plain decoding; a chi-square test of the sampled tokens passes). The
   table of candidates is computed exactly for the 15 x 16 x 16 (position, sender, candidate) triples instead of
   DSpine's reference tables over the whole vocabulary (0.76 GB), and the 0.5 GB codebook stays in host memory.
