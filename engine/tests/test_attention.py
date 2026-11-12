@@ -122,19 +122,19 @@ def test_attention_calls(kv, f8, decode, tc8, monkeypatch):
 
 @pytest.mark.parametrize("kv,tc8", [("bf16", ""), ("fp8", ""), ("fp8", "1"), ("nvfp4", "0"), ("nvfp4", "")])
 @pytest.mark.parametrize("pos", [5, 63, 1000, 4097, 30000])
-def test_decode_rows_independent_of_t(kv, tc8, pos, monkeypatch):
-    """A chain of T new tokens (the speculative verify) gives each token exactly the decode result
+@pytest.mark.parametrize("T", [8, 16])
+def test_decode_rows_independent_of_t(kv, tc8, pos, T, monkeypatch):
+    """A chain of T new tokens (the speculative verify; 16: DSpine's) gives each token exactly the decode result
     (the decode runs a token on 4 warps, the verify a token per warp; 30000: many chunks per split).
     tc8: Q27_ATTN_TC_F8 ("": the default, FP8 MMAs with NVFP4 KV only)."""
     monkeypatch.setenv("Q27_ATTN_TC_F8", tc8)
-    pages = max(72, (pos + 8) // PAGE + 8)
+    pages = max(72, (pos + T) // PAGE + 8)
     page_table = torch.randperm(pages, dtype=torch.int32).to(dev)
     kc = (torch.randn(pages, PAGE, HKV, D, device=dev)).bfloat16() if kv == "bf16" else \
         torch.randint(0, 120, (pages, PAGE, HKV, FP4_ROW if kv == "nvfp4" else D), dtype=torch.uint8, device=dev)
     vc = kc.clone()
     q_norm, k_norm = (torch.randn(D, device=dev) * 0.1).bfloat16(), (torch.randn(D, device=dev) * 0.1).bfloat16()
     ws = torch.zeros(26 << 20, dtype=torch.uint8, device=dev)
-    T = 8
     qg = torch.randn(T, H, 2 * D, device=dev) * 2
     k, v = torch.randn(T, HKV, D, device=dev) * 2, torch.randn(T, HKV, D, device=dev)
     q_out, out = torch.empty(T, H, D, device=dev), torch.empty(T, H * D, device=dev)

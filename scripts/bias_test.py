@@ -49,7 +49,7 @@ def main():
     ap.add_argument("--gen", type=int, default=192)
     ap.add_argument("--tol", type=float, default=1e-3, help="reference: a near tie (log-prob difference)")
     ap.add_argument("--kv-dtype", default="nvfp4", choices=["bf16", "fp8", "nvfp4"],
-                    help="KV cache (the server's default; with bf16 / fp8 a verify block over 8 rows, DSpine's, is not bit-identical to decode)")
+                    help="KV cache (default: the server's)")
     ap.add_argument("--draft", choices=["dspine", "dflash2"], help="draft model (default $SPEC, else dspine as the server)")
     ap.add_argument("--weights", default="nvidia", help="weight profile: nvidia | gdnfp4 | quasar | a model directory")
     args = ap.parse_args()

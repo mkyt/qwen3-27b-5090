@@ -437,7 +437,7 @@ __global__ void __launch_bounds__(kDecWarps * 32) attention_decode_kernel(const 
   }
 }
 
-// Tensor-core version for a chain of T <= 8 new tokens (decode and the speculative verify, BF16 KV).
+// Tensor-core version for a chain of T <= 8 new tokens (decode and the speculative verify; 9..16 in two launches).
 // The keys are cut into fixed 32-key chunks (within a 64-token page); chunk c belongs to split
 // c % splits, and a split walks its chunks in ascending order. CTA = (KV head, split): each chunk is
 // staged in shared memory once for all tokens (cp.async by producer warps, below; 16-byte columns XOR-swizzled
@@ -530,12 +530,18 @@ template <class KV>  // raw slots, then (FP8 / NVFP4) two 16-bit chunks: 96 / 96
 constexpr int kTcSmemOf = kTcRaw<KV> * 2 * kTcChunk * kKvRowBytes<KV> + (std::is_same_v<KV, bf16> ? 0 : 2 * kTcStageBytes);
 
 // kBatch (P6-10): lane blockIdx.z, T rows per lane from row kLaneRows * z (its position and page table).
+// t0: the rows are tokens t0 .. t0 + T - 1 of a chain from *pos_dev (q and the partials from row t0): a verify block
+// of 9..16 rows is two launches of at most 8 (a column's arithmetic is the same, so the rows stay the decode's).
 template <class KV, bool kBatch = false>
 __global__ void __launch_bounds__(kTcMaxT * 32 + kTcProd, 1) attention_tc_kernel(const float* q, const int32_t* pos_dev, int T,
                                                                              const KV* kc, const KV* vc,
                                                                              const int32_t* page_table, int splits,
-                                                                             DecPartial part, SeqLanes lanes) {
+                                                                             DecPartial part, SeqLanes lanes, int t0 = 0) {
   pdl_trigger();
+  if (t0) {
+    const int64_t rows = int64_t(t0) * kHeads;
+    q += rows * kHeadDim, part.acc += rows * splits * kHeadDim, part.ml += rows * splits * 2;
+  }
   if constexpr (kBatch) {
     const int z = blockIdx.z;
     const int64_t rows = int64_t(kLaneRows) * z * kHeads;
@@ -556,7 +562,9 @@ __global__ void __launch_bounds__(kTcMaxT * 32 + kTcProd, 1) attention_tc_kernel
   const int ncw = blockDim.x / 32 - kTcProdWarps;  // compute warps
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   // The position is advanced only at the end of a step / chunk (host-synchronized): read before the wait.
-  const int pos0 = *pos_dev, kmax = pos0 + T;
+  // pos0: the first key of this step (the producers read the keys before it ahead of the PDL wait); p0: the
+  // position of this launch's first row.
+  const int pos0 = *pos_dev, p0 = pos0 + t0, kmax = p0 + T;
   const int nchunks = (kmax + kTcChunk - 1) / kTcChunk;
   if (split >= nchunks) return;
   const int nmine = (nchunks - split + splits - 1) / splits;  // chunks split, split + splits, ...
@@ -642,7 +650,7 @@ __global__ void __launch_bounds__(kTcMaxT * 32 + kTcProd, 1) attention_tc_kernel
   const int qcol = lane / 4, c2 = 2 * (lane % 4);  // fragment row / column pair
   const int ncols = T * kGqa, ntile = (ncols + 7) / 8;
   const int nfull = ncw == ntile ? ntile : ncw - kTcGrpWarps;
-  auto col_kt = [&](int col) { return col < ncols ? pos0 + col / kGqa + 1 : 0; };  // keys column col sees
+  auto col_kt = [&](int col) { return col < ncols ? p0 + col / kGqa + 1 : 0; };  // keys column col sees
   // B fragments of Q^T for tile j (k = dims, n = 8 columns), pre-scaled.
   auto load_q = [&](int j, uint32_t (&qf)[kHeadDim / 16][2]) {
     const float scale = rsqrtf(float(kHeadDim));
@@ -703,7 +711,7 @@ __global__ void __launch_bounds__(kTcMaxT * 32 + kTcProd, 1) attention_tc_kernel
       constexpr int kDq = kHeadDim / 16 / kTcGrpWarps;  // dims tiles per warp
       const int gw = warp - nfull, jq = gw / 2, mt = gw % 2, dm0 = gw * kDq;
       const bool qk = jq < ng;
-      const int kgrp = pos0 + T;  // the last tile holds the last token
+      const int kgrp = p0 + T;  // the last tile holds the last token
       int ktc[2][2];
 #pragma unroll
       for (int jj = 0; jj < 2; jj++)
@@ -2038,11 +2046,12 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
   const int min_keys = getenv("Q27_ATTN_MIN_KEYS") ? atoi(getenv("Q27_ATTN_MIN_KEYS")) : 64;
   const int prefetch = getenv("Q27_ATTN_PREFETCH") ? atoi(getenv("Q27_ATTN_PREFETCH")) : kDecPrefetchKeys;
   // The split count of a single token for every T (bit-identical rows); short contexts leave most empty.
-  // Chains of up to 8 tokens (decode, the chain verify; BF16 or FP8 KV): tensor cores, every chunk read once.
+  // Chains of up to 16 tokens (decode, the chain verify): tensor cores, every chunk read once per 8 tokens.
   // Q27_ATTN_TC=0: the CUDA-core kernel. The split count is fixed per process (bit-identical rows).
   const bool tc_on = !getenv("Q27_ATTN_TC") || atoi(getenv("Q27_ATTN_TC")) != 0;
   // (FP8 MMAs with NVFP4 KV, tc_f8: chains of up to 16 rows)
-  const bool tc = tc_on && !tree && (T <= kTcMaxT || (T <= kT8MaxT && tc_f8(kv_type)));
+  // (BF16 / FP8 KV: 9..16 rows, DSpine's verify, in two launches of attention_tc_kernel)
+  const bool tc = tc_on && !tree && T <= kT8MaxT;
   const int tc_splits = getenv("Q27_ATTN_TC_SPLITS") ? atoi(getenv("Q27_ATTN_TC_SPLITS"))
                                                      : std::max(1, g_attn_sms / kKvHeads);
   const int splits = std::min(kDecodeMaxSplits,
@@ -2083,21 +2092,28 @@ void attention_decode(const float* q, const float* qg, int ldq, int T, const int
                    static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
                    SeqLanes{});
     } else {
-    const bool dec4 = T == 1 && (!getenv("Q27_ATTN_TC_DEC") || atoi(getenv("Q27_ATTN_TC_DEC")) != 0);
-    // Compute warps: one per n8 tile of the 6 T (token, head) columns while there are at most 4 tiles,
-    // else 4 + a group of 4 for the last 1 or 2 (T = 6..8); a decode's tile on a group. Then the producers.
-    const int ntile = ceil_div(T * kGqa, 8);
+    // Rows t0 .. t0 + n - 1 (at most 8: the launch bounds); more rows take two launches.
+    for (int t0 = 0; t0 < T; t0 += kTcMaxT) {
+    const int n = std::min(kTcMaxT, T - t0);
+    const bool dec4 = n == 1 && (!getenv("Q27_ATTN_TC_DEC") || atoi(getenv("Q27_ATTN_TC_DEC")) != 0);
+    // Compute warps: one per n8 tile of the 6 n (token, head) columns while there are at most 4 tiles,
+    // else 4 + a group of 4 for the last 1 or 2 (n = 6..8); a decode's tile on a group. Then the producers.
+    const int ntile = ceil_div(n * kGqa, 8);
     const int ncw = dec4 ? kTcGrpWarps : ntile <= 4 ? ntile : 4 + kTcGrpWarps;
     const dim3 block(ncw * 32 + kTcProd);
     if (kv_type == KvType::BF16)
-      launch_pdl(attention_tc_kernel<bf16>, grid, block, kTcSmemOf<bf16>, s, q, pos_dev, T,
-                 static_cast<const bf16*>(kv.k), static_cast<const bf16*>(kv.v), page_table, splits, part, SeqLanes{});
+      launch_pdl(attention_tc_kernel<bf16>, grid, block, kTcSmemOf<bf16>, s, q, pos_dev, n,
+                 static_cast<const bf16*>(kv.k), static_cast<const bf16*>(kv.v), page_table, splits, part, SeqLanes{},
+                 t0);
     else if (kv_type == KvType::NVFP4)
-      launch_pdl(attention_tc_kernel<Fp4Kv>, grid, block, kTcSmemOf<Fp4Kv>, s, q, pos_dev, T,
-                 static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part, SeqLanes{});
+      launch_pdl(attention_tc_kernel<Fp4Kv>, grid, block, kTcSmemOf<Fp4Kv>, s, q, pos_dev, n,
+                 static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), page_table, splits, part, SeqLanes{},
+                 t0);
     else
-      launch_pdl(attention_tc_kernel<uint8_t>, grid, block, kTcSmemOf<uint8_t>, s, q, pos_dev, T,
-                 static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part, SeqLanes{});
+      launch_pdl(attention_tc_kernel<uint8_t>, grid, block, kTcSmemOf<uint8_t>, s, q, pos_dev, n,
+                 static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), page_table, splits, part,
+                 SeqLanes{}, t0);
+    }
     }
   } else if (kv_type == KvType::BF16)
     launch_pdl(attention_decode_kernel<bf16>, dim3(grid), dim3(kDecWarps * 32), 0, s, q, pos_dev, T,
@@ -2176,15 +2192,15 @@ void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqL
   else if (kv_type == KvType::BF16)
     launch_pdl(attention_tc_kernel<bf16, true>, grid, block, kTcSmemOf<bf16>, s, q, lanes.pos, T,
                static_cast<const bf16*>(kv.k), static_cast<const bf16*>(kv.v), lanes.page_table[0], splits, part,
-               lanes);
+               lanes, 0);
   else if (kv_type == KvType::NVFP4)
     launch_pdl(attention_tc_kernel<Fp4Kv, true>, grid, block, kTcSmemOf<Fp4Kv>, s, q, lanes.pos, T,
                static_cast<const Fp4Kv*>(kv.k), static_cast<const Fp4Kv*>(kv.v), lanes.page_table[0], splits, part,
-               lanes);
+               lanes, 0);
   else
     launch_pdl(attention_tc_kernel<uint8_t, true>, grid, block, kTcSmemOf<uint8_t>, s, q, lanes.pos, T,
                static_cast<const uint8_t*>(kv.k), static_cast<const uint8_t*>(kv.v), lanes.page_table[0], splits,
-               part, lanes);
+               part, lanes, 0);
   Q27_CUDA(cudaGetLastError());
   launch_pdl(attention_combine_kernel<true>, dim3(unsigned(rows)), dim3(kHeadDim), 0, s, qg, ldq, lanes.pos, splits, 0,
              kTcChunk, part, out, q8, in_scale, static_cast<const SpecTree*>(nullptr), lanes);
