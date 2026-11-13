@@ -217,6 +217,62 @@ restarts it with other settings (weights, KV cache type, speculative decoding, v
 context limit, VRAM budget), showing for every choice the context it leaves before anything is loaded
 ([docs/configuration.md](docs/configuration.md#start-settings)).
 
+### NixOS (flake)
+
+The engine also runs on NixOS from this repository's flake, without Docker: the
+`engine`, `serve` and `repoFiles` packages plus a `services.qwen27b` systemd
+module (the same defaults as the Configuration table above).
+
+```nix
+# flake.nix of your system
+{
+  inputs.qwen27b.url = "github:mkyt/qwen3-27b-5090";
+
+  outputs = { self, nixpkgs, qwen27b }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      specialArgs = { inherit qwen27b; };
+      modules = [
+        ./configuration.nix
+        qwen27b.nixosModules.qwen27b
+      ];
+    };
+  };
+}
+```
+
+```nix
+# configuration.nix
+services.qwen27b = {
+  enable = true;
+  engine = qwen27b.packages."x86_64-linux".engine;
+  serve = qwen27b.packages."x86_64-linux".serve;
+  files = qwen27b.packages."x86_64-linux".repoFiles;
+};
+```
+
+The service listens on `http://127.0.0.1:8000` (the same API as the Docker
+setup) and runs as its own system user `qwen27b`, whose home
+(`/var/lib/qwen27b`, created by systemd's `StateDirectory`) holds the weights.
+`HF_HOME` defaults to `/var/lib/qwen27b/hf` and `HF_HUB_OFFLINE` is set, so the
+server never downloads: populate it first (23 GB; run this after
+`nixos-rebuild switch`, so the `qwen27b` user exists), from a checkout of this
+repository:
+
+```bash
+sudo install -d -o qwen27b -g qwen27b -m 0700 /var/lib/qwen27b /var/lib/qwen27b/hf
+nix shell nixpkgs#python3 --command \
+  env HF_HOME=/var/lib/qwen27b/hf python3 scripts/download_weights.py
+sudo chown -R qwen27b:qwen27b /var/lib/qwen27b/hf
+```
+
+The downloader is stdlib-only Python 3.10+ (or use `python3` directly if it is
+on `PATH`); it fetches the pinned `gdnfp4` weights and the DFlash2 draft, and
+resumes an interrupted download. To run under a user you already manage, set
+`user` to that account and `createUser = false`; `userHome` and `modelPath`
+then point at its directories. A prestart check fails with a clear message
+unless the card is an RTX 5090 (the kernels are SM120-only), and a GPU lock
+keeps concurrent engines from sharing it.
+
 ## Clients
 
 - **OpenAI-compatible** (chat completions, completions, Responses): base URL `http://127.0.0.1:8000/v1`, any API key,

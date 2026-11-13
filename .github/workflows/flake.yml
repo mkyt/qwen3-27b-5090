@@ -1,0 +1,54 @@
+name: flake
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Fast gate: flake structure (eval only) + the stdlib-only frontend tests.
+  # `nix flake check --no-build` evaluates every output (catches flake syntax /
+  # attribute errors) WITHOUT building, so the multi-GB torch/CUDA `serve`
+  # closure and the heavy checks are NOT pulled into the per-push gate. The
+  # stdlib-only frontend tests build in seconds (no torch, no GPU, no CUDA).
+  # The CUDA `engine` build runs in the dedicated `engine` job below; the
+  # torch-dependent `reference-tests` remain buildable via
+  # `nix build .#checks.x86_64-linux.reference-tests` but are left out of the
+  # fast gate so a push never waits on a CUDA source build.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: flake structure (eval only, no builds)
+        run: nix flake check --no-build --no-update-lock-file
+      - name: stdlib-only frontend tests
+        run: nix build --no-update-lock-file .#checks.x86_64-linux.frontend-tests
+
+  # Path filter: only run the expensive CUDA build when engine sources change.
+  paths:
+    runs-on: ubuntu-latest
+    outputs:
+      engine: ${{ steps.filter.outputs.engine }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            engine:
+              - 'engine/**'
+              - 'flake.nix'
+              - 'pkgs/**'
+
+  # Engine build: compiles libq27.so for sm_120a (no GPU needed, nvcc cross-compiles).
+  # First run compiles ~20 .cu files (~10–20 min); subsequent runs are cached.
+  engine:
+    needs: [check, paths]
+    if: needs.paths.outputs.engine == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: nix build engine
+        run: nix build --no-update-lock-file .#engine
