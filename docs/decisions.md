@@ -329,6 +329,13 @@ gate without an explicit decision, recorded below with its numbers.
   One layer 256 -> 187 us of kernel time; prefill 19K +1.9%, 73K +1.1%; golden against BF16 KL 0.0454 -> 0.0459
   (two builds of the same code differ by 0.047). F16 accumulators (twice the MMA rate, `micro/mma_peak`) are not
   used yet; the chunk kernel holds 250 registers, and adding a bound-based scale there spilled (+30 us).
+- **P5-16: in_proj_a / b split over K.** The prefill kernel ran a block per 32 tokens through all 5,120 k in
+  80 steps of about 0.9 us whatever the pipeline depth (a latency chain at 12 warps per SM): 77 us at any T > 8.
+  Blocks of 16 tokens and a quarter of K, the four of a token tile in a cluster, block 0 adding the partial sums
+  in order from the others' shared memory (no workspace; plain distributed shared memory loads, not the bulk
+  copies that compile to driver calls): 18 us for 16 tokens, 45 us for 2,048. Prompts of 128 / 512 tokens
+  +7.4 / +6.4%; at 19K the gain (-17 ms of kernel time) is taken back by the power limit (+0.4%, energy per token
+  unchanged). Error against FP64 1.2e-5 -> 3.7e-6; golden KL against BF16 0.0467 (noise).
 - **Not done: FP4 attention for P V (SageAttention3 style), a megakernel.** See [Not done](#not-done).
 
 ## Vision
