@@ -6,9 +6,12 @@
 //   mxfp8  mma.sync m16n8k32  kind::mxf8f6f4 block_scale 1X e4m3 x e4m3, ue8m0 scales of 1 -> f32
 //          (same products as fp8; NInfer's note: the block-scaled form avoids the half-rate FP32 accumulation)
 //   nvfp4  mma.sync m16n8k64  kind::mxf4nvf4 block_scale 4X e2m1 x e2m1, ue4m3 scales -> f32 (MLP, lm_head)
+//   f16f32 mma.sync m16n8k16  f16 x f16 -> f32                (reference for f16f16)
+//   f16f16 mma.sync m16n8k16  f16 x f16 -> f16 accumulators   (candidate for the GDN chunk products)
+// The f16 kinds multiply 1.0 by (+1, -1) pairs so the f16 accumulators stay at 0 without zero products.
 //
 // Register-only loops with independent accumulators, so this is the instruction ceiling, not a GEMM.
-// usage: mma_peak [--seconds 3]
+// usage: mma_peak [--seconds 3] [--only <name>]
 
 #include "common.cuh"
 
@@ -67,6 +70,49 @@ __global__ void __launch_bounds__(256) mma_loop(uint32_t seed, long iters, float
   if (s == 1234.5f) out[threadIdx.x] = s;
 }
 
+// kF16Acc: f16 accumulators (2 registers of f16x2) instead of 4 floats.
+template <bool kF16Acc>
+__global__ void __launch_bounds__(256) mma_loop_f16(uint32_t seed, long iters, float* out) {
+  const uint32_t one = 0x3c003c00u, pm = 0xbc003c00u;  // f16 (1, 1) and (1, -1)
+  uint32_t a[4] = {one, one ^ (seed & 1), one, one};
+  uint32_t b[2] = {pm, pm};
+  float s = 0;
+  if constexpr (kF16Acc) {
+    uint32_t d[kAcc][2] = {};
+    for (long i = 0; i < iters; ++i) {
+#pragma unroll
+      for (int k = 0; k < kAcc; ++k)
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+            : "+r"(d[k][0]), "+r"(d[k][1])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+#pragma unroll
+    for (int k = 0; k < kAcc; ++k) s += float(d[k][0] ^ d[k][1]);
+  } else {
+    float d[kAcc][4] = {};
+    for (long i = 0; i < iters; ++i) {
+#pragma unroll
+      for (int k = 0; k < kAcc; ++k)
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+            "{%0,%1,%2,%3};"
+            : "+f"(d[k][0]), "+f"(d[k][1]), "+f"(d[k][2]), "+f"(d[k][3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+#pragma unroll
+    for (int k = 0; k < kAcc; ++k) s += d[k][0] + d[k][1] + d[k][2] + d[k][3];
+  }
+  if (s == 1234.5f) out[threadIdx.x] = s;
+}
+
+template <int kKind>
+static void launch(int blocks, int threads, uint32_t seed, long iters, float* out) {
+  if constexpr (kKind == 4) mma_loop_f16<false><<<blocks, threads>>>(seed, iters, out);
+  else if constexpr (kKind == 5) mma_loop_f16<true><<<blocks, threads>>>(seed, iters, out);
+  else mma_loop<kKind><<<blocks, threads>>>(seed, iters, out);
+}
+
 template <int kKind>
 static void run(const char* name, double flops_per_mma, double seconds) {
   const int sms = sm_count();
@@ -77,13 +123,13 @@ static void run(const char* name, double flops_per_mma, double seconds) {
   // Calibrate the iteration count to ~0.2 s, then run for `seconds`.
   long iters = 1 << 12;
   t.begin();
-  mma_loop<kKind><<<blocks, threads>>>(1, iters, out);
+  launch<kKind>(blocks, threads, 1, iters, out);
   CHECK(cudaGetLastError());
   double ms = t.end();
   iters = long(iters * 200.0 / ms);
   const int reps = int(seconds / 0.2 + 0.5);
   t.begin();
-  for (int r = 0; r < reps; ++r) mma_loop<kKind><<<blocks, threads>>>(r, iters, out);
+  for (int r = 0; r < reps; ++r) launch<kKind>(blocks, threads, r, iters, out);
   ms = t.end();
   const double mmas = double(blocks) * (threads / 32) * kAcc * iters * reps;
   std::printf("%-6s %8.1f TFLOPS  (%.2f s)\n", name, mmas * flops_per_mma / (ms * 1e-3) / 1e12, ms / 1e3);
@@ -92,12 +138,18 @@ static void run(const char* name, double flops_per_mma, double seconds) {
 
 int main(int argc, char** argv) {
   double seconds = 3;
-  for (int a = 1; a < argc; ++a)
+  const char* only = nullptr;
+  for (int a = 1; a < argc; ++a) {
     if (!std::strcmp(argv[a], "--seconds") && a + 1 < argc) seconds = std::atof(argv[++a]);
+    else if (!std::strcmp(argv[a], "--only") && a + 1 < argc) only = argv[++a];
+  }
   print_device();
-  run<0>("bf16", 2.0 * 16 * 8 * 16, seconds);
-  run<1>("fp8", 2.0 * 16 * 8 * 32, seconds);
-  run<3>("mxfp8", 2.0 * 16 * 8 * 32, seconds);
-  run<2>("nvfp4", 2.0 * 16 * 8 * 64, seconds);
+  auto want = [&](const char* n) { return !only || !std::strcmp(only, n); };
+  if (want("bf16")) run<0>("bf16", 2.0 * 16 * 8 * 16, seconds);
+  if (want("fp8")) run<1>("fp8", 2.0 * 16 * 8 * 32, seconds);
+  if (want("mxfp8")) run<3>("mxfp8", 2.0 * 16 * 8 * 32, seconds);
+  if (want("nvfp4")) run<2>("nvfp4", 2.0 * 16 * 8 * 64, seconds);
+  if (want("f16f32")) run<4>("f16f32", 2.0 * 16 * 8 * 16, seconds);
+  if (want("f16f16")) run<5>("f16f16", 2.0 * 16 * 8 * 16, seconds);
   return 0;
 }
