@@ -5,8 +5,8 @@ Speed and quality of the default configuration (`docker compose up -d serve` wit
 each number. The JSON files of the speed numbers are in [results/](results/).
 
 The speed through the server was measured again when each request of a batched step got its own verify rows
-(2026-11-14), together with DFlash2 (`SPEC=dflash2`) on the same day; the prefill table is from 2026-11-13, when DSpine
-became the default draft. The in-process table by context length runs without speculative decoding and is from
+(2026-11-14), together with DFlash2 (`SPEC=dflash2`) on the same day; the prefill table's DSpine column was measured
+again on 2026-11-14 after the GDN prefill changes (P5-14 to P5-17), its DFlash2 column is from 2026-10-11. The in-process table by context length runs without speculative decoding and is from
 2026-10-11; the comparison with other engines and the power limit section keep their own dates.
 
 ## Conditions
@@ -15,8 +15,8 @@ became the default draft. The in-process table by context length runs without sp
 | --- | --- |
 | GPU | RTX 5090 (32 GB), power limit **400 W** (below the card's default 575 W; every number here is at 400 W) |
 | Host | WSL2 (kernel 6.18), Docker with the NVIDIA Container Toolkit; NVIDIA driver 621.14 (2026-11-13), 617.42 (2026-10-11) |
-| Build | the serving image (CUDA 13.3), code `ea0d2f8` (2026-11-14) for DSpine's concurrent and agent rows, `32e5b99` for the rest (the commit between changes only DSpine's batched steps); prefill `9e74583` (2026-11-13) |
-| Date | 2026-11-14 through the server (prefill 2026-11-13); 2026-10-11 in-process and against other engines |
+| Build | the serving image (CUDA 13.3), code `ea0d2f8` (2026-11-14) for DSpine's concurrent and agent rows, `32e5b99` for the rest (the commit between changes only DSpine's batched steps); prefill `0ea9769` (2026-11-14; DFlash2 column `9e74583`, 2026-10-11) |
+| Date | 2026-11-14 through the server; 2026-10-11 in-process, DFlash2's prefill and against other engines |
 
 Prefill is power-bound at 400 W: the FP4 / FP8 GEMMs and attention all run at the power limit. The card's default
 575 W limit and the energy per token at both limits are in [Power limit and energy](#power-limit-and-energy).
@@ -110,7 +110,8 @@ docker compose --profile dev run --rm dev python scripts/bench_decode.py --weigh
 ```
 
 The results go to `bench/results/`. The runs above are [results/](results/) `20261114-*-dspine-p338*-*.json`
-(DSpine), `20261114-*-dflash2-p338-*.json` (DFlash2), the prefill runs `20261113-*-dspine-release-prefill-*.json` and
+(DSpine), `20261114-*-dflash2-p338-*.json` (DFlash2), the prefill runs `20261114-*-prefill-p517-s*.json` (DSpine;
+v0.5.0 on the same day `20261114-*-prefill-v050-s*.json`; DFlash2 `20261011-*-pr6-custom-prefill-s*.json`) and
 [results/20261011-pr4-prefill-decode.json](results/20261011-pr4-prefill-decode.json) (by context length). The
 measurements of v0.5.0 (every batched request at 8 rows) are `20261113-*-{dspine,dflash2}-release-*.json`, those with
 DFlash2 as the default on 2026-10-11 `20261011-*-pr4-release-*.json`.
@@ -148,30 +149,36 @@ measure: prompt tokens divided by the time to the first token, an average over t
 grows with the position, the speed at a given depth is lower; the second set of rows gives the speed between two
 lengths, (difference in tokens) / (difference in time), the mean of the two seeds.
 
-| Prompt tokens | This engine, DSpine (2026-11-13) | This engine, DFlash2 | NInfer | SGLang | vLLM |
+| Prompt tokens | This engine, DSpine (2026-11-14) | This engine, DFlash2 (2026-10-11) | NInfer | SGLang | vLLM |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 19.5K, average tok/s (time to first token) | **11,438–11,594** (1.68–1.71 s) | 10,705–10,929 (1.78–1.82 s) | 9,271–9,735 (2.00–2.11 s) | 7,231–7,804 (2.50–2.69 s) | 7,530–7,789 (2.50–2.59 s) |
-| 73K | **9,029–9,193** (7.94–8.08 s) | 8,519–8,675 (8.41–8.56 s) | 6,861–7,048 (10.35–10.63 s) | 4,771–4,854 (15.03–15.28 s) | 4,704–4,814 (15.16–15.50 s) |
-| 152K | **6,796–6,864** (22.1–22.4 s) | 6,508–6,575 (23.1–23.4 s) | 4,889–4,941 (30.8–31.1 s) | 2,993–3,022 (50.3–50.8 s) | 2,707–2,741 (55.5–56.1 s) |
-| 0 → 19.5K, tok/s in the interval | **11,516** | 10,817 | 9,503 | 7,517 | 7,659 |
-| 19.5K → 73K | **8,466** | 7,998 | 6,335 | 4,256 | 4,182 |
-| 73K → 152K | **5,548** | 5,359 | 3,868 | 2,234 | 1,953 |
+| 19.5K, average tok/s (time to first token) | **11,776–11,971** (1.63–1.66 s) | 10,705–10,929 (1.78–1.82 s) | 9,271–9,735 (2.00–2.11 s) | 7,231–7,804 (2.50–2.69 s) | 7,530–7,789 (2.50–2.59 s) |
+| 73K | **9,168–9,320** (7.83–7.95 s) | 8,519–8,675 (8.41–8.56 s) | 6,861–7,048 (10.35–10.63 s) | 4,771–4,854 (15.03–15.28 s) | 4,704–4,814 (15.16–15.50 s) |
+| 152K | **6,903–6,993** (21.7–22.0 s) | 6,508–6,575 (23.1–23.4 s) | 4,889–4,941 (30.8–31.1 s) | 2,993–3,022 (50.3–50.8 s) | 2,707–2,741 (55.5–56.1 s) |
+| 0 → 19.5K, tok/s in the interval | **11,873** | 10,817 | 9,503 | 7,517 | 7,659 |
+| 19.5K → 73K | **8,554** | 7,998 | 6,335 | 4,256 | 4,182 |
+| 73K → 152K | **5,652** | 5,359 | 3,868 | 2,234 | 1,953 |
+
+The DSpine column is code `0ea9769`. On the same day the release v0.5.0 (`c835358`) gave 11,564–11,820 / 9,134–9,260 /
+6,866–6,951 tok/s (1.65–1.69 / 7.88–7.98 / 21.9–22.1 s), so the GDN prefill changes take 1.5 / 0.5 / 0.6% off the
+time to the first token; the rest of the difference to the 2026-11-13 numbers (11,438–11,594 at 19.5K,
+`20261113-*-dspine-release-prefill-*.json`) is the day.
 
 The settings are those in the table below, except NInfer, which ran without speculative decoding (`--max-context
 262144 --max-concurrency 1`): 152K does not fit with DFlash2 under WSL2. Without speculative decoding it also skips
 the pass of the draft model (or MTP head) over the prompt that the other engines run. The time to the first token includes HTTP,
-tokenization and the first decode step, so these are slightly below the in-process prefill numbers above
-(11,295 / 8,773 tok/s at 19K / 73K).
+tokenization, the draft model's pass and the first decode step. The in-process prefill numbers above (11,295 / 8,773
+tok/s at 19K / 73K) are from an older build (2026-10-11).
 
 | Engine | Version | Weights | KV cache | Speculative decoding | Settings |
 | --- | --- | --- | --- | --- | --- |
-| This engine | this repository (`9e74583` / 2026-10-11) | `gdnfp4` | NVFP4 | DSpine, 16-token blocks (adaptive 16 / 8 rows) / DFlash2, 8-token blocks | defaults (`MAX_SEQS=8`) |
+| This engine | this repository (DSpine: `0ea9769` / 2026-11-14; DFlash2: `9e74583` / 2026-10-11) | `gdnfp4` | NVFP4 | DSpine, 16-token blocks (adaptive 16 / 8 rows) / DFlash2, 8-token blocks | defaults (`MAX_SEQS=8`) |
 | [NInfer](https://github.com/Neroued/ninfer) | [`81c8ce0`](https://github.com/Neroued/ninfer/commit/81c8ce093b2c1646a87566a8e59d807fcf0ec95c), built on this repository's `dev` image | `neroued/Qwen3.8-27B-nvfp4-NInfer` | FP8 | DFlash2, 7 draft tokens, `--lm-head-draft` | x8: `--max-context 16384 --max-concurrency 8 --device-state-slots 0` (decode, concurrency); x4: `--max-context 94208 --max-concurrency 4` (agent, documents); larger settings do not fit under WSL2 |
 | [SGLang](https://github.com/sgl-project/sglang) | [v0.5.21](https://github.com/sgl-project/sglang/releases/tag/v0.5.21) with two unmerged patches: embedding in host memory ([#37826](https://github.com/sgl-project/sglang/pull/37826), backported) and MTP weight sharing ([#37155](https://github.com/sgl-project/sglang/pull/37155)) | `nvidia/Qwen3.8-27B-NVFP4` | FP8 | fast: DFlash2 (one request at a time); agent / parallel: the checkpoint's MTP head, 5 steps | fast: 90K, 1 request; agent: 196K, 4 requests; parallel: 160K, 8 requests |
 | [vLLM](https://github.com/vllm-project/vllm) | [v0.29.0](https://github.com/vllm-project/vllm/releases/tag/v0.29.0) | `nvidia/Qwen3.8-27B-NVFP4` | FP8 | MTP, 3 tokens | 160K, 8 requests, a fixed 6.5 GiB KV cache |
 
 The JSON files are in [results/](results/) (`20261011-1*-pr6-*.json`, this engine on 2026-11-14
-`20261114-*-dspine-p338*-*.json`, its prefill on 2026-11-13 `20261113-*-dspine-release-prefill-*.json`). Notes:
+`20261114-*-dspine-p338*-*.json`, its prefill `20261114-*-prefill-p517-s*.json` and v0.5.0's on the same day
+`20261114-*-prefill-v050-s*.json`). Notes:
 
 - NInfer sizes its memory from what `cudaMemGetInfo` reports free minus a 1 GiB margin. Under WSL2 that leaves
   9.5 GB after its weights, which limits the context with several requests. It reuses a prefix only at the end of a

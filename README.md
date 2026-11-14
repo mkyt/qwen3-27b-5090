@@ -77,7 +77,7 @@ Long prompts stay fast and accurate:
 | 73K tokens | 8,773 tok/s (8.3 s) | 87 tok/s |
 | 194K tokens | 5,875 tok/s (33 s) | 77 tok/s |
 
-Between 73K and 152K tokens of a prompt this engine prefills 5,359 tok/s, against 3,868 (NInfer), 2,234 (SGLang)
+Between 73K and 152K tokens of a prompt this engine prefills 5,652 tok/s, against 3,868 (NInfer), 2,234 (SGLang)
 and 1,953 (vLLM). Needle retrieval finds 16 of 16 facts at 190K tokens and 56 of 64 at 256K.
 
 The full measurements, each engine's settings and the caveats (NInfer's memory sizing under WSL2, for one) are in
