@@ -293,8 +293,9 @@ async def scenario_agent(client, model, args, sessions):
         **delta_stats(before, await scrape(client)),
         "rows": rows,
     }
-    print(f"  agent x{sessions}: warm TTFT p50 {out['warm_turn_ttft']['p50']}s, "
-          f"decode p50 {out['decode_tps']['p50']} tok/s, hit rate {out['prefix_cache_hit_rate']} "
+    p50 = lambda s: s["p50"] if s else None  # (None: no turn had two timed chunks)
+    print(f"  agent x{sessions}: warm TTFT p50 {p50(out['warm_turn_ttft'])}s, "
+          f"decode p50 {p50(out['decode_tps'])} tok/s, hit rate {out['prefix_cache_hit_rate']} "
           f"({out.get('prefix_cache_hit_of_reusable')} of reusable), "
           f"final ctx {out['final_prompt_tokens']}")
     return out

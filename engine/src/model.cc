@@ -407,6 +407,7 @@ void Model::configure() {
   batch_adapt_ = adapt_on_ && env_int("Q27_SPEC_ADAPT_BATCH", 1) != 0;
   batch_hyst_ = std::max(0.f, env_f("Q27_SPEC_ADAPT_HYST", 0.01f));
   batch_period_ = std::max(1, env_int("Q27_SPEC_ADAPT_PERIOD", 8));
+  batch_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_BATCH_ALPHA", 0.03125f), 0.f, 1.f);
   spec_pipeline_ = env_int("Q27_SPEC_PIPELINE", 1) != 0;
   mlp_bf16_ = env_int("Q27_MLP_BF16", 1) != 0;
   mlp_fused_ = env_int("Q27_MLP_FUSED", 1) != 0;
@@ -1532,7 +1533,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   // The full block first; the average starts between the thresholds.
   spec_smp_.block = spec_smp_.block_next = spec_smp_.block_due = draft_->block();
   spec_smp_.accept_ema = 0.5f * (adapt_up_ + adapt_down_);
-  spec_smp_.lane_rows = std::min(ddims::kBlock, draft_->block()), spec_smp_.lane_ema = 4.25f;
+  spec_smp_.lane_rows = std::min(ddims::kBlock, draft_->block()), spec_smp_.lane_ema = 4.25f, spec_smp_.lane_seen = 0;
   return first;
 }
 
@@ -2283,6 +2284,22 @@ float batch_step_ms(int lanes, int rows) {
 }
 }  // namespace
 
+// A batched step's tokens k at w rows: the moving averages of the lane at w (lane_ema, lane_tok); the other widths it
+// ran drift towards the extrapolation from w (by a quarter of the rate), so an old measurement fades.
+void Model::lane_note(SpecSampling& m, int w, int k) const {
+  if (!batch_adapt_ || m.pinned || m.masked) return;
+  m.lane_ema += batch_alpha_ * (float(k) - m.lane_ema);
+  if (w % 4) return;
+  const int full = std::min(draft_->block(), kSpecBlock);
+  for (int c = 4; c <= full; c += 4) {
+    const int b = c / 4 - 1;
+    if (c == w)
+      m.lane_tok[b] = m.lane_ema, m.lane_seen |= uint8_t(1 << b);
+    else if (m.lane_seen >> b & 1)
+      m.lane_tok[b] += 0.25f * batch_alpha_ * (geo_tokens(m.lane_ema, w, c) - m.lane_tok[b]);
+  }
+}
+
 // The lanes' rows of a batched step (DSpine). Rule (P3-38, chosen on recorded DSpine steps): each lane's expected
 // tokens at c rows, est(c), come from the moving average of its tokens per step at the rows it ran; the step's time is
 // about batch_step_ms(lanes, total rows) (the GEMMs step up at every 16 rows of the total; how the rows split does
@@ -2299,7 +2316,8 @@ void Model::batch_rows(int n, int* w) {
     SpecSampling& m = lane_smp(z);
     fixed[z] = m.pinned || m.masked || !batch_adapt_;
     cur[z] = m.pinned ? std::clamp(m.block_due, 2, kSpecBlock) : fixed[z] ? std::min(ddims::kBlock, full) : m.lane_rows;
-    for (int c = 4; c <= full; c += 4) est[z][c / 4] = geo_tokens(m.lane_ema, std::max(cur[z], 2), c);
+    for (int c = 4; c <= full; c += 4)
+      est[z][c / 4] = m.lane_seen >> (c / 4 - 1) & 1 ? m.lane_tok[c / 4 - 1] : geo_tokens(m.lane_ema, std::max(cur[z], 2), c);
     w[z] = cur[z];
   }
   auto ema = [&](int z) { return lane_smp(z).lane_ema; };
@@ -2337,7 +2355,7 @@ void Model::batch_rows(int n, int* w) {
   for (int z = 0; z < n; z++) {  // (the average is of the rows the lane ran: rescaled to the new ones)
     SpecSampling& m = lane_smp(z);
     if (fixed[z] || w[z] == cur[z]) continue;
-    m.lane_ema = geo_tokens(m.lane_ema, cur[z], w[z]);
+    m.lane_ema = est[z][w[z] / 4];
     m.lane_rows = w[z];
   }
 }
@@ -2439,7 +2457,7 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     *r.spec_last = o[k - 1];
     stat_steps_++, stat_tokens_ += k;
     spec_adapt(lane_smp(z), k);  // (the width of the sequence's later steps, batched or not)
-    lane_smp(z).lane_ema += adapt_alpha_ * (float(k) - lane_smp(z).lane_ema);  // (its rows in later batched steps)
+    lane_note(lane_smp(z), blr_.rows(z), k);  // (its rows in later batched steps)
   }
   bpar_ ^= 1;
   bstep_++;

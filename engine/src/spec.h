@@ -68,6 +68,10 @@ struct SpecSampling {
   // per batched step at those rows. Past batched steps decide them, as the single width above.
   int lane_rows = 8;
   float lane_ema = 4.25f;
+  // The lane's tokens per step at 4 / 8 / 12 / 16 rows (lane_tok[c / 4 - 1]) once it ran them (bit c / 4 - 1 of
+  // lane_seen): measured widths are estimated from these, the others extrapolated from lane_ema.
+  float lane_tok[4] = {};
+  uint8_t lane_seen = 0;
   bool penalized() const { return pen.presence != 0.f || pen.frequency != 0.f; }
   bool same(const SpecSampling& o) const {  // (the settings a captured step depends on)
     return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && paths == o.paths &&

@@ -407,9 +407,11 @@ class Model {
   BatchGraph& batch_graph(int n);
   void batch_prepare(const int32_t* lanes, int n);
   void batch_rows(int n, int* rows);  // the lanes' rows of a batched step (DSpine)
+  void lane_note(SpecSampling& m, int rows, int tokens) const;
   bool batch_adapt_ = false;
   float batch_hyst_ = 0.01f;
   int batch_period_ = 8;   // batched steps between the decisions (Q27_SPEC_ADAPT_PERIOD)
+  float batch_alpha_ = 0.03125f;  // the lanes' moving averages (Q27_SPEC_ADAPT_BATCH_ALPHA)
   uint64_t bstep_ = 0;     // batched steps run
   bool batch_part(int n, int part);
   GdnSpec gdn_spec_lanes(int gdn_layer) const;
