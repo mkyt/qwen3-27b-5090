@@ -319,6 +319,16 @@ gate without an explicit decision, recorded below with its numbers.
   instructions alike): one GEMM for qkv | z (slower than the two), as many tiles on every CTA (154 x 5), a dynamic
   tile counter, the producer's loads from an elected lane without the per-lane loop the lane-0 branch compiled to
   (14% of the instructions: kept, but no faster). As a pair qkv and z are 1.7% faster than CUTLASS's.
+- **P5-14: the GDN chunk prep writes only (I + L)^-1.** The P5-2 prep solved [W | U] for 256 columns and wrote
+  W, U, M and BF16 q / k: 188 MB for one layer of 2,048 tokens, so its 121 us were memory time. With A = (I + L)^-1,
+  delta = U - W S = A (diag(beta) V - diag(beta e^gamma) K S): the chunk kernel computes K S (K is already in shared
+  memory for the state update) and multiplies by A, so W and U are never written (prep 121 -> 53 us, 76 MB). The
+  extra product runs on F16 MMAs with each state column of X scaled by a power of 2, which keeps the error against
+  the FP64 recurrence at the old level (o 3.5e-3, state 2.6e-3; BF16 operands there gave 3.9e-3 / 3.1e-3). The
+  inverse is solved by four lanes per column, rows interleaved and L read as float4 (a lane per column: 66 us).
+  One layer 256 -> 187 us of kernel time; prefill 19K +1.9%, 73K +1.1%; golden against BF16 KL 0.0454 -> 0.0459
+  (two builds of the same code differ by 0.047). F16 accumulators (twice the MMA rate, `micro/mma_peak`) are not
+  used yet; the chunk kernel holds 250 registers, and adding a bound-based scale there spilled (+30 us).
 - **Not done: FP4 attention for P V (SageAttention3 style), a megakernel.** See [Not done](#not-done).
 
 ## Vision

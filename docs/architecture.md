@@ -280,8 +280,8 @@ Prefill runs in chunks of 2,048 tokens through the same weights.
     of context), instead of once per CTA (P7-8).
   - Tiles follow absolute positions (64-token blocks, blocks ending past 1,024 split their keys in two), so a row's
     result does not depend on where a chunk starts.
-- **GDN**: a chunked delta rule with chunks of 64 (WY representation: the per-chunk matrices in FP32 by forward
-  substitution, the inter-chunk state update on BF16 MMAs; P5-2). Chunk boundaries are fixed at multiples of 64
+- **GDN**: a chunked delta rule with chunks of 64 (WY representation: (I + L)^-1 per chunk in FP32 by forward
+  substitution, the inter-chunk state update on BF16 MMAs and delta from (I + L)^-1 on F16 MMAs; P5-2, P5-14). Chunk boundaries are fixed at multiples of 64
   absolute positions, and so are the prefill chunk boundaries and the checkpoints. A prefill resumed from a
   checkpoint is therefore bit-identical to one that ran through.
 - **Draft context**: only the last 2,048 tokens of a prompt go through the draft.
