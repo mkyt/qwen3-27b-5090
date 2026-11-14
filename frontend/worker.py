@@ -158,6 +158,8 @@ class Scheduler:
         self.quantum = cfg["quantum_ms"] / 1000.0
         self.eos = set(cfg["eos"])
         self.im_start = cfg["im_start"]
+        self.user = cfg.get("user")
+        self.breaks = frozenset(cfg.get("breaks", ()))
         self.waiting = collections.deque()
         self.alive = []          # admitted, unfinished
         self.by_id = {}
@@ -377,9 +379,20 @@ class Scheduler:
         """Checkpoints of a prompt (docs/architecture.md §9): the end of the first message (the shared system prompt
         and tools), the starts of the last message and of the generation prompt (a retried request, or a
         client that rewrites the last turn), and where the prompt leaves the longest earlier sequence (a
-        prefix shared inside a message). The end of the generation is saved after it."""
+        prefix shared inside a message), and after the last blank line of a final user message (a document followed
+        by a question: the next question about it shares the document). The end of the generation is saved
+        after it."""
         starts = [i for i, t in enumerate(prompt) if t == self.im_start]
         at = set(starts[1:2] + starts[-2:])
+        if len(starts) >= 2 and starts[-2] + 1 < len(prompt) and prompt[starts[-2] + 1] == self.user:
+            # (positions are rounded down to 64 in the engine: the generation prompt's start can land past the end of
+            # the document and miss a follow-up question that differs only after it)
+            b = next((i + 1 for i in range(starts[-1] - 1, starts[-2], -1) if prompt[i] in self.breaks), 0)
+            g = starts[-1] // 64 * 64
+            if b and b // 64 * 64 < g:
+                if g - b // 64 * 64 <= 64:  # (one block apart: a chunk of 64 tokens would take the decode GEMMs)
+                    at.discard(starts[-1])
+                at.add(b)
         if reusable > 0:
             at.add(reusable)
         return sorted(at)

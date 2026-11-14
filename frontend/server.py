@@ -1639,6 +1639,7 @@ def main():
     base = {"prefill_chunk": args.prefill_chunk, "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv),
             "kv_reserve": args.kv_reserve, "decode_share": args.decode_share, "quantum_ms": args.quantum_ms,
             "batch_decode": bool(args.batch_decode), "im_start": tok.token_id("<|im_start|>"),
+            "user": tok.encode("user")[0], "breaks": tok.paragraph_breaks(),
             "engine_python": str(ROOT / "engine/python"), "tokenizer": str(pathlib.Path(path) / "tokenizer.json")}
     # Images by default with the vision tower in pinned host memory (no KV pool cost); the library default is off.
     launch = Launch(base, dict(env_settings(), weights=args.weights, kv_dtype=args.kv_dtype, spec=args.spec,

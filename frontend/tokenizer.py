@@ -128,6 +128,18 @@ class Tokenizer:
     def encode(self, text):
         return self.tok.encode(text, add_special_tokens=False).ids
 
+    def paragraph_breaks(self):
+        """Ids of the tokens that end a blank line (whitespace only, two or more newlines): where a document
+        pasted into a message ends and the question after it begins (Worker.checkpoints)."""
+        out = []
+        for t, i in self.tok.get_vocab().items():
+            if i in self.added or any(c not in BYTE_DECODER for c in t):
+                continue
+            b = bytes(BYTE_DECODER[c] for c in t)
+            if b.count(b"\n") >= 2 and not b.strip(b" \t\r\n") and b.rstrip(b" \t").endswith(b"\n"):
+                out.append(i)
+        return sorted(out)
+
     def decode(self, ids):
         return self.tok.decode(ids, skip_special_tokens=False)
 

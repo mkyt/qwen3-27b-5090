@@ -297,7 +297,10 @@ it (reference-counted, shared between checkpoints of the same conversation) and 
 convolution, the draft's context ring: 189.9 MiB).
 
 - **Where checkpoints are taken**: at message boundaries the server marks (the end of the first message, which
-  holds the system prompt and tools; the starts of the last message and of the generation prompt), where the prompt diverges from the previous
+  holds the system prompt and tools; the starts of the last message and of the generation prompt), after the last
+  blank line of a final user message (a document followed by a question: a second question about the same document
+  reuses all of it; without this the generation prompt's checkpoint, rounded down to 64, often fell just past the
+  document and the next question resumed from the last interval checkpoint, up to 8,192 tokens back), where the prompt diverges from the previous
   one, every `CHECKPOINT_INTERVAL` (8,192) tokens inside a long prompt (the last four), and at the end of each
   generation. Positions are rounded down to multiples of 64 ([§8](#8-prefill)).
 - **Where they are kept**: in pinned host memory (`STATE_HOST_CACHE`, 4 GiB = 21 checkpoints). Saving copies the
