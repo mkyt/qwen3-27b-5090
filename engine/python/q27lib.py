@@ -32,6 +32,8 @@ SIGNATURES = {
     "q27_has_draft": ([P], I),
     "q27_spec_block": ([P], I),
     "q27_last_step_block": ([P], I),
+    "q27_last_lane_block": ([P, I], I),
+    "q27_spec_set_block": ([P, I, I], I),
     "q27_max_lanes": ([P], I),
     "q27_max_tokens": ([P], I),
     "q27_spec_step_lanes": ([P, P, I, P, P], I),
@@ -277,7 +279,7 @@ class Engine:
     @property
     def spec_block(self):
         """Rows of a single sequence's speculative step: the last token and the drafted ones (DFlash2 8, DSpine up to
-        16; batched steps take 8 per lane)."""
+        16; batched steps take their lane's width, 2..16)."""
         return lib().q27_spec_block(self.h)
 
     @property
@@ -315,12 +317,13 @@ class Engine:
         self._check(lib().q27_spec_set_masked(self.h, -1 if area is None else area), "q27_spec_set_masked")
 
     def spec_draft_lanes(self, lanes):
-        """spec_draft for a batched step with masked lanes (spec_step_lanes follows): per lane its 8 verify tokens."""
+        """spec_draft for a batched step with masked lanes (spec_step_lanes follows): per lane its verify tokens (its
+        block's rows: the host's mask rows of lane z are 16 z ..)."""
         n = len(lanes)
         src = (ctypes.c_int32 * n)(*[-1 if a is None else a for a in lanes])
-        out = (ctypes.c_int32 * (8 * n))()
+        out = (ctypes.c_int32 * (16 * n))()
         self._check(lib().q27_spec_draft_lanes(self.h, src, n, out), "q27_spec_draft_lanes")
-        return [list(out[8 * z:8 * z + 8]) for z in range(n)]
+        return [[t for t in out[16 * z:16 * z + 16] if t >= 0] for z in range(n)]
 
     def spec_step(self, ahead=True):
         """One draft + verify step; returns the new tokens (1..spec_block). ahead=False: the next step is not launched
@@ -338,12 +341,20 @@ class Engine:
 
     def spec_step_lanes(self, lanes):
         """One batched speculative step (P6-10) of the decoding sequences `lanes` (None: the running one, else
-        a parking area): the same tokens as a spec_step of each. Returns their new tokens (lists of 1..8)."""
+        a parking area): the same tokens as a spec_step of each. Returns their new tokens (lists of 1..16)."""
         n = len(lanes)
         src = (ctypes.c_int32 * n)(*[-1 if a is None else a for a in lanes])
-        out, counts = (ctypes.c_int32 * (8 * n))(), (ctypes.c_int32 * n)()
+        out, counts = (ctypes.c_int32 * (16 * n))(), (ctypes.c_int32 * n)()
         self._check(lib().q27_spec_step_lanes(self.h, src, n, out, counts), "q27_spec_step_lanes")
-        return [list(out[8 * z:8 * z + counts[z]]) for z in range(n)]
+        return [list(out[16 * z:16 * z + counts[z]]) for z in range(n)]
+
+    def last_lane_block(self, z):
+        """Rows of lane z's block in the last spec_step_lanes (0 for builds without the entry)."""
+        return lib().q27_last_lane_block(self.h, z) if hasattr(lib(), "q27_last_lane_block") else 0
+
+    def spec_set_block(self, area, block):
+        """Pins a decoding sequence's verify width (area None: the running one) for its single and batched steps."""
+        self._check(lib().q27_spec_set_block(self.h, -1 if area is None else area, block), "q27_spec_set_block")
 
     def prefill(self, ids, budget, spec=False):
         """Prompt chunks of ids (the rest of the prompt) while more than one prefill chunk is left, at least

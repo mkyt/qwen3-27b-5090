@@ -627,15 +627,18 @@ __global__ void __launch_bounds__(kPrepThreads) gdn_prep_kernel(const float* qkv
   // Before the PDL wait: everything that does not come from the previous kernels (weights, the conv
   // state of this layer, the previous verify's inputs); after it: qkv and the normed hidden state h.
   pdl_trigger();
-  // Batched verify (P6-10): lane ln = blockIdx.y, its rows from r0 in every row buffer, its scalars at
-  // offset ln and its conv state (0 / the call's otherwise). (Locals, not edits of sp: those spill it.)
+  // Batched verify (P6-10): lane ln = blockIdx.y, its rows from r0 in every row buffer (T of them), the previous
+  // verify's from pr0, its scalars at offset ln, its commit path at kLaneSlot ln and its conv state (0 / the call's
+  // otherwise). (Locals, not edits of sp: those spill it.)
   int ln = 0;
+  int64_t r0 = 0, pr0 = 0, cp0 = 0;
   if constexpr (kBatch) {
     ln = blockIdx.y;
     conv_state = lane_sel(sp.lconv, ln);
-    qkv += int64_t(kLaneRows) * ln * ld, h += int64_t(kLaneRows) * ln * kHidden, po.q += int64_t(kLaneRows) * ln * kQ;
+    r0 = sp.lr.first(ln), pr0 = sp.prow0[ln], cp0 = int64_t(kLaneSlot) * ln;
+    if (T > 0) T = sp.lr.rows(ln);  // (0: a flush)
+    qkv += r0 * ld, h += r0 * kHidden, po.q += r0 * kQ;
   }
-  const int64_t r0 = int64_t(kLaneRows) * ln;
   const int blk = blockIdx.x, tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
   __shared__ float red[kPrepGroup][kPrepThreads / 32];
   __shared__ int8_t s_depth[kVerifyMaxT], s_path[kVerifyMaxT][kSpecBlock];
@@ -652,7 +655,7 @@ __global__ void __launch_bounds__(kPrepThreads) gdn_prep_kernel(const float* qkv
     const int c = is_qk ? half * kQ + blk * kKDim + j : 2 * kQ + (blk - kPrepQK) * kPrepThreads + tid;
     ConvIn in = conv_load(conv_state, conv_w, c);
     // (the committed window is written back by gdn_rec_kernel once every block has read the old one)
-    if constexpr (kVerify) conv_replay(in, c, (prev ? sp.raw[1] : sp.raw[0]) + r0 * kConvDim, nc, sp.cpath + r0);
+    if constexpr (kVerify) conv_replay(in, c, (prev ? sp.raw[1] : sp.raw[0]) + pr0 * kConvDim, nc, sp.cpath + cp0);
     if (T == 0) return;  // flush: replay only
     pdl_wait();
     // Paths of the rows: the tree (written by this step's selector, after the wait), or the chain 0..t
@@ -869,16 +872,17 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
                                                                  uint8_t* q8, float in_scale, GdnSpec sp) {
   pdl_trigger();
   GDN_PROBE(0);
-  // Batched verify (P6-10): lane ln = blockIdx.y (clusters run along x), its rows from r0, its scalars
-  // at offset ln, its states lconv / lst (replayed in place); 0 / the call's otherwise.
+  // Batched verify (P6-10): lane ln = blockIdx.y (clusters run along x), its rows from r0, the previous verify's
+  // from pr0, its commit path at kLaneSlot ln, its scalars at offset ln, its states lconv / lst (replayed in place);
+  // 0 / the call's otherwise.
   int ln = 0;
+  int64_t r0 = 0, pr0 = 0, cp0 = 0;
   if constexpr (kBatch) {
     ln = blockIdx.y;
-    const int64_t o = int64_t(kLaneRows) * ln;
-    in.q += o * kQ, z += o * ldz, out += o * kVHeads * kVDim;
-    if (q8) q8 += o * kVHeads * kVDim;
+    r0 = sp.lr.first(ln), pr0 = sp.prow0[ln], cp0 = int64_t(kLaneSlot) * ln;
+    in.q += r0 * kQ, z += r0 * ldz, out += r0 * kVHeads * kVDim;
+    if (q8) q8 += r0 * kVHeads * kVDim;
   }
-  const int64_t r0 = int64_t(kLaneRows) * ln;
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
   constexpr int kRows = kTree ? kTreeMax : kSpecBlock;  // rows staged at once
@@ -930,10 +934,10 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
     // Replay of the previous verify's committed rows (inputs final: before the PDL wait).
     const int cur = sp.par[ln], prev = cur ^ 1, nc = sp.ncommit[ln];
     if (nc > 0) {
-      if (tid < nc) s_rows[tid] = sp.cpath[r0 + tid];
+      if (tid < nc) s_rows[tid] = sp.cpath[cp0 + tid];
       __syncthreads();
-      const float* kp = (prev ? sp.k[1] : sp.k[0]) + r0 * kQ;
-      stage({kp, nullptr, (prev ? sp.v[1] : sp.v[0]) + r0 * kVHeads * kVDim, (prev ? sp.ab[1] : sp.ab[0]) + r0 * 2 * kVHeads},
+      const float* kp = (prev ? sp.k[1] : sp.k[0]) + pr0 * kQ;
+      stage({kp, nullptr, (prev ? sp.v[1] : sp.v[0]) + pr0 * kVHeads * kVDim, (prev ? sp.ab[1] : sp.ab[0]) + pr0 * 2 * kVHeads},
             nc, s_rows);
       for (int t = 0; t < nc; t++) gdn_step(S, sk[t], sk[t], sv[t][lcol], s_decay[t], s_beta[t]);
       __syncthreads();  // the staging buffers are refilled below
@@ -949,10 +953,10 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
     // Conv state of the layer: the committed window (the prep kernel, which reads the old one, is done).
     const int c = blockIdx.x * blockDim.x + tid;
     if (nc > 0 && c < kConvDim) {
-      const float* rp = (prev ? sp.raw[1] : sp.raw[0]) + r0 * kConvDim;
+      const float* rp = (prev ? sp.raw[1] : sp.raw[0]) + pr0 * kConvDim;
       float* cs = (kBatch ? lane_sel(sp.lconv, ln) : sp.conv_state) + c * (kConvK - 1);
       float x0 = cs[0], x1 = cs[1], x2 = cs[2];
-      for (int jj = 0; jj < nc; jj++) x0 = x1, x1 = x2, x2 = rp[int64_t(sp.cpath[r0 + jj]) * kConvDim + c];
+      for (int jj = 0; jj < nc; jj++) x0 = x1, x1 = x2, x2 = rp[int64_t(sp.cpath[cp0 + jj]) * kConvDim + c];
       cs[0] = x0, cs[1] = x1, cs[2] = x2;
     }
     if (T == 0) return;  // (uniform over the cluster: no cluster barrier is reached)
@@ -1134,7 +1138,8 @@ void gdn_verify_prep(const float* qkv, int ld, int T, float* conv_state, const b
   // T = 0 (flush): one column of blocks that only replays the conv state.
   // A chain (one path) needs no tree lookups: row t is at depth t.
   if (sp.lanes > 0) {  // batched chain verify: T rows per lane (P6-10)
-    Q27_CHECK(sp.paths <= 1 && T <= kLaneRows && sp.lanes <= kMaxLanes, "gdn_verify_prep: batched chains only");
+    Q27_CHECK(sp.paths <= 1 && sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify_prep: batched chains only");
+    T = T > 0 ? sp.lr.max_rows() : 0;  // (each lane runs its own rows)
     launch_pdl(gdn_prep_kernel<true, false, true>, dim3(prep_blocks<true>(T), sp.lanes), dim3(kPrepThreads), 0, s, qkv,
                ld, T, conv_state, conv_w, h, wa, wb, PrepOut{q, nullptr, nullptr, nullptr}, sp);
   } else if (sp.paths > 1)
@@ -1151,7 +1156,7 @@ void gdn_verify(const float* q, int T, const bf16* A_log, const bf16* dt_bias, f
                 cudaStream_t s) {
   Q27_CHECK(T <= kVerifyMaxT, "gdn_verify: T must be <= 32");
   if (sp.lanes > 0) {
-    Q27_CHECK(sp.paths <= 1 && T <= kLaneRows && sp.lanes <= kMaxLanes, "gdn_verify: batched chains only");
+    Q27_CHECK(sp.paths <= 1 && sp.lanes <= kMaxLanes && sp.lr.n == sp.lanes && sp.prow0, "gdn_verify: batched chains only");
     launch_pdl_cluster(gdn_rec_kernel<true, false, true>, dim3(kVHeads * kRecSplit, sp.lanes), dim3(kRecWarps * 32), 0,
                        s, kRecSplit, RecIn{nullptr, q, nullptr, nullptr}, T, A_log, dt_bias, state, z, ldz, norm_w,
                        eps, out, q8, in_scale, sp);

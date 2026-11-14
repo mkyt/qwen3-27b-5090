@@ -278,6 +278,9 @@ int q27_spec_draft(void* m, int32_t* chain) {
 }
 
 // Masks of a decoding sequence from its next step on (Model::spec_set_masked; area -1: the running one).
+int q27_spec_set_block(void* m, int area, int block) {
+  return guard([&] { static_cast<Model*>(m)->spec_set_block(area, block); });
+}
 int q27_spec_set_masked(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->spec_set_masked(area); });
 }
@@ -306,12 +309,12 @@ int q27_seq_suspend(void* m, int area) {
 }
 
 // Batched speculative steps (P6-10, Model::spec_step_lanes): lanes[n] (-1: the running sequence, else a
-// parking area); out [n][8] new tokens, counts [n]. 0, -1 on an error, -2 when the KV pool is full.
+// parking area); out [n][16] new tokens, counts [n]. 0, -1 on an error, -2 when the KV pool is full.
 int q27_max_lanes(void* m) { return static_cast<Model*>(m)->max_lanes(); }
 int q27_spec_step_lanes(void* m, const int32_t* lanes, int n, int32_t* out, int32_t* counts) {
   return guard([&] { static_cast<Model*>(m)->spec_step_lanes(lanes, n, out, counts); });
 }
-// Lanes with masks (Model::spec_draft_lanes): chain [n][8].
+// Lanes with masks (Model::spec_draft_lanes): chain [n][16] (lane z's block rows, then -1).
 int q27_spec_draft_lanes(void* m, const int32_t* lanes, int n, int32_t* chain) {
   return guard([&] { static_cast<Model*>(m)->spec_draft_lanes(lanes, n, chain); });
 }
@@ -321,6 +324,8 @@ int q27_has_draft(void* m) { return static_cast<Model*>(m)->has_draft() ? 1 : 0;
 int q27_spec_block(void* m) { return static_cast<Model*>(m)->spec_block(); }
 // Rows of the block of the step the last q27_spec_step returned (Q27_SPEC_ADAPT: 8 or the draft's block).
 int q27_last_step_block(void* m) { return static_cast<Model*>(m)->last_step_block(); }
+// Rows of lane z's block in the last q27_spec_step_lanes (0: no such lane).
+int q27_last_lane_block(void* m, int z) { return static_cast<Model*>(m)->last_lane_block(z); }
 
 // Speculative counters since the last call: steps, lookup steps, tokens.
 int q27_spec_stats(void* m, int64_t* out) {

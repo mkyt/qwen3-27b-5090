@@ -651,13 +651,13 @@ class Scheduler:
             if any(s.gm is not None for s in seqs):  # (structured output: drafted, masked by the grammars, verified)
                 for z, (s, chain) in enumerate(zip(seqs, self.engine.spec_draft_lanes(lanes))):
                     if s.gm is not None:
-                        write_masks(self.engine, s.gm, chain, 8 * z, self.eos)
+                        write_masks(self.engine, s.gm, chain, 16 * z, self.eos)
             new = self.engine.spec_step_lanes(lanes)
             self.m["q27:spec_verify_calls_total"] += len(seqs)
             self.m["q27:batched_steps_total"] += 1
             for z, (s, toks) in enumerate(zip(seqs, new)):
                 s.steps += 1
-                self.count_draft(s, toks)
+                self.count_draft(s, toks, max(1, self.engine.last_lane_block(z) or 8) - 1)
                 self.emit(s, toks, self.engine.logprobs(z) if s.logprobs >= 0 else None)
             if any(s.dead or s.phase != DECODE for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0):
                 break

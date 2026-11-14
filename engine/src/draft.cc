@@ -13,6 +13,10 @@ namespace q27 {
 
 using namespace ddims;
 
+// Rows of the attention buffers (q, kb, vb, partials) for B block rows: a block runs on the kernel of the next size
+// (8 or 16), whose rows past it are read (a batched step's last lane: up to 7 rows past the step's).
+static int attn_rows(int B) { return std::max(B + kBlock, kMaxBlock); }
+
 void Draft::tensor(const std::string& name, const bf16** dst, int64_t rows, int64_t cols) {
   const auto& info = ckpt_->info(name);
   Q27_CHECK(info.dtype == "BF16", name + ": expected BF16");
@@ -90,7 +94,7 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
   }
   for (int i = 0; i < kCtxFeatures; i++)
     Q27_CHECK(dc["target_layer_ids"][i].as_int() == ctx_layers_[i], "unexpected draft target_layer_ids");
-  max_ctx_rows_ = std::max({max_ctx_rows, block_, kBlock * lanes});
+  max_ctx_rows_ = std::max({max_ctx_rows, block_, batch_row_budget(lanes)});
   if (const char* e = getenv("Q27_DRAFT_QUANT")) {
     if (!strcmp(e, "bf16"))
       quant_ = DraftQuant::kBf16;
@@ -165,10 +169,10 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
   }
 
   const int R = max_ctx_rows_;
-  const int B = std::max(block_, kBlock * lanes);  // block rows of a (batched) step
+  const int B = std::max(block_, batch_row_budget(lanes));  // block rows of a (batched) step
   auto f32 = [&](const char* what, int64_t n) { return act.add(std::string("draft ") + what, size_t(n) * 4); };
   auto b16 = [&](const char* what, int64_t n) { return act.add(std::string("draft ") + what, size_t(n) * 2); };
-  const int BQ = std::max(B, kMaxBlock);  // (q / kb / vb / partials: the attention kernel's rows)
+  const int BQ = attn_rows(B);
   off_.x = f32("x", B * kHidden);
   off_.h = f32("h", B * kHidden);
   off_.act_q = act.add("draft GEMM input", size_t(B) * kMaxK * 2);
@@ -188,7 +192,7 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
   off_.ctx = f32("ctx", int64_t(R) * kHidden);
   off_.ctxb = b16("ctx bf16", int64_t(R) * kHidden);
   off_.kv = f32("ctx kv", int64_t(R) * 2 * kKvHeads * kHeadDim);
-  // Candidates: a batched step computes them on every block row (lane z: rows 8 z + 1 ..), one block on its
+  // Candidates: a batched step computes them on every block row (lane z: the rows after its first), one block on its
   // drafted rows.
   const int ND = block_ - 1;
   const int SR = lanes > 1 ? std::max(B, ND) : ND;
@@ -197,7 +201,8 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
   off_.choice_q = f32("choice q", kMaxDraft * kSelK);
   off_.choice_path = act.add("draft choice path", kMaxDraft * 4);
   off_.choice_src = act.add("draft choice source", 4);
-  off_.lattice = f32("lattice", int64_t(std::max(lanes * kDraft, ND)) * kSelK * kSelK);
+  const int NP = std::max(lanes > 1 ? B : 0, ND);  // drafted positions of a (batched) step, at most
+  off_.lattice = f32("lattice", int64_t(NP) * kSelK * kSelK);
   off_.sel_cnt = act.add("draft selector counter", lanes * 4);
   off_.src_lanes = act.add("draft choice source of the lanes", kMaxLanes * 4);
   if (!dspine()) {
@@ -205,7 +210,7 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, Pool& host, int m
     off_.coef = f32("coef", B * kCoef);
     off_.hp = f32("selector hidden", SR * kSelRank);
   } else {
-    const int E = std::max(lanes > 1 ? lanes * kDraft : 0, ND) * kSelK;  // refinement rows (position, sender)
+    const int E = NP * kSelK;  // refinement rows (position, sender)
     off_.code = f32("bridge read", B * kCode);
     off_.codeb = b16("bridge codes", B * kCode);
     off_.pk = f32("bridge projections", B * 3 * kBridgeRank);
@@ -263,12 +268,12 @@ void Draft::bind() {
     vocab_w_ = wpool_.at<uint8_t>(vocab_w_off_);
     vocab_sf_ = wpool_.at<uint8_t>(vocab_sf_off_);
   }
-  const int B = std::max(block_, kBlock * lanes_);
+  const int B = std::max(block_, batch_row_budget(lanes_));
   Q27_CUDA(cudaMemset(act_sf_, 0, size_t(sf_bytes(B, kMaxK / 16))));
   // (attention of a block shorter than its kernel's rows reads the rows past it: finite values, see draft_attention)
-  Q27_CUDA(cudaMemset(q_, 0, size_t(std::max(B, kMaxBlock)) * kHeads * kHeadDim * 4));
-  Q27_CUDA(cudaMemset(kb_, 0, size_t(std::max(B, kMaxBlock)) * kKvHeads * kHeadDim * 4));
-  Q27_CUDA(cudaMemset(vb_, 0, size_t(std::max(B, kMaxBlock)) * kKvHeads * kHeadDim * 4));
+  Q27_CUDA(cudaMemset(q_, 0, size_t(attn_rows(B)) * kHeads * kHeadDim * 4));
+  Q27_CUDA(cudaMemset(kb_, 0, size_t(attn_rows(B)) * kKvHeads * kHeadDim * 4));
+  Q27_CUDA(cudaMemset(vb_, 0, size_t(attn_rows(B)) * kKvHeads * kHeadDim * 4));
 }
 
 void Draft::load(cudaStream_t s) {
@@ -396,8 +401,9 @@ void Draft::propose(const int32_t* block_ids, const int32_t* pos, const bf16* em
                     size_t ws_bytes, const Lookup& lk, cudaStream_t s, int rows) {
   if (dspine()) {
     Q27_CHECK(rows <= block_, "draft propose: more rows than the draft's block");
-    propose_dspine(1, rows > 0 ? rows : block_, DraftLanes{1, pos, {ring_k_}, {ring_v_}}, block_ids, embed, lm_w, lm_sf, lm_in_scale,
-                   lm_alpha, &smp, nullptr, rng, ids_out, choice.tree, aq, asf, logits, ws, ws_bytes, s);
+    propose_dspine(LaneRows::one(rows > 0 ? rows : block_), DraftLanes{1, pos, {ring_k_}, {ring_v_}}, block_ids, embed,
+                   lm_w, lm_sf, lm_in_scale, lm_alpha, &smp, nullptr, rng, ids_out, choice.tree, aq, asf, logits, ws,
+                   ws_bytes, s);
     return;
   }
   constexpr int T = kBlock;
@@ -449,12 +455,15 @@ void Draft::propose_lanes(const DraftLanes& lanes, const int32_t* block_ids, con
                           const uint8_t* lm_sf, float lm_in_scale, float lm_alpha, const SelectLanes& smp,
                           const uint64_t* rng, int32_t* ids_out, SpecTree* trees, uint8_t* aq, uint8_t* asf,
                           float* logits, void* ws, size_t ws_bytes, cudaStream_t s) {
-  Q27_CHECK(lanes.n >= 1 && lanes.n <= lanes_, "draft propose_lanes: more lanes than planned");
+  Q27_CHECK(lanes.n >= 1 && lanes.n <= lanes_ && lanes.lr.n == lanes.n &&
+                lanes.lr.total() <= std::max(block_, batch_row_budget(lanes_)),
+            "draft propose_lanes: more lanes or rows than planned");
   if (dspine()) {
-    propose_dspine(lanes.n, kBlock, lanes, block_ids, embed, lm_w, lm_sf, lm_in_scale, lm_alpha, nullptr, &smp, rng,
-                   ids_out, trees, aq, asf, logits, ws, ws_bytes, s);
+    propose_dspine(lanes.lr, lanes, block_ids, embed, lm_w, lm_sf, lm_in_scale, lm_alpha, nullptr, &smp, rng, ids_out,
+                   trees, aq, asf, logits, ws, ws_bytes, s);
     return;
   }
+  for (int z = 0; z < lanes.n; z++) Q27_CHECK(lanes.lr.rows(z) == kBlock, "draft propose_lanes: DFlash2 blocks of 8");
   const int T = kBlock * lanes.n;
   const ActOut ao = act();
   embed_gather(embed, block_ids, T, kHidden, x_, s);
@@ -464,7 +473,7 @@ void Draft::propose_lanes(const DraftLanes& lanes, const int32_t* block_ids, con
     gemm(T, L.attn_kproj, coef_, ws, ws_bytes, s);
     draft_conv_in(h_, coef_, L.attn_base, T, ao, s);
     gemm(T, L.qkv, qkv_, ws, ws_bytes, s);
-    draft_qk_prep_lanes(lanes.n, qkv_, L.q_norm, L.k_norm, lanes.pos, q_, kb_, vb_, s);
+    draft_qk_prep_lanes(lanes, qkv_, L.q_norm, L.k_norm, q_, kb_, vb_, s);
     draft_attention_lanes(ring_layer(lanes, ring_bytes_ / 2, l), q_, kb_, vb_, part_, o32_, s);
     draft_quant_rows(o32_, T, kHeads * kHeadDim, ao, s);
     gemm(T, L.o, y_, ws, ws_bytes, s);
@@ -487,15 +496,15 @@ void Draft::propose_lanes(const DraftLanes& lanes, const int32_t* block_ids, con
   skinny_bf16(T, kSelRank, kHidden, hb_, static_cast<const bf16*>(hproj_.w), 1.f, nullptr, 0.f, hp_, ws, ws_bytes, s);
   DraftChoice ch = choice;
   ch.tree = trees, ch.src = src_lanes_;
-  draft_select_lanes(lanes.n, smp, cand_v_, cand_i_, hp_, pred_cb_, succ_cb_, block_ids, rng, ids_out, ch, lattice_,
+  draft_select_lanes(smp, cand_v_, cand_i_, hp_, pred_cb_, succ_cb_, block_ids, rng, ids_out, ch, lattice_,
                      sel_cnt_, s);
 }
 
 void Draft::append_ctx_lanes(const DraftLanes& lanes, const bf16* cap, const int32_t* n_dev, const int32_t* rowmap,
                              void* ws, size_t ws_bytes, cudaStream_t s) {
-  const int rows = kBlock * lanes.n;
+  const int rows = lanes.lr.total();
   const ActOut ao = act();
-  draft_quant_rows_lanes(cap, rows, kCtxFeatures * kHidden, ao, s, rowmap);
+  draft_quant_rows_lanes(cap, lanes.lr, kCtxFeatures * kHidden, ao, s, rowmap);
   gemm(rows, fc_, ctx_, ws, ws_bytes, s);
   draft_norm(ctx_, hidden_norm_, rows, nullptr, ao, nullptr, s);
   for (int l = 0; l < kLayers; l++) {
@@ -562,14 +571,14 @@ void Draft::append_ctx(const bf16* cap, int rows, const int32_t* pos, int pos_ad
   }
 }
 
-// DSpine: nb blocks of T rows (one sequence: nb 1 with its position and ring in lanes; a batched step: the lanes',
-// T = 8). smp (one block) or sl (lanes): the walks' sampling.
-void Draft::propose_dspine(int nb, int T, const DraftLanes& lanes, const int32_t* block_ids, const bf16* embed,
+// DSpine: the blocks of lr (one sequence: one block with its position and ring in lanes; a batched step: the
+// lanes'). smp (one block) or sl (lanes): the walks' sampling.
+void Draft::propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const int32_t* block_ids, const bf16* embed,
                            const uint8_t* lm_w, const uint8_t* lm_sf, float lm_in_scale, float lm_alpha,
                            const SpecSampling* smp, const SelectLanes* sl, const uint64_t* rng, int32_t* ids_out,
                            SpecTree* trees, uint8_t* aq, uint8_t* asf, float* logits, void* ws, size_t ws_bytes,
                            cudaStream_t s) {
-  const int R = nb * T, nd = T - 1;
+  const int R = lr.total(), T = lr.rows(0), nd = T - 1;  // (T, nd: one block's)
   const bool batched = sl != nullptr;
   const ActOut ao = act();
   embed_gather(embed, block_ids, R, kHidden, x_, s);
@@ -579,7 +588,7 @@ void Draft::propose_dspine(int nb, int T, const DraftLanes& lanes, const int32_t
     const bool last = l + 1 == kLayers;
     gemm(R, L.qkv, qkv_, ws, ws_bytes, s);
     if (batched) {
-      draft_qk_prep_lanes(nb, qkv_, L.q_norm, L.k_norm, lanes.pos, q_, kb_, vb_, s);
+      draft_qk_prep_lanes(lanes, qkv_, L.q_norm, L.k_norm, q_, kb_, vb_, s);
       draft_attention_lanes(ring_layer(lanes, ring_bytes_ / 2, l), q_, kb_, vb_, part_, o32_, s, window_, true);
     } else {
       draft_qk_prep(qkv_, L.q_norm, L.k_norm, lanes.pos, q_, kb_, vb_, s, T);
@@ -597,13 +606,13 @@ void Draft::propose_dspine(int nb, int T, const DraftLanes& lanes, const int32_t
     dspine_read(y_, x_, last ? raw_ : nullptr, rms_, nrm, R, s);
     const bf16* rw = last ? last_read_ : early_read_ + size_t(l) * kCode * kHidden;
     skinny_bf16(R, kCode, kHidden, nrm, rw, 1.f, nullptr, 0.f, code_, ws, ws_bytes, s);
-    dspine_codes(code_, block_ids, codebook_, R, T, codeb_, s);
+    dspine_codes(code_, block_ids, codebook_, lr, codeb_, s);
     skinny_bf16(R, 3 * kBridgeRank, kCode, codeb_, static_cast<const bf16*>(packed_.w), 1.f, nullptr, 0.f, pk_, ws,
                 ws_bytes, s);
-    dspine_msg(pk_, gate_b_, R, T, msg_, s);
+    dspine_msg(pk_, gate_b_, lr, msg_, s);
     skinny_bf16(R, kHidden, kBridgeRank, msg_, write_w_ + size_t(l) * kHidden * kBridgeRank, 1.f, nullptr, 0.f,
                 delta_, ws, ws_bytes, s);
-    dspine_write_norm(delta_, rms_, R, T, x_, last ? norm_ : layers_[l + 1].in_norm, last ? h_ : nullptr,
+    dspine_write_norm(delta_, rms_, lr, x_, last ? norm_ : layers_[l + 1].in_norm, last ? h_ : nullptr,
                       last ? ActOut{int(DraftQuant::kBf16), act_q_, nullptr, nullptr} : ao, s);
   }
   // Candidates: the top 16 of the target head (one block: its drafted rows; batched: every row), as head rows.
@@ -617,12 +626,12 @@ void Draft::propose_dspine(int nb, int T, const DraftLanes& lanes, const int32_t
   topk_rows(logits, nc, V, kSelK, cand_v_, cand_c_, s);
   // The refinement: the last write redone with each candidate of the predecessor as the sender (its codebook
   // row as the code), giving the 16 x 16 logits per position the selector walks.
-  dspine_cand(nb, T, batched, cand_c_, voc ? vocab_ids_ : nullptr, block_ids, cand_i_, sid_, s);
-  const int E = nb * nd * kSelK;
+  dspine_cand(lr, batched, cand_c_, voc ? vocab_ids_ : nullptr, block_ids, cand_i_, sid_, s);
+  const int nb = lr.n, E = (R - nb) * kSelK;
   constexpr int kChunk = 64;  // (the skinny GEMMs take up to 64 rows)
   const bf16* gv_w = static_cast<const bf16*>(packed_.w) + size_t(kBridgeRank) * kCode;  // G_p | A
   if (tsv_) {  // the candidates' from the sender table; the anchors' (sid of (z, 0, 0)) computed here
-    dspine_gather_codes(codebook_, sid_, nb, ecode_, s, nd * kSelK);
+    dspine_gather_anchor_codes(codebook_, sid_, lr, ecode_, s);
     skinny_bf16(nb, 2 * kBridgeRank, kCode, ecode_, gv_w, 1.f, nullptr, 0.f, egv_, ws, ws_bytes, s);
   } else {
     dspine_gather_codes(codebook_, sid_, E, ecode_, s);
@@ -630,16 +639,16 @@ void Draft::propose_dspine(int nb, int T, const DraftLanes& lanes, const int32_t
       skinny_bf16(std::min(kChunk, E - c), 2 * kBridgeRank, kCode, ecode_ + size_t(c) * kCode, gv_w, 1.f, nullptr, 0.f,
                   egv_ + size_t(c) * 2 * kBridgeRank, ws, ws_bytes, s);
   }
-  dspine_emsg(nb, T, batched, egv_, pk_, gate_b_, emsg_, s, tsv_, cand_c_);
+  dspine_emsg(lr, batched, egv_, pk_, gate_b_, emsg_, s, tsv_, cand_c_);
   const bf16* ww = write_w_ + size_t(kLayers - 1) * kHidden * kBridgeRank;
   for (int c = 0; c < E; c += kChunk)
     skinny_bf16(std::min(kChunk, E - c), kHidden, kBridgeRank, emsg_ + size_t(c) * kBridgeRank, ww, 1.f, nullptr, 0.f,
                 refined_ + size_t(c) * kHidden, ws, ws_bytes, s);
-  dspine_table(nb, T, batched, raw_, rms_, refined_, norm_, cand_c_, hw, hsf, lm_alpha / lm_in_scale, lattice_, s);
+  dspine_table(lr, batched, raw_, rms_, refined_, norm_, cand_c_, hw, hsf, lm_alpha / lm_in_scale, lattice_, s);
   DraftChoice ch = choice;
   ch.tree = trees;
   if (batched) ch.src = src_lanes_;
-  dspine_select(nb, nd, sl, smp ? *smp : SpecSampling{}, cand_i_, block_ids, rng, ids_out, ch, lattice_, s);
+  dspine_select(nd, sl, smp ? *smp : SpecSampling{}, cand_i_, block_ids, rng, ids_out, ch, lattice_, s);
 }
 
 }  // namespace q27

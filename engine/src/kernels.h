@@ -17,18 +17,88 @@ constexpr size_t kv_row_bytes(KvType t) {
   return t == KvType::BF16 ? 512 : t == KvType::FP8 ? 256 : 128 + 16;  // (head_dim 256)
 }
 
-// Batched speculative steps (P6-10): up to kMaxLanes sequences ("lanes") run one step together, lane z
-// with the kLaneRows verify rows 8 z .. 8 z + 7 of every row buffer. The batched kernels take the lane
-// from a grid dimension (or the row) and its scalars at strided offsets (pos + z, ...); what differs per
-// lane otherwise (states, page tables) comes as pointer arrays.
-constexpr int kMaxLanes = 8;  // MAX_SEQS 1..8 (Phase 7)
-constexpr int kLaneRows = 8;  // a chain verify block (kSpecBlock)
-constexpr int kMaxBatchRows = kMaxLanes * kLaneRows;  // rows of a batched step
+// Batched speculative steps (P6-10): up to kMaxLanes sequences ("lanes") run one step together. Each lane verifies
+// its own block of 2..16 rows (DFlash2: 8): the compute row buffers hold the lanes' rows packed, lane z in
+// rows lr.row0[z] .. lr.row0[z + 1] - 1 (LaneRows, passed by value: a captured step has a fixed layout). The batched
+// kernels take the lane from a grid dimension (or the row) and its scalars at strided offsets (pos + z, ...); what
+// differs per lane otherwise (states, page tables) comes as pointer arrays. What outlives a step (the anchor, the
+// commit path, the grammar masks) sits in per-lane slots of kLaneSlot rows, independent of the layout.
+constexpr int kMaxLanes = 8;      // MAX_SEQS 1..8 (Phase 7)
+constexpr int kLaneSlot = 16;     // a lane's longest block (kSpecBlock)
+constexpr int kMaxBatchRows = 64; // rows of a batched step (the skinny GEMMs)
+// Rows of a batched step with MAX_SEQS = lanes: 8 per lane, at least the 32 of a tree verify (the GDN verify inputs
+// are kept for that many rows anyway), at most kMaxBatchRows.
+constexpr int batch_row_budget(int lanes) {
+  return lanes > 1 ? (8 * lanes < 32 ? 32 : 8 * lanes > kMaxBatchRows ? kMaxBatchRows : 8 * lanes) : 0;
+}
+#if defined(__CUDACC__)
+#define Q27_UNROLL _Pragma("unroll")
+#else
+#define Q27_UNROLL
+#endif
+// (Device code reads row0 at constant indices only, by selects: a dynamic index into a kernel parameter goes through
+// the stack, which cost the batched attention kernel 9 us per call.)
+struct LaneRows {
+  int n = 0;                          // lanes
+  uint8_t row0[kMaxLanes + 1] = {};   // lane z: rows row0[z] .. row0[z + 1] - 1; row0[n] = the total
+  static LaneRows one(int T) {  // (a single sequence: one lane of T rows)
+    LaneRows r;
+    r.n = 1;
+    for (int z = 1; z <= kMaxLanes; z++) r.row0[z] = uint8_t(T);
+    return r;
+  }
+  void set(int nl, const int* rows) {
+    n = nl, row0[0] = 0;
+    for (int z = 0; z < kMaxLanes; z++) row0[z + 1] = uint8_t(row0[z] + (z < nl ? rows[z] : 0));
+  }
+  __host__ __device__ int at(int i) const {  // row0[i], 0 <= i <= kMaxLanes
+    int r = row0[0];
+    Q27_UNROLL
+    for (int j = 1; j <= kMaxLanes; j++) r = i == j ? row0[j] : r;
+    return r;
+  }
+  __host__ __device__ int first(int z) const { return at(z); }
+  __host__ __device__ int rows(int z) const { return at(z + 1) - at(z); }
+  __host__ __device__ int total() const { return at(n); }
+  __host__ __device__ int max_rows() const {
+    int m = 0;
+    Q27_UNROLL
+    for (int j = 0; j < kMaxLanes; j++) m = j < n && row0[j + 1] - row0[j] > m ? row0[j + 1] - row0[j] : m;
+    return m;
+  }
+  __host__ __device__ int lane(int t) const {  // the lane of row t (< total())
+    int z = 0;
+    Q27_UNROLL
+    for (int j = 1; j < kMaxLanes; j++) z += j < n && t >= row0[j];
+    return z;
+  }
+  __host__ __device__ bool is_first(int t) const {  // row t is a block's first (the anchor)
+    bool f = false;
+    Q27_UNROLL
+    for (int j = 0; j < kMaxLanes; j++) f |= j < n && row0[j] == t;
+    return f;
+  }
+  // Drafted positions (block rows past the first): lane z's from pos0(z) on, in all lanes' order.
+  __host__ __device__ int pos0(int z) const { return at(z) - z; }
+  __host__ __device__ int lane_of_pos(int p) const {
+    int z = 0;
+    Q27_UNROLL
+    for (int j = 1; j < kMaxLanes; j++) z += j < n && p >= row0[j] - j;
+    return z;
+  }
+  bool operator==(const LaneRows& o) const {
+    if (n != o.n) return false;
+    for (int z = 0; z <= n; z++)
+      if (row0[z] != o.row0[z]) return false;
+    return true;
+  }
+};
 struct SeqLanes {
   int n = 0;                                   // lanes (0: an unbatched call)
   const int32_t* pos = nullptr;                // [n] committed lengths
   const int32_t* rope_delta = nullptr;         // [n] rotary delta of the images
   const int32_t* page_table[kMaxLanes] = {};   // logical -> physical page of each lane
+  LaneRows lr;                                 // the rows of each lane
 };
 
 // Quantized copy of an activation for the next GEMM (written by the op that produces it).
@@ -233,13 +303,17 @@ struct GdnSpec {
   const int32_t* sbuf;     // and writes the replayed state to the other (path CTAs may still be reading)
   const SpecTree* tree;    // the current draft tree (rows: nodes)
   int paths;               // tree paths launched (the tree's npaths is at most this)
-  // Batched chain verify (lanes > 0, P6-10): T rows per lane, lane z's rows from kLaneRows * z in every row
-  // buffer (raw / k / v / ab included), its scalars at par + z, ncommit + z, cpath + kLaneRows * z, tree + z,
-  // and its states lconv[z] / lst[z]. A lane's commit is replayed in place (one state buffer: every CTA
-  // reads and writes only its own columns, so nothing else reads it meanwhile); sbuf / st are not used.
+  // Batched chain verify (lanes > 0, P6-10): lane z's rows lr.first(z) .. (lr.rows(z) of them) in every row
+  // buffer (raw / k / v / ab included), its scalars at par + z, ncommit + z, cpath + kLaneSlot * z, tree + z,
+  // and its states lconv[z] / lst[z]. The previous verify's rows of the lane (the commit replayed now) start at
+  // prow0[z] of the other parity's raw / k / v / ab (its layout may differ; written by spec_advance_lanes).
+  // A lane's commit is replayed in place (one state buffer: every CTA reads and writes only its own columns, so
+  // nothing else reads it meanwhile); sbuf / st are not used.
   int lanes = 0;
   float* lconv[kMaxLanes] = {};
   float* lst[kMaxLanes] = {};
+  LaneRows lr;
+  const int32_t* prow0 = nullptr;
 };
 void gdn_verify_prep(const float* qkv, int ld, int T, float* conv_state, const bf16* conv_w, const float* h,
                      const bf16* wa, const bf16* wb, float* q, const GdnSpec& sp, cudaStream_t s);
@@ -299,14 +373,17 @@ constexpr size_t kAttnDecodeWsBytes = size_t(kDecodeMaxT) * 24 * kDecodeMaxSplit
 void attention_decode(const float* q, const float* qg, int ldq, int T, const int32_t* pos_dev, KvLayer kv,
                       KvType kv_type, const int32_t* page_table, float* out, void* ws, size_t ws_bytes,
                       cudaStream_t s, uint8_t* q8 = nullptr, float in_scale = 1.f, const SpecTree* tree = nullptr);
-// Batched chain verify (P6-10): lanes.n blocks of kLaneRows rows (lane z: rows 8 z .., its position, page
-// table and rotary delta), each computed exactly as attn_prep / attention_decode of that lane alone.
+// Batched chain verify (P6-10): lanes.n blocks (lane z: rows lanes.lr.first(z) .., its position, page table and
+// rotary delta), each computed exactly as attn_prep / attention_decode of that lane alone.
 void attn_prep_lanes(const float* qg, int ldq, const float* k, const float* v, int ldkv, const bf16* q_norm,
                      const bf16* k_norm, const SeqLanes& lanes, KvLayer kv, KvType kv_type, float* q_out,
                      cudaStream_t s);
 void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqLanes& lanes, KvLayer kv,
                             KvType kv_type, float* out, void* ws, size_t ws_bytes, cudaStream_t s,
                             uint8_t* q8 = nullptr, float in_scale = 1.f);
+// Whether the lanes of a batched verify may have different rows (the FP8-MMA verify of FP8 / NVFP4 KV; read per call,
+// Q27_ATTN_TC_F8). Otherwise every lane has 8.
+bool attention_lanes_vary(KvType kv_type);
 // After a speculative step: the KV of the accepted path (rows cpath[0..*ncommit) of the tree, stored at
 // slots pos + row) moves to pos + i in all nlayers attention layers (layers_dev: device array).
 void kv_commit(KvLayer* layers_dev, int nlayers, KvType kv_type, const int32_t* page_table, const int32_t* pos_dev,
@@ -349,10 +426,10 @@ struct LogprobSink {
 };
 void sample(const float* logits, int T, int V, float temperature, int top_k, float top_p, const float* uniform,
             int32_t* out, cudaStream_t s, float min_p = 0.f, Penalty pen = {}, LogprobSink lp = {});
-// Grammar masks (structured output): row r of logits [rows][V] gets -inf at the tokens whose bit is 0 in row r of
-// mask ([rows][words] bitmasks, bit t % 32 of word t / 32: token t allowed), when bit r / rows_per_lane of lanes is set
-// (other lanes' rows are left).
-void mask_logits(float* logits, int rows, int V, const uint32_t* mask, int words, int rows_per_lane, uint32_t lanes,
+// Grammar masks (structured output): row r of logits [rows][V] (lr.total() rows) gets -inf at the tokens whose bit is
+// 0 in row r of mask ([rows][words] bitmasks, bit t % 32 of word t / 32: token t allowed), when the bit of its lane
+// (lr.lane(r)) is set in lanes (other lanes' rows are left).
+void mask_logits(float* logits, int V, const uint32_t* mask, int words, const LaneRows& lr, uint32_t lanes,
                  cudaStream_t s);
 // Logit bias (OpenAI logit_bias): a sequence's sparse list of (token, value) added to its rows' logits before the
 // grammar mask, the top-k and the penalties (so the logprobs include it, as OpenAI's do). In device memory, so a
@@ -367,15 +444,15 @@ struct alignas(16) BiasList {  // (a multiple of 16 bytes: swap_bytes)
   int32_t eos[2];
   int32_t eos_before;
 };
-// Row r of logits [rows][V] (lane z = r / rows_per_lane) gets list[z]'s values (nullptr: the lane's rows are left).
-// Its token's position: *pos[z] (the sequence's length: a decode or prompt row), or with depth[z] (a verify row j of
-// lane z is tree node j, *pos[z] the anchor's position) *pos[z] + depth[z][j] + 1.
+// Row r of logits [rows][V] (lr.total() rows, lane z = lr.lane(r)) gets list[z]'s values (nullptr: the lane's rows
+// are left). Its token's position: *pos[z] (the sequence's length: a decode or prompt row), or with depth[z] (verify
+// row j of lane z is tree node j, *pos[z] the anchor's position) *pos[z] + depth[z][j] + 1.
 struct BiasLanes {
   const BiasList* list[kMaxLanes] = {};
   const int32_t* pos[kMaxLanes] = {};
   const int8_t* depth[kMaxLanes] = {};
 };
-void bias_logits(float* logits, int rows, int V, const BiasLanes& bl, int rows_per_lane, cudaStream_t s);
+void bias_logits(float* logits, int V, const BiasLanes& bl, const LaneRows& lr, cudaStream_t s);
 // counts[ids[i]] += delta for i < n (the penalty counts of a sequence's output).
 void count_tokens(uint32_t* counts, const int32_t* ids, int n, int delta, cudaStream_t s);
 

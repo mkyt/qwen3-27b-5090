@@ -253,14 +253,21 @@ __device__ __forceinline__ float head_norm_rope(float x, const bf16* w, int pos,
 }
 
 // Block per (token, head slot): 0..31 query heads, 32..39 key heads (+ their values).
-// kBatch (P6-10): token t is row t % 8 of the block of lane t / 8 (pos_dev: the lanes' positions).
+// kBatch (P6-10): token t is a row of the block of lane lr.lane(t) (pos_dev: the lanes' positions).
 template <bool kBatch = false>
 __global__ void __launch_bounds__(kHeadDim) qk_prep_kernel(const float* qkv, const bf16* q_norm, const bf16* k_norm,
-                                                           const int32_t* pos_dev, float* q, float* kb, float* vb) {
+                                                           const int32_t* pos_dev, float* q, float* kb, float* vb,
+                                                           LaneRows lr) {
   pdl_trigger();
   __shared__ float xs[kHeadDim], red[4];
   const int t = blockIdx.x, slot = blockIdx.y, d = threadIdx.x;
-  const int pos = kBatch ? pos_dev[t / kBlock] + t % kBlock : *pos_dev + t;
+  int pos;
+  if constexpr (kBatch) {
+    const int z = lr.lane(t);
+    pos = pos_dev[z] + t - lr.first(z);
+  } else {
+    pos = *pos_dev + t;
+  }
   pdl_wait();
   const bool is_q = slot < kHeads;
   const int head = is_q ? slot : slot - kHeads;
@@ -282,7 +289,8 @@ constexpr int kAttnSplits = 16;
 constexpr int kGqa = kHeads / kKvHeads;  // 4
 constexpr int kPart = kHeadDim + 4;      // acc, m, l (padded for float4 stores)
 
-// kBatch (P6-10): lane blockIdx.z, its block's rows from 8 z and its context ring (lanes; one layer).
+// kBatch (P6-10): lane blockIdx.z, its block's rows (8) from lanes.lr.first(z) and its context ring (lanes; one
+// layer).
 template <bool kBatch = false>
 __global__ void __launch_bounds__(kBlock * 32) attn_kernel(const float* q, const float* kb, const float* vb,
                                                            const bf16* ring_k, const bf16* ring_v,
@@ -290,7 +298,7 @@ __global__ void __launch_bounds__(kBlock * 32) attn_kernel(const float* q, const
   pdl_trigger();
   if constexpr (kBatch) {
     const int z = blockIdx.z;
-    const int64_t r0 = int64_t(kBlock) * z;
+    const int64_t r0 = lanes.lr.first(z);
     q += r0 * kHeads * kHeadDim, kb += r0 * kKvHeads * kHeadDim, vb += r0 * kKvHeads * kHeadDim;
     part += r0 * kHeads * kAttnSplits * kPart;
     ring_k = lane_sel(lanes.ring_k, z), ring_v = lane_sel(lanes.ring_v, z), pos_dev = lanes.pos + z;
@@ -372,26 +380,31 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float a, float b) {
   return *reinterpret_cast<uint32_t*>(&v);
 }
 
-// kT: rows of a block (8: DFlash2 and batched steps; 16: DSpine), 2 warps per 8 rows. window: positions
-// >= pos + t - (window - 1) are seen (the ring has window + kRingPad slots); causal: block row t sees block keys 0..t only
-// (DSpine) instead of all of them.
+// kT: rows of a block (8: DFlash2; 16: DSpine), 2 warps per 8 rows. A block of other rows runs on the kernel of the
+// next size (its keys are those of that size: the splits depend on it). window: positions >= pos + t - (window - 1)
+// are seen (the ring has window + kRingPad slots); causal: block row t sees block keys 0..t only (DSpine) instead of
+// all of them.
+// kBatch (P6-10): lane blockIdx.z, its block's rows (lanes.lr.rows(z), at most kT) from lanes.lr.first(z), with the
+// keys of its own size (8 or 16, whatever the launch's), and its context ring; only its rows' partials are written.
 template <bool kBatch = false, int kT = kBlock>
 __global__ void __launch_bounds__(kT * 8) attn_tc_kernel(const float* q, const float* kb, const float* vb,
                                                          const bf16* ring_k, const bf16* ring_v, const int32_t* pos_dev,
                                                          float* part, DraftLanes lanes, int window, bool causal) {
   pdl_trigger();
+  int tn = kT, tk = kT;  // rows written, block keys
   if constexpr (kBatch) {
     const int z = blockIdx.z;
-    const int64_t r0 = int64_t(kT) * z;
+    const int64_t r0 = lanes.lr.first(z);
     q += r0 * kHeads * kHeadDim, kb += r0 * kKvHeads * kHeadDim, vb += r0 * kKvHeads * kHeadDim;
     part += r0 * kHeads * kAttnSplits * kPart;
     ring_k = lane_sel(lanes.ring_k, z), ring_v = lane_sel(lanes.ring_v, z), pos_dev = lanes.pos + z;
+    tn = lanes.lr.rows(z), tk = tn <= kBlock ? kBlock : kMaxBlock;
   }
   __shared__ __align__(16) bf16 sk[2][kTcKeys][kTcRow], sv[2][kTcKeys][kTcRow];
   const int g = blockIdx.x, split = blockIdx.y, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
   const int r0 = lane / 4, c2 = 2 * (lane % 4);
   const int pos = *pos_dev;
-  const int nctx = min(pos, window - 1), nk = nctx + kT;
+  const int nctx = min(pos, window - 1), nk = nctx + tk;
   const int kps = (nk + kAttnSplits - 1) / kAttnSplits;
   const int k0 = split * kps, k1 = min(nk, k0 + kps);
   const int nch = k1 > k0 ? (k1 - k0 + kTcKeys - 1) / kTcKeys : 0;
@@ -515,12 +528,16 @@ __global__ void __launch_bounds__(kT * 8) attn_tc_kernel(const float* q, const f
   cp_wait<0>();
   float* p0 = part + ((int64_t(t0) * kHeads + g * kGqa + R0 % 4) * kAttnSplits + split) * kPart;
   float* p1 = part + ((int64_t(t1) * kHeads + g * kGqa + R1 % 4) * kAttnSplits + split) * kPart;
+  const bool w0 = t0 < tn, w1 = t1 < tn;  // (a batched lane's rows only: the next lane's follow)
 #pragma unroll
   for (int n = 0; n < kHeadDim / 8; n++) {
-    *reinterpret_cast<float2*>(p0 + n * 8 + c2) = make_float2(o[n][0], o[n][1]);
-    *reinterpret_cast<float2*>(p1 + n * 8 + c2) = make_float2(o[n][2], o[n][3]);
+    if (w0) *reinterpret_cast<float2*>(p0 + n * 8 + c2) = make_float2(o[n][0], o[n][1]);
+    if (w1) *reinterpret_cast<float2*>(p1 + n * 8 + c2) = make_float2(o[n][2], o[n][3]);
   }
-  if (lane % 4 == 0) p0[kHeadDim] = m0, p0[kHeadDim + 1] = l0, p1[kHeadDim] = m1, p1[kHeadDim + 1] = l1;
+  if (lane % 4 == 0) {
+    if (w0) p0[kHeadDim] = m0, p0[kHeadDim + 1] = l0;
+    if (w1) p1[kHeadDim] = m1, p1[kHeadDim + 1] = l1;
+  }
 }
 
 bool draft_attn_tc() {
@@ -549,14 +566,23 @@ __global__ void __launch_bounds__(kHeadDim) attn_combine_kernel(const float* par
 
 // Rows of a [T][K] GEMM input from fp32 / BF16 values, or from silu(gate) * up (gu rows ld apart,
 // up at +K): block per row; the row maximum first (second pass re-reads from L1 / L2).
-// rowmap: row r is source row rowmap[r]; kLanes (P6-10): row r of lane r / 8 is its block's row rowmap[r].
+// rowmap: row r is source row rowmap[r]; kLanes (P6-10): row i of lane z (rows lr.first(z) ..) is its block's row
+// rowmap[kLaneSlot z + i].
 template <class In, bool kSilu, bool kLanes = false>
 __global__ void __launch_bounds__(256) quant_rows_kernel(const In* x, int64_t ld, int K, ActOut ao,
-                                                         const int32_t* rowmap) {
+                                                         const int32_t* rowmap, LaneRows lr) {
   pdl_trigger();
   pdl_wait();
   const int row = blockIdx.x, groups = K / 16;
-  const int src = rowmap ? (kLanes ? row & ~(kBlock - 1) : 0) + rowmap[row] : row;
+  int src = row;
+  if (rowmap) {
+    if constexpr (kLanes) {
+      const int z = lr.lane(row);
+      src = lr.first(z) + rowmap[kLaneSlot * z + row - lr.first(z)];
+    } else {
+      src = rowmap[row];
+    }
+  }
   auto load = [&](int g, float* v) {
     load16(x + src * ld + g * 16, v);
     if constexpr (kSilu) {
@@ -651,7 +677,7 @@ __global__ void dequant_weight_kernel(DLinear l, int fmt, int row0, int n, bf16*
 }
 
 // Block per (row, KV head), thread per dim.
-// kBatch (P6-10): row r is row r % 8 of lane r / 8 (its position, count n_dev + lane and ring).
+// kBatch (P6-10): row r is a row of lane lanes.lr.lane(r) (its position, count n_dev + lane and ring).
 template <bool kBatch = false>
 __global__ void __launch_bounds__(kHeadDim) ctx_write_kernel(const float* kv, const bf16* k_norm,
                                                              const int32_t* pos_dev, int pos_add,
@@ -662,8 +688,8 @@ __global__ void __launch_bounds__(kHeadDim) ctx_write_kernel(const float* kv, co
   const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
   int rl = r;  // the row within its lane's block
   if constexpr (kBatch) {
-    const int z = r / kBlock;
-    rl = r % kBlock;
+    const int z = lanes.lr.lane(r);
+    rl = r - lanes.lr.first(z);
     pos_dev = lanes.pos + z, n_dev += z;
     ring_k = const_cast<bf16*>(lane_sel(lanes.ring_k, z)), ring_v = const_cast<bf16*>(lane_sel(lanes.ring_v, z));
   }
@@ -679,8 +705,8 @@ __global__ void __launch_bounds__(kHeadDim) ctx_write_kernel(const float* kv, co
 
 // Selector: CTA e computes the lattice row block score[e][p][c] (p over the previous position's
 // candidates, or the anchor for e = 0); the last CTA to finish walks the path (warp 0).
-// kBatch (P6-10): lane blockIdx.y with its candidates (rows 8 z + 1 .. of all lanes), anchor, sampling,
-// RNG, tree, lattice and counter; it writes the 7 drafted ids only (a chain: its block's rows).
+// kBatch (P6-10): lane blockIdx.y with its candidates (the rows after its first, lanes.lr), anchor, sampling,
+// RNG, tree, lattice and counter; it writes the drafted ids of its block's rows only (a chain), nd = its rows - 1.
 // nd: draft positions (7 for DFlash2's blocks; DSpine: block rows - 1). kPre (DSpine): the lattice is
 // given (Draft::propose_dspine's table); one CTA per lane walks it.
 template <bool kBatch = false, bool kPre = false>
@@ -690,14 +716,16 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
                                                      DraftChoice choice, float* lattice, int32_t* counter, Lookup lk,
                                                      SelectLanes lanes, int nd) {
   pdl_trigger();
+  int nrows = kTreeMax;  // ids written
   if constexpr (kBatch) {
     const int z = blockIdx.y;
-    const int64_t r0 = int64_t(kBlock) * z + 1;
+    const int64_t r0 = lanes.lr.first(z) + 1;
     cand_v += r0 * kSelK, cand_i += r0 * kSelK, hp += r0 * kSelRank;
-    anchor += kBlock * z, ids_out += kBlock * z, rng += 2 * z;
+    anchor += lanes.lr.first(z), ids_out += lanes.lr.first(z), rng += 2 * z;
     smp = lane_sel(lanes.smp, z);
     choice.tree += z, choice.src += z;
-    lattice += int64_t(z) * nd * kSelK * kSelK, counter += z;
+    lattice += int64_t(lanes.lr.pos0(z)) * kSelK * kSelK, counter += z;
+    nrows = lanes.lr.rows(z), nd = nrows - 1;
   }
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
   pdl_wait();
@@ -942,7 +970,7 @@ __global__ void __launch_bounds__(256) select_kernel(const float* cand_v, const 
       tr->path[t][0] = int8_t(t);
       tr->cidx[t] = 0;
     }
-    for (int t = 1; t < (kBatch ? kBlock : kTreeMax); t++) ids_out[t] = tr->tok[t];
+    for (int t = 1; t < nrows; t++) ids_out[t] = tr->tok[t];
     *choice.src = 0;
     if (lk.on) *lk.best = 0;  // (lookup chains are not merged into the tree yet)
   }
@@ -1003,13 +1031,13 @@ __global__ void __launch_bounds__(kNormThreads) dspine_read_kernel(const float* 
 // Codes of the block rows (T rows per block): the anchor's (row 0) sqrt(C) * codebook[anchor] (pinned host,
 // UVA), the others sqrt(C) * proj / (|proj| + eps); BF16.
 __global__ void __launch_bounds__(kCodeThreads) dspine_codes_kernel(const float* proj, const int32_t* block_ids,
-                                                                    const bf16* codebook, int T, bf16* codes) {
+                                                                    const bf16* codebook, LaneRows lr, bf16* codes) {
   pdl_trigger();
   pdl_wait();
   const int t = blockIdx.x, c = threadIdx.x * 4;
   const float sq = sqrtf(float(kCode));
   float v[4];
-  if (t % T == 0) {
+  if (lr.is_first(t)) {
     const uint2 raw = *reinterpret_cast<const uint2*>(codebook + int64_t(block_ids[t]) * kCode + c);
     const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
     const float2 a = __bfloat1622float2(h[0]), b = __bfloat1622float2(h[1]);
@@ -1036,12 +1064,13 @@ __device__ __forceinline__ float sigmoidf(float x) { return 1.f / (1.f + expf(-x
 
 // Messages: row t (not a block's first) gets sigmoid(G_q z_t + G_p z_{t-1} + b) * A z_{t-1} from the packed
 // projections pk [rows][3 R] (G_q | G_p | A); a block's first row gets none. BF16 [rows][R].
-__global__ void __launch_bounds__(kBridgeRank) dspine_msg_kernel(const float* pk, const bf16* gb, int T, bf16* msg) {
+__global__ void __launch_bounds__(kBridgeRank) dspine_msg_kernel(const float* pk, const bf16* gb, LaneRows lr,
+                                                                 bf16* msg) {
   pdl_trigger();
   pdl_wait();
   const int t = blockIdx.x, r = threadIdx.x;
   float m = 0.f;
-  if (t % T != 0) {
+  if (!lr.is_first(t)) {
     const float* cur = pk + int64_t(t) * 3 * kBridgeRank;
     const float* prv = cur - 3 * kBridgeRank;
     m = sigmoidf(cur[r] + prv[kBridgeRank + r] + __bfloat162float(gb[r])) * prv[2 * kBridgeRank + r];
@@ -1051,7 +1080,7 @@ __global__ void __launch_bounds__(kBridgeRank) dspine_msg_kernel(const float* pk
 
 // Bridge write: x += rms * delta (not on a block's first row), then h = RMSNorm(x) * w: fp32 h (optional) and the
 // next GEMM's input.
-__global__ void __launch_bounds__(kNormThreads) dspine_write_norm_kernel(const float* delta, const float* rms, int T,
+__global__ void __launch_bounds__(kNormThreads) dspine_write_norm_kernel(const float* delta, const float* rms, LaneRows lr,
                                                                          float* x, const bf16* w, float* h,
                                                                          ActOut ao) {
   pdl_trigger();
@@ -1061,7 +1090,7 @@ __global__ void __launch_bounds__(kNormThreads) dspine_write_norm_kernel(const f
   pdl_wait();
   float v[16];
   load16(x + int64_t(t) * kHidden + g * 16, v);
-  if (t % T != 0) {
+  if (!lr.is_first(t)) {
     float d[16];
     load16(delta + int64_t(t) * kHidden + g * 16, d);
     const float r = rms[t];
@@ -1079,40 +1108,49 @@ __global__ void __launch_bounds__(kNormThreads) dspine_write_norm_kernel(const f
   act_row(ao, t, kHidden, v);
 }
 
-// Proposal geometry of the refinement: nb blocks of T rows (nd = T - 1 positions each); position e of block z
-// has its candidates on row crow(z, e) of cand_c / cand_i (single block: rows 0..; batched: 8 z + 1 + e, all
-// block rows were scored) and its pre-write state on block row T z + 1 + e.
+// Proposal geometry of the refinement: the blocks of lr (lane z: lr.rows(z) - 1 positions); position e of block z
+// has its candidates on row crow(z, e) of cand_c / cand_i (single block: rows 0..; batched: the block's rows after its
+// first, all block rows were scored) and its pre-write state on block row lr.first(z) + 1 + e. The (z, e, a) rows of
+// the refinement are in position order: m = (lr.pos0(z) + e) * 16 + a.
 struct DsGeo {
-  int T, nd;
+  LaneRows lr;
   bool lanes;
-  __device__ int crow(int z, int e) const { return lanes ? T * z + 1 + e : e; }
-  __device__ int brow(int z, int e) const { return T * z + 1 + e; }
+  __device__ int crow(int z, int e) const { return lanes ? lr.first(z) + 1 + e : e; }
+  __device__ int brow(int z, int e) const { return lr.first(z) + 1 + e; }
+  __device__ int positions() const { return lr.total() - lr.n; }
+  __device__ void at(int m, int& z, int& e, int& a) const {
+    const int p = m / kSelK;
+    a = m % kSelK, z = lr.lane_of_pos(p), e = p - lr.pos0(z);
+  }
 };
 
 // Candidate ids (compact head rows -> token ids) and the senders: sid[z][e][a] = the anchor (e = 0) or
 // candidate a of position e - 1. Thread per (z, e, a).
-__global__ void dspine_cand_kernel(DsGeo geo, int nb, const int32_t* cand_c, const int32_t* vocab_ids,
+__global__ void dspine_cand_kernel(DsGeo geo, const int32_t* cand_c, const int32_t* vocab_ids,
                                    const int32_t* block_ids, int32_t* cand_i, int32_t* sid) {
   pdl_trigger();
   pdl_wait();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= nb * geo.nd * kSelK) return;
-  const int a = i % kSelK, e = i / kSelK % geo.nd, z = i / kSelK / geo.nd;
+  if (i >= geo.positions() * kSelK) return;
+  int z, e, a;
+  geo.at(i, z, e, a);
   auto id = [&](int e2) {
     const int c = cand_c[geo.crow(z, e2) * kSelK + a];
     return vocab_ids ? vocab_ids[c] : c;
   };
   cand_i[geo.crow(z, e) * kSelK + a] = id(e);
-  sid[i] = e == 0 ? block_ids[geo.T * z] : id(e - 1);
+  sid[i] = e == 0 ? block_ids[geo.lr.first(z)] : id(e - 1);
 }
 
-// sqrt(C) * codebook[ids[r * stride]] (pinned host, UVA) in BF16, rows of the refinement.
+// sqrt(C) * codebook[ids[r]] (pinned host, UVA) in BF16, rows of the refinement; with lr.n > 0, row r is that of
+// ids[lr.pos0(r) * 16] (the anchor's of block r).
 __global__ void __launch_bounds__(128) dspine_gather_codes_kernel(const bf16* codebook, const int32_t* ids,
-                                                                  bf16* out, int stride) {
+                                                                  bf16* out, LaneRows lr) {
   pdl_trigger();
   pdl_wait();
   const int r = blockIdx.x, c = threadIdx.x * 8;
-  const uint4 raw = *reinterpret_cast<const uint4*>(codebook + int64_t(ids[r * stride]) * kCode + c);
+  const int i = lr.n > 0 ? lr.pos0(r) * kSelK : r;
+  const uint4 raw = *reinterpret_cast<const uint4*>(codebook + int64_t(ids[i]) * kCode + c);
   const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
   const float sq = sqrtf(float(kCode));
   uint32_t o[4];
@@ -1134,7 +1172,8 @@ __global__ void __launch_bounds__(kBridgeRank) dspine_emsg_kernel(DsGeo geo, con
   pdl_trigger();
   pdl_wait();
   const int m = blockIdx.x, r = threadIdx.x;
-  const int a = m % kSelK, e = m / kSelK % geo.nd, z = m / kSelK / geo.nd;
+  int z, e, a;
+  geo.at(m, z, e, a);
   const float q = pk[int64_t(geo.brow(z, e)) * 3 * kBridgeRank + r];
   float g, v;
   if (tsv && e > 0) {
@@ -1158,7 +1197,8 @@ __global__ void __launch_bounds__(kNormThreads) dspine_table_kernel(DsGeo geo, c
   pdl_trigger();
   pdl_wait();
   const int m = blockIdx.x, g = threadIdx.x, warp = g / 32, lane = g % 32;
-  const int e = m / kSelK % geo.nd, z = m / kSelK / geo.nd;
+  int z, e, a;
+  geo.at(m, z, e, a);
   const int br = geo.brow(z, e);
   float v[16], d[16], wv[16];
   load16(raw + int64_t(br) * kHidden + g * 16, v);
@@ -1225,7 +1265,7 @@ void draft_conv_out_norm(const float* y, const float* coef, const bf16* base, in
 void draft_qk_prep(const float* qkv, const bf16* q_norm, const bf16* k_norm, const int32_t* pos, float* q, float* kb,
                    float* vb, cudaStream_t s, int T) {
   launch_pdl(qk_prep_kernel<false>, dim3(T, kHeads + kKvHeads), dim3(kHeadDim), 0, s, qkv, q_norm, k_norm, pos, q, kb,
-             vb);
+             vb, LaneRows{});
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -1252,23 +1292,23 @@ void draft_attention(const float* q, const float* kb, const float* vb, const bf1
 
 void draft_quant_rows(const float* x, int T, int K, ActOut ao, cudaStream_t s) {
   launch_pdl(quant_rows_kernel<float, false>, dim3(T), dim3(256), 0, s, x, int64_t(K), K, ao,
-             static_cast<const int32_t*>(nullptr));
+             static_cast<const int32_t*>(nullptr), LaneRows{});
   Q27_CUDA(cudaGetLastError());
 }
 
 void draft_quant_rows(const bf16* x, int T, int K, ActOut ao, cudaStream_t s, const int32_t* rowmap) {
-  launch_pdl(quant_rows_kernel<bf16, false>, dim3(T), dim3(256), 0, s, x, int64_t(K), K, ao, rowmap);
+  launch_pdl(quant_rows_kernel<bf16, false>, dim3(T), dim3(256), 0, s, x, int64_t(K), K, ao, rowmap, LaneRows{});
   Q27_CUDA(cudaGetLastError());
 }
 
-void draft_quant_rows_lanes(const bf16* x, int T, int K, ActOut ao, cudaStream_t s, const int32_t* rowmap) {
-  launch_pdl(quant_rows_kernel<bf16, false, true>, dim3(T), dim3(256), 0, s, x, int64_t(K), K, ao, rowmap);
+void draft_quant_rows_lanes(const bf16* x, const LaneRows& lr, int K, ActOut ao, cudaStream_t s, const int32_t* rowmap) {
+  launch_pdl(quant_rows_kernel<bf16, false, true>, dim3(lr.total()), dim3(256), 0, s, x, int64_t(K), K, ao, rowmap, lr);
   Q27_CUDA(cudaGetLastError());
 }
 
 void draft_silu_mul(const float* gu, int64_t ld, int T, int I, ActOut ao, cudaStream_t s) {
   launch_pdl(quant_rows_kernel<float, true>, dim3(T), dim3(256), 0, s, gu, ld, I, ao,
-             static_cast<const int32_t*>(nullptr));
+             static_cast<const int32_t*>(nullptr), LaneRows{});
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -1307,38 +1347,46 @@ void draft_select(const float* cand_v, const int32_t* cand_i, const float* hp, c
   Q27_CUDA(cudaGetLastError());
 }
 
-void draft_qk_prep_lanes(int lanes, const float* qkv, const bf16* q_norm, const bf16* k_norm, const int32_t* pos,
-                         float* q, float* kb, float* vb, cudaStream_t s) {
-  launch_pdl(qk_prep_kernel<true>, dim3(kBlock * lanes, kHeads + kKvHeads), dim3(kHeadDim), 0, s, qkv, q_norm, k_norm,
-             pos, q, kb, vb);
+void draft_qk_prep_lanes(const DraftLanes& lanes, const float* qkv, const bf16* q_norm, const bf16* k_norm, float* q,
+                         float* kb, float* vb, cudaStream_t s) {
+  launch_pdl(qk_prep_kernel<true>, dim3(lanes.lr.total(), kHeads + kKvHeads), dim3(kHeadDim), 0, s, qkv, q_norm, k_norm,
+             lanes.pos, q, kb, vb, lanes.lr);
   Q27_CUDA(cudaGetLastError());
 }
 
 void draft_attention_lanes(const DraftLanes& lanes, const float* q, const float* kb, const float* vb, float* part,
                            float* out, cudaStream_t s, int window, bool causal) {
-  if (draft_attn_tc() || window != kWindow || causal)
+  const int T = lanes.lr.max_rows();
+  Q27_CHECK(lanes.lr.n == lanes.n && T >= 2 && T <= kMaxBlock && (causal || T == kBlock),
+            "draft_attention_lanes: 2..16 rows per lane (causal), or 8");
+  for (int z = 0; z < lanes.n; z++) Q27_CHECK(causal || lanes.lr.rows(z) == kBlock, "draft_attention_lanes: 8 rows");
+  if (T > kBlock)
+    launch_pdl(attn_tc_kernel<true, kMaxBlock>, dim3(kKvHeads, kAttnSplits, lanes.n), dim3(kMaxBlock * 8), 0, s, q, kb,
+               vb, lanes.ring_k[0], lanes.ring_v[0], lanes.pos, part, lanes, window, causal);
+  else if (draft_attn_tc() || window != kWindow || causal)
     launch_pdl(attn_tc_kernel<true>, dim3(kKvHeads, kAttnSplits, lanes.n), dim3(64), 0, s, q, kb, vb, lanes.ring_k[0],
                lanes.ring_v[0], lanes.pos, part, lanes, window, causal);
   else
     launch_pdl(attn_kernel<true>, dim3(kKvHeads, kAttnSplits, lanes.n), dim3(kBlock * 32), 0, s, q, kb, vb,
                lanes.ring_k[0], lanes.ring_v[0], lanes.pos, part, lanes);
   Q27_CUDA(cudaGetLastError());
-  launch_pdl(attn_combine_kernel, dim3(kBlock * kHeads * lanes.n), dim3(kHeadDim), 0, s, static_cast<const float*>(part),
-             out);
+  launch_pdl(attn_combine_kernel, dim3(lanes.lr.total() * kHeads), dim3(kHeadDim), 0, s,
+             static_cast<const float*>(part), out);
   Q27_CUDA(cudaGetLastError());
 }
 
 void draft_ctx_write_lanes(const DraftLanes& lanes, const float* kv, const bf16* k_norm, const int32_t* n_dev,
                            cudaStream_t s, int window) {
-  launch_pdl(ctx_write_kernel<true>, dim3(kBlock * lanes.n, kKvHeads), dim3(kHeadDim), 0, s, kv, k_norm, lanes.pos, 0,
+  launch_pdl(ctx_write_kernel<true>, dim3(lanes.lr.total(), kKvHeads), dim3(kHeadDim), 0, s, kv, k_norm, lanes.pos, 0,
              n_dev, const_cast<bf16*>(lanes.ring_k[0]), const_cast<bf16*>(lanes.ring_v[0]), lanes, window);
   Q27_CUDA(cudaGetLastError());
 }
 
-void draft_select_lanes(int lanes, const SelectLanes& sl, const float* cand_v, const int32_t* cand_i, const float* hp,
+void draft_select_lanes(const SelectLanes& sl, const float* cand_v, const int32_t* cand_i, const float* hp,
                         const bf16* pred_cb, const bf16* succ_cb, const int32_t* anchor, const uint64_t* rng,
                         int32_t* ids_out, DraftChoice choice, float* lattice, int32_t* counter, cudaStream_t s) {
-  launch_pdl(select_kernel<true>, dim3(kDraft, lanes), dim3(256), 0, s, cand_v, cand_i, hp, pred_cb, succ_cb, anchor,
+  for (int z = 0; z < sl.lr.n; z++) Q27_CHECK(sl.lr.rows(z) == kBlock, "draft_select_lanes: 8 rows per lane");
+  launch_pdl(select_kernel<true>, dim3(kDraft, sl.lr.n), dim3(256), 0, s, cand_v, cand_i, hp, pred_cb, succ_cb, anchor,
              sl.smp[0], rng, ids_out, choice, lattice, counter, Lookup{}, sl, kDraft);
   Q27_CUDA(cudaGetLastError());
 }
@@ -1353,58 +1401,65 @@ void dspine_read(const float* y, float* x, float* raw, float* rms, bf16* nb, int
   Q27_CUDA(cudaGetLastError());
 }
 
-void dspine_codes(const float* proj, const int32_t* block_ids, const bf16* codebook, int rows, int T, bf16* codes,
+void dspine_codes(const float* proj, const int32_t* block_ids, const bf16* codebook, const LaneRows& lr, bf16* codes,
                   cudaStream_t s) {
-  launch_pdl(dspine_codes_kernel, dim3(rows), dim3(kCodeThreads), 0, s, proj, block_ids, codebook, T, codes);
+  launch_pdl(dspine_codes_kernel, dim3(lr.total()), dim3(kCodeThreads), 0, s, proj, block_ids, codebook, lr, codes);
   Q27_CUDA(cudaGetLastError());
 }
 
-void dspine_msg(const float* pk, const bf16* gb, int rows, int T, bf16* msg, cudaStream_t s) {
-  launch_pdl(dspine_msg_kernel, dim3(rows), dim3(kBridgeRank), 0, s, pk, gb, T, msg);
+void dspine_msg(const float* pk, const bf16* gb, const LaneRows& lr, bf16* msg, cudaStream_t s) {
+  launch_pdl(dspine_msg_kernel, dim3(lr.total()), dim3(kBridgeRank), 0, s, pk, gb, lr, msg);
   Q27_CUDA(cudaGetLastError());
 }
 
-void dspine_write_norm(const float* delta, const float* rms, int rows, int T, float* x, const bf16* w, float* h,
+void dspine_write_norm(const float* delta, const float* rms, const LaneRows& lr, float* x, const bf16* w, float* h,
                        ActOut ao, cudaStream_t s) {
-  launch_pdl(dspine_write_norm_kernel, dim3(rows), dim3(kNormThreads), 0, s, delta, rms, T, x, w, h, ao);
+  launch_pdl(dspine_write_norm_kernel, dim3(lr.total()), dim3(kNormThreads), 0, s, delta, rms, lr, x, w, h, ao);
   Q27_CUDA(cudaGetLastError());
 }
 
-void dspine_cand(int nb, int T, bool lanes, const int32_t* cand_c, const int32_t* vocab_ids, const int32_t* block_ids,
-                 int32_t* cand_i, int32_t* sid, cudaStream_t s) {
-  const DsGeo geo{T, T - 1, lanes};
-  const int n = nb * geo.nd * kSelK;
-  launch_pdl(dspine_cand_kernel, dim3((n + 127) / 128), dim3(128), 0, s, geo, nb, cand_c, vocab_ids, block_ids, cand_i,
+void dspine_cand(const LaneRows& lr, bool lanes, const int32_t* cand_c, const int32_t* vocab_ids,
+                 const int32_t* block_ids, int32_t* cand_i, int32_t* sid, cudaStream_t s) {
+  const DsGeo geo{lr, lanes};
+  const int n = (lr.total() - lr.n) * kSelK;
+  launch_pdl(dspine_cand_kernel, dim3((n + 127) / 128), dim3(128), 0, s, geo, cand_c, vocab_ids, block_ids, cand_i,
              sid);
   Q27_CUDA(cudaGetLastError());
 }
 
-void dspine_gather_codes(const bf16* codebook, const int32_t* ids, int rows, bf16* out, cudaStream_t s, int stride) {
-  launch_pdl(dspine_gather_codes_kernel, dim3(rows), dim3(128), 0, s, codebook, ids, out, stride);
+void dspine_gather_codes(const bf16* codebook, const int32_t* ids, int rows, bf16* out, cudaStream_t s) {
+  launch_pdl(dspine_gather_codes_kernel, dim3(rows), dim3(128), 0, s, codebook, ids, out, LaneRows{});
   Q27_CUDA(cudaGetLastError());
 }
 
-void dspine_emsg(int nb, int T, bool lanes, const float* egv, const float* pk, const bf16* gb, bf16* emsg,
+void dspine_gather_anchor_codes(const bf16* codebook, const int32_t* sid, const LaneRows& lr, bf16* out,
+                                cudaStream_t s) {
+  launch_pdl(dspine_gather_codes_kernel, dim3(lr.n), dim3(128), 0, s, codebook, sid, out, lr);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void dspine_emsg(const LaneRows& lr, bool lanes, const float* egv, const float* pk, const bf16* gb, bf16* emsg,
                  cudaStream_t s, const bf16* tsv, const int32_t* cand_c) {
-  const DsGeo geo{T, T - 1, lanes};
-  launch_pdl(dspine_emsg_kernel, dim3(nb * geo.nd * kSelK), dim3(kBridgeRank), 0, s, geo, egv, pk, gb, emsg, tsv, cand_c);
+  const DsGeo geo{lr, lanes};
+  launch_pdl(dspine_emsg_kernel, dim3((lr.total() - lr.n) * kSelK), dim3(kBridgeRank), 0, s, geo, egv, pk, gb, emsg, tsv,
+             cand_c);
   Q27_CUDA(cudaGetLastError());
 }
 
-void dspine_table(int nb, int T, bool lanes, const float* raw, const float* rms, const float* delta,
+void dspine_table(const LaneRows& lr, bool lanes, const float* raw, const float* rms, const float* delta,
                   const bf16* norm_w, const int32_t* cand_c, const uint8_t* head_w, const uint8_t* head_sf,
                   float wscale, float* lattice, cudaStream_t s) {
-  const DsGeo geo{T, T - 1, lanes};
-  launch_pdl(dspine_table_kernel, dim3(nb * geo.nd * kSelK), dim3(kNormThreads), 0, s, geo, raw, rms, delta, norm_w,
+  const DsGeo geo{lr, lanes};
+  launch_pdl(dspine_table_kernel, dim3((lr.total() - lr.n) * kSelK), dim3(kNormThreads), 0, s, geo, raw, rms, delta, norm_w,
              cand_c, head_w, head_sf, wscale, lattice);
   Q27_CUDA(cudaGetLastError());
 }
 
-void dspine_select(int nb, int nd, const SelectLanes* sl, const SpecSampling& smp, const int32_t* cand_i,
+void dspine_select(int nd, const SelectLanes* sl, const SpecSampling& smp, const int32_t* cand_i,
                    const int32_t* anchor, const uint64_t* rng, int32_t* ids_out, DraftChoice choice, float* lattice,
                    cudaStream_t s) {
   if (sl)
-    launch_pdl(select_kernel<true, true>, dim3(1, nb), dim3(32), 0, s, static_cast<const float*>(nullptr), cand_i,
+    launch_pdl(select_kernel<true, true>, dim3(1, sl->lr.n), dim3(32), 0, s, static_cast<const float*>(nullptr), cand_i,
                static_cast<const float*>(nullptr), static_cast<const bf16*>(nullptr),
                static_cast<const bf16*>(nullptr), anchor, sl->smp[0], rng, ids_out, choice, lattice,
                static_cast<int32_t*>(nullptr), Lookup{}, *sl, nd);

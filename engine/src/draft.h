@@ -77,17 +77,19 @@ struct ActOut {
   float* scale = nullptr;  // per-row scale (FP8 / NVFP4)
 };
 
-// Batched steps (P6-10): the lanes' positions [n] and context rings (K / V bases; one layer's, or all
-// layers' in Draft::propose_lanes / append_ctx_lanes).
+// Batched steps (P6-10): the lanes' positions [n], context rings (K / V bases; one layer's, or all layers' in
+// Draft::propose_lanes / append_ctx_lanes) and block rows (lr; DFlash2: 8 each, DSpine: 2..16).
 struct DraftLanes {
   int n = 0;
   const int32_t* pos = nullptr;
   const bf16* ring_k[kMaxLanes] = {};
   const bf16* ring_v[kMaxLanes] = {};
+  LaneRows lr;
 };
-// The sampling of each lane (the selector's walk).
+// The sampling of each lane (the selector's walk) and the lanes' block rows.
 struct SelectLanes {
   SpecSampling smp[kMaxLanes] = {};
+  LaneRows lr;
 };
 
 struct DraftLayer {
@@ -128,18 +130,19 @@ class Draft {
   void append_ctx(const bf16* cap, int rows, const int32_t* pos, int pos_add, const int32_t* n_dev, void* ws,
                   size_t ws_bytes, void* scratch, size_t scratch_bytes, cudaStream_t s,
                   const int32_t* rowmap = nullptr);
-  // Batched steps (P6-10): the draft blocks of lanes.n sequences at once (block_ids / ids_out [n][8], rows 8 z ..
-  // of every buffer), each computed exactly as propose / append_ctx of that sequence alone (chains only).
+  // Batched steps (P6-10): the draft blocks of lanes.n sequences at once (block_ids / ids_out: the lanes' rows packed,
+  // lanes.lr; DFlash2 8 rows each), each computed exactly as propose / append_ctx of that sequence alone with its
+  // rows (chains only).
   // trees / src: [n]; rng: [n][2]; lattice / counters: the selector's scratch of each lane (see lane_*).
   void propose_lanes(const DraftLanes& lanes, const int32_t* block_ids, const bf16* embed, const uint8_t* lm_w,
                      const uint8_t* lm_sf, float lm_in_scale, float lm_alpha, const SelectLanes& smp,
                      const uint64_t* rng, int32_t* ids_out, SpecTree* trees, uint8_t* aq, uint8_t* asf, float* logits,
                      void* ws, size_t ws_bytes, cudaStream_t s);
-  // Context K/V of the lanes' accepted rows: cap rows [n][8] (row 8 z + rowmap[8 z + i] of lane z), only
-  // rows i < n_dev[z], at positions pos[z] + i.
+  // Context K/V of the lanes' accepted rows: cap rows of the step (row lr.first(z) + rowmap[kLaneSlot z + i] of lane
+  // z), only rows i < n_dev[z], at positions pos[z] + i.
   void append_ctx_lanes(const DraftLanes& lanes, const bf16* cap, const int32_t* n_dev, const int32_t* rowmap,
                         void* ws, size_t ws_bytes, cudaStream_t s);
-  // The candidate ids of a batched step ([8 n][16]: lane z's draft positions are rows 8 z + 1 .. 8 z + 7).
+  // The candidate ids of a batched step ([rows][16]: lane z's draft positions are the rows after its first).
   const int32_t* lane_cand() const { return cand_i_; }
   int32_t* lane_src() const { return src_lanes_; }
   int lanes() const { return lanes_; }
@@ -147,8 +150,7 @@ class Draft {
   DraftQuant quant() const { return quant_; }
   DraftKind kind() const { return kind_; }
   bool dspine() const { return kind_ == DraftKind::kDSpine; }
-  // Rows of a draft block (anchor + drafted tokens) of a single sequence; a batched step's blocks have
-  // kBlock (8) rows (kLaneRows).
+  // Rows of a draft block (anchor + drafted tokens) of a single sequence (a batched step's: LaneRows).
   int block() const { return block_; }
   int window() const { return window_; }  // the context ring: positions >= pos - (window - 1) are seen
   int ctx_layer(int f) const { return ctx_layers_[f]; }  // target layers whose output is the context
@@ -179,7 +181,7 @@ class Draft {
   // built at load; the refinement's candidate senders read it instead of the codebook (PCIe) and a GEMM.
   size_t tsv_off_ = 0;
   bf16* tsv_ = nullptr;
-  void propose_dspine(int nb, int T, const DraftLanes& lanes, const int32_t* block_ids, const bf16* embed,
+  void propose_dspine(const LaneRows& lr, const DraftLanes& lanes, const int32_t* block_ids, const bf16* embed,
                       const uint8_t* lm_w, const uint8_t* lm_sf, float lm_in_scale, float lm_alpha,
                       const SpecSampling* smp, const SelectLanes* sl, const uint64_t* rng, int32_t* ids_out,
                       SpecTree* trees, uint8_t* aq, uint8_t* asf, float* logits, void* ws, size_t ws_bytes,
@@ -268,8 +270,9 @@ size_t draft_attention_part_floats(int rows);
 // Rows [T][K] (fp32 or BF16) into the next GEMM's input.
 void draft_quant_rows(const float* x, int T, int K, ActOut ao, cudaStream_t s);
 void draft_quant_rows(const bf16* x, int T, int K, ActOut ao, cudaStream_t s, const int32_t* rowmap = nullptr);
-// The same over the blocks of a batched step (P6-10): row r of lane r / 8 is its block's row rowmap[r].
-void draft_quant_rows_lanes(const bf16* x, int T, int K, ActOut ao, cudaStream_t s, const int32_t* rowmap);
+// The same over the blocks of a batched step (P6-10): row i of lane z is its block's row rowmap[kLaneSlot z + i].
+void draft_quant_rows_lanes(const bf16* x, const LaneRows& lr, int K, ActOut ao, cudaStream_t s,
+                            const int32_t* rowmap);
 // silu(gate) * up ([T][I], gate / up rows ld apart) into the next GEMM's input.
 void draft_silu_mul(const float* gu, int64_t ld, int T, int I, ActOut ao, cudaStream_t s);
 // Context K/V: k_norm + RoPE of kv [rows][2048] (k | v of 8 heads) at positions *pos + pos_add + r into
@@ -282,41 +285,45 @@ void draft_select(const float* cand_v, const int32_t* cand_i, const float* hp, c
                   const bf16* succ_cb, const int32_t* anchor, SpecSampling smp, const uint64_t* rng,
                   int32_t* ids_out, DraftChoice choice, float* lattice, int32_t* counter, const Lookup& lk,
                   cudaStream_t s);
-// Batched steps (P6-10): the kernels above for the blocks of `lanes` sequences (rows 8 z .. of lane z).
-void draft_qk_prep_lanes(int lanes, const float* qkv, const bf16* q_norm, const bf16* k_norm, const int32_t* pos,
-                         float* q, float* kb, float* vb, cudaStream_t s);
+// Batched steps (P6-10): the kernels above for the blocks of the lanes (rows lanes.lr).
+void draft_qk_prep_lanes(const DraftLanes& lanes, const float* qkv, const bf16* q_norm, const bf16* k_norm, float* q,
+                         float* kb, float* vb, cudaStream_t s);
 void draft_attention_lanes(const DraftLanes& lanes, const float* q, const float* kb, const float* vb, float* part,
                            float* out, cudaStream_t s, int window = ddims::kWindow, bool causal = false);
 void draft_ctx_write_lanes(const DraftLanes& lanes, const float* kv, const bf16* k_norm, const int32_t* n_dev,
                            cudaStream_t s, int window = ddims::kWindow);
-void draft_select_lanes(int lanes, const SelectLanes& sl, const float* cand_v, const int32_t* cand_i, const float* hp,
+void draft_select_lanes(const SelectLanes& sl, const float* cand_v, const int32_t* cand_i, const float* hp,
                         const bf16* pred_cb, const bf16* succ_cb, const int32_t* anchor, const uint64_t* rng,
                         int32_t* ids_out, DraftChoice choice, float* lattice, int32_t* counter, cudaStream_t s);
-// DSpine (Draft::propose_dspine): rows of nb blocks of T rows (batched steps: T = 8, lanes true).
+// DSpine (Draft::propose_dspine): the rows of the blocks of lr (one sequence: LaneRows::one(T); batched: lanes true).
 // x += y, then RMSNorm(x) * w into the next GEMM's input.
 void dspine_add_norm(const float* y, float* x, const bf16* w, int T, ActOut ao, cudaStream_t s);
 // The bridge's read: f = x + y into x (and raw), rms, f / (rms + eps) in BF16 (nb).
 void dspine_read(const float* y, float* x, float* raw, float* rms, bf16* nb, int T, cudaStream_t s);
 // Codes (BF16): sqrt(C) * codebook[anchor] on a block's first row, sqrt(C) * proj / |proj| on the others.
-void dspine_codes(const float* proj, const int32_t* block_ids, const bf16* codebook, int rows, int T, bf16* codes,
+void dspine_codes(const float* proj, const int32_t* block_ids, const bf16* codebook, const LaneRows& lr, bf16* codes,
                   cudaStream_t s);
 // Messages (BF16 [rows][512]) from the packed projections pk [rows][1536].
-void dspine_msg(const float* pk, const bf16* gb, int rows, int T, bf16* msg, cudaStream_t s);
+void dspine_msg(const float* pk, const bf16* gb, const LaneRows& lr, bf16* msg, cudaStream_t s);
 // x += rms * delta (not on a block's first row), h = RMSNorm(x) * w (fp32 h optional, the next GEMM's input ao).
-void dspine_write_norm(const float* delta, const float* rms, int rows, int T, float* x, const bf16* w, float* h,
+void dspine_write_norm(const float* delta, const float* rms, const LaneRows& lr, float* x, const bf16* w, float* h,
                        ActOut ao, cudaStream_t s);
 // The refinement: candidate token ids and senders, the senders' codes, messages, and the 16 x 16 table.
-void dspine_cand(int nb, int T, bool lanes, const int32_t* cand_c, const int32_t* vocab_ids, const int32_t* block_ids,
-                 int32_t* cand_i, int32_t* sid, cudaStream_t s);
-void dspine_gather_codes(const bf16* codebook, const int32_t* ids, int rows, bf16* out, cudaStream_t s, int stride = 1);
+void dspine_cand(const LaneRows& lr, bool lanes, const int32_t* cand_c, const int32_t* vocab_ids,
+                 const int32_t* block_ids, int32_t* cand_i, int32_t* sid, cudaStream_t s);
+void dspine_gather_codes(const bf16* codebook, const int32_t* ids, int rows, bf16* out, cudaStream_t s);
+// The anchors' sender codes: block z's sid of (z, 0, 0).
+void dspine_gather_anchor_codes(const bf16* codebook, const int32_t* sid, const LaneRows& lr, bf16* out,
+                                cudaStream_t s);
 // tsv (optional): the sender table, see Draft::tsv_ (cand_c: the candidates' compact ids).
-void dspine_emsg(int nb, int T, bool lanes, const float* egv, const float* pk, const bf16* gb, bf16* emsg,
+void dspine_emsg(const LaneRows& lr, bool lanes, const float* egv, const float* pk, const bf16* gb, bf16* emsg,
                  cudaStream_t s, const bf16* tsv = nullptr, const int32_t* cand_c = nullptr);
-void dspine_table(int nb, int T, bool lanes, const float* raw, const float* rms, const float* delta,
+void dspine_table(const LaneRows& lr, bool lanes, const float* raw, const float* rms, const float* delta,
                   const bf16* norm_w, const int32_t* cand_c, const uint8_t* head_w, const uint8_t* head_sf,
                   float wscale, float* lattice, cudaStream_t s);
-// The walk over the table (the selector's, see draft_select): one block (sl null) or nb lanes.
-void dspine_select(int nb, int nd, const SelectLanes* sl, const SpecSampling& smp, const int32_t* cand_i,
+// The walk over the table (the selector's, see draft_select): one block of nd positions (sl null) or the lanes of
+// sl->lr.
+void dspine_select(int nd, const SelectLanes* sl, const SpecSampling& smp, const int32_t* cand_i,
                    const int32_t* anchor, const uint64_t* rng, int32_t* ids_out, DraftChoice choice, float* lattice,
                    cudaStream_t s);
 // fp32 -> BF16 (load time).

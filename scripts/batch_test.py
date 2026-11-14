@@ -4,6 +4,9 @@ check: --seqs sequences (4, up to 8; greedy and sampled, different settings per 
 (Engine.spec_step_lanes) must produce exactly the tokens each produces alone with spec_step. The run mixes
 batched steps over random subsets of 2..--seqs sequences in random order with single steps of one sequence (the
 batch ends and starts again: replay of the pending commits, scalars back to the sequences, swaps).
+--widths (DSpine): sequence i verifies blocks of the i-th width (cyclic; Engine.spec_set_block) in its solo run,
+its single steps and as a batched lane, so batched steps mix lanes of different rows. The widths of any lanes must
+fit the step's row budget (MAX_SEQS 8: 64 rows), or a lane's width is cut and its tokens differ.
 
 kvfull: a small KV pool (KV_POOL_TOKENS, --max-tokens 2048): --seqs sequences in batched steps until the engine
 raises KvFull; the latest one is suspended to the prefix cache (seq_suspend) and the batch goes on. The others
@@ -18,6 +21,7 @@ document (the longest golden prompt, repeated and rotated per sequence so no two
     docker compose --profile dev run --rm dev python scripts/batch_test.py check --seqs 8
     docker compose --profile dev run --rm dev python scripts/batch_test.py check --penalties   # min_p, presence / frequency
     docker compose --profile dev run --rm dev python scripts/batch_test.py check --logprobs    # and logprobs (some lanes)
+    docker compose --profile dev run --rm dev python scripts/batch_test.py check --draft dspine --widths 4,12,16,8
     docker compose --profile dev run --rm dev python scripts/batch_test.py bench --steps 200
     docker compose --profile dev run --rm dev python scripts/batch_test.py bench --ctx 32768 --max-tokens 262144
 """
@@ -58,8 +62,10 @@ def start(eng, ids, smp, seed):
     return begin(eng, ids, smp, seed, random.Random(seed).random())
 
 
-def solo(eng, ids, smp, seed, n, lps=None):
+def solo(eng, ids, smp, seed, n, lps=None, width=0):
     out = [start(eng, ids, smp, seed)]
+    if width:
+        eng.spec_set_block(None, width)
     if lps is not None:
         lps += eng.logprobs()
     while len(out) < n:
@@ -111,7 +117,9 @@ def check(eng, tok, args):
     cases = make_cases(tok, args.seqs, 100, LOGPROBS if args.logprobs else PENALTIES if args.penalties else SAMPLINGS)
     t0 = time.time()
     ref_lps = [[] for _ in cases]
-    refs = [solo(eng, ids, smp, seed, args.gen, ref_lps[i]) for i, (ids, smp, seed) in enumerate(cases)]
+    widths = [int(x) for x in args.widths.split(",")] if args.widths else []
+    width = [widths[i % len(widths)] if widths else 0 for i in range(len(cases))]
+    refs = [solo(eng, ids, smp, seed, args.gen, ref_lps[i], width[i]) for i, (ids, smp, seed) in enumerate(cases)]
     print(f"solo runs {time.time() - t0:.1f} s", flush=True)
     rng = random.Random(args.seed)
     outs = [[] for _ in cases]
@@ -122,6 +130,8 @@ def check(eng, tok, args):
             run = next(j for j, a in where.items() if a is None)
             where[run] = eng.seq_park()
         outs[i].append(start(eng, ids, smp, seed))
+        if width[i]:
+            eng.spec_set_block(None, width[i])
         lps[i] += eng.logprobs()
         where[i] = None
     batched = singles = 0
@@ -310,13 +320,14 @@ def main():
     ap.add_argument("--weights", default="nvidia", help="weight profile: nvidia | gdnfp4 | quasar | a model directory")
     ap.add_argument("--max-tokens", type=int, default=16384)
     ap.add_argument("--draft", default="dflash2", choices=["dflash2", "dspine"],
-                    help="draft model (check / kvfull with dspine: Q27_DRAFT_BLOCK=8, the batched steps' block, for the solo steps too)")
+                    help="draft model (check / kvfull with dspine: Q27_DRAFT_BLOCK=8 unless --widths, so every lane has 8 rows)")
+    ap.add_argument("--widths", default="", help="check, dspine: verify widths of the sequences (cyclic), e.g. 4,12,16,8")
     ap.add_argument("--ctx", type=int, default=0, help="bench: tokens of a long document before each prompt")
     ap.add_argument("--profile", action="store_true", help="bench: per-op GPU time of the steps (Q27_PROFILE=1)")
     ap.add_argument("--out", default="", help="bench: result JSON (default bench/results/<UTC time>-custom-p6-10-batch.json)")
     args = ap.parse_args()
     lanes_max = max(int(x) for x in args.lanes.split(",")) if args.part == "bench" else args.seqs
-    os.environ.setdefault("MAX_SEQS", str(max(4, lanes_max)))
+    os.environ.setdefault("MAX_SEQS", str(8 if args.widths else max(4, lanes_max)))
     if args.part == "kvfull":  # (a pool of 2,112 tokens: four sequences of --gen 600 do not fit; 512 per sequence)
         os.environ.setdefault("STATE_HOST_CACHE", "2")
         os.environ.setdefault("KV_POOL_TOKENS", str(512 * max(4, args.seqs)))
@@ -328,7 +339,7 @@ def main():
 
     from q27lib import Engine, KvFull
     from qwen27b.weights import DFLASH2, DSPINE, TARGET, engine_target, snapshot
-    if args.draft == "dspine" and args.part != "bench":
+    if args.draft == "dspine" and args.part != "bench" and not args.widths:
         os.environ.setdefault("Q27_DRAFT_BLOCK", "8")
 
     tok = AutoTokenizer.from_pretrained(snapshot(*TARGET))
