@@ -131,8 +131,9 @@ void quant_fp4_weight(const bf16* w, int M, int K, float global, uint8_t* q, uin
 // Zero-centered RMSNorm over the hidden size (5120) per token, writing the fp32 result to `out` (may be
 // null) and the quantized activation (same numerics as rmsnorm + quant_fp4 / quant_fp8).
 // cap (optional): a BF16 copy of the input rows x (the residual stream), rows cap_ld elements apart.
+// rstd (optional): the per-token 1 / rms ([T]), for linear_bf16_pair's RMSNorm form.
 void rmsnorm_quant(const float* x, const bf16* w, int T, float eps, float* out, QuantOut q, cudaStream_t s,
-                   bf16* cap = nullptr, int cap_ld = 0);
+                   bf16* cap = nullptr, int cap_ld = 0, float* rstd = nullptr);
 // NVFP4 quantization of silu(gate) * up ([T][I], gate / up rows ld floats apart).
 void silu_mul_quant_fp4(const float* gate, const float* up, int64_t ld, int T, int I, float input_scale, uint8_t* q,
                         uint8_t* sf, cudaStream_t s);
@@ -161,8 +162,11 @@ void silu_mul(const float* gate, const float* up, int64_t n, float* out, cudaStr
 void linear_bf16(const float* x, const bf16* w, int T, int N, int K, float* out, cudaStream_t s);
 // Two BF16 linear layers [N][K] on the same input: outa = x . wa^T, outb = x . wb^T ([T][N] each).
 // T > 8 (N = 48): tensor cores, x as bf16 hi + lo (about 1e-5 relative to the fp32 dots).
+// rstd / norm_w (when linear_bf16_pair_norm_ok(T)): x is the residual stream, the input RMSNorm(x) with the
+// rstd from rmsnorm_quant, bit-identical to passing rmsnorm_quant's fp32 output (P5-17).
 void linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T, int N, int K, float* outa, float* outb,
-                      cudaStream_t s);
+                      cudaStream_t s, const float* rstd = nullptr, const bf16* norm_w = nullptr);
+bool linear_bf16_pair_norm_ok(int T);
 // Debug timeline of the decode step (no-ops unless built with -DQ27_TRACE; see launch.cuh).
 void trace_clear_launches();
 void trace_step_begin(cudaStream_t s);

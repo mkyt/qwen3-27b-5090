@@ -929,8 +929,12 @@ void Model::gdn(int i, int T) {
   float* conv = conv_ + size_t(gi) * kConvDim * (kConvK - 1);
   float* ssm = ssm_ + size_t(gi) * kVHeads * kKDim * kVDim;
   mark("norm+quant");
-  if (!skip("norm"))  // h_: input of in_proj_a / b
-    rmsnorm_quant(x_, L.in_norm, T, kEps, h_, qin(G.qkv), s_, cap_for(i), ddims::kCtxFeatures * kHidden);
+  // h_: input of in_proj_a / b, or (norm_ab, P5-17, the prefill only: the verify and decode preps read h_) just
+  // the rstd per token, in_proj_a / b normalizing x_ itself.
+  const bool norm_ab = !verify_ && T > 1 && linear_bf16_pair_norm_ok(T);
+  if (!skip("norm"))
+    rmsnorm_quant(x_, L.in_norm, T, kEps, norm_ab ? nullptr : h_, qin(G.qkv), s_, cap_for(i), ddims::kCtxFeatures * kHidden,
+                  norm_ab ? h_ : nullptr);
   float *qkv = big1_, *z = big2_;
   int ld = kConvDim, ldz = kVHeads * kVDim;
   if (fused(T)) {
@@ -967,7 +971,10 @@ void Model::gdn(int i, int T) {
     return;
   }
   mark("gdn a,b");
-  linear_bf16_pair(h_, G.a, G.b, T, kVHeads, kHidden, a_, b_, s_);
+  if (norm_ab)
+    linear_bf16_pair(x_, G.a, G.b, T, kVHeads, kHidden, a_, b_, s_, h_, L.in_norm);
+  else
+    linear_bf16_pair(h_, G.a, G.b, T, kVHeads, kHidden, a_, b_, s_);
   mark("gdn prep");
   gdn_prep(qkv, ld, conv, G.conv, a_, b_, G.A_log, G.dt_bias, T, q_, k_, v_, g_, beta_, s_);
   mark("gdn recurrent");

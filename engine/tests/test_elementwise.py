@@ -231,3 +231,23 @@ def test_dequant_fp8_rows():
     out = torch.empty(rows, K, dtype=torch.bfloat16, device=dev)
     call("q27t_dequant_fp8_rows", w.view(torch.uint8).to(dev), s.to(dev), rows, K, out)
     assert torch.equal(out.cpu(), (w.float() * s[:, None]).bfloat16())
+
+
+def test_norm_linear_bf16_pair_fused_is_bit_identical(monkeypatch):
+    """P5-17: in_proj_a / b normalizing the residual itself (rstd from the RMSNorm) equals the normed rows' result."""
+    N, K = 48, 5120
+    x = torch.randn(300, K, device=dev) * 3
+    nw = (torch.randn(K, device=dev) * 0.3).bfloat16()
+    wa, wb = (torch.randn(N, K, device=dev) * 0.02).bfloat16(), (torch.randn(N, K, device=dev) * 0.02).bfloat16()
+
+    def run(T, fused):
+        monkeypatch.setenv("Q27_AB_NORM", "1" if fused else "0")
+        h, q = torch.empty(T, K, device=dev), torch.empty(T, K, dtype=torch.uint8, device=dev)
+        oa, ob = torch.empty(T, N, device=dev), torch.empty(T, N, device=dev)
+        call("q27t_norm_linear_bf16_pair", x[:T].contiguous(), nw, 1e-6, wa, wb, T, h, q, oa, ob)
+        return oa, ob
+
+    for T in (9, 77, 300):
+        a0, b0 = run(T, False)
+        a1, b1 = run(T, True)
+        assert torch.equal(a0, a1) and torch.equal(b0, b1), T

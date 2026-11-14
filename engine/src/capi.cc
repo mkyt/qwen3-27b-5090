@@ -481,6 +481,19 @@ int q27t_gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_s
 int q27t_linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T, int N, int K, float* oa, float* ob) {
   return kernel([&] { linear_bf16_pair(x, wa, wb, T, N, K, oa, ob, ts()); });
 }
+// RMSNorm (FP8 activations into q) then in_proj_a / b as the GDN prefill runs them; h: [T][5120] scratch.
+int q27t_norm_linear_bf16_pair(const float* x, const bf16* norm_w, float eps, const bf16* wa, const bf16* wb, int T,
+                               float* h, uint8_t* q, float* oa, float* ob) {
+  return kernel([&] {
+    const bool fused = linear_bf16_pair_norm_ok(T);
+    rmsnorm_quant(x, norm_w, T, eps, fused ? nullptr : h, {QuantOut::kFp8, 1.f, q, nullptr}, ts(), nullptr, 0,
+                  fused ? h : nullptr);
+    if (fused)
+      linear_bf16_pair(x, wa, wb, T, 48, dims::kHidden, oa, ob, ts(), h, norm_w);
+    else
+      linear_bf16_pair(h, wa, wb, T, 48, dims::kHidden, oa, ob, ts());
+  });
+}
 int q27t_swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst) {
   return kernel([&] { swizzle_sf(src, rows, kblocks, dst, ts()); });
 }

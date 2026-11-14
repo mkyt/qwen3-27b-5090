@@ -336,6 +336,11 @@ gate without an explicit decision, recorded below with its numbers.
   copies that compile to driver calls): 18 us for 16 tokens, 45 us for 2,048. Prompts of 128 / 512 tokens
   +7.4 / +6.4%; at 19K the gain (-17 ms of kernel time) is taken back by the power limit (+0.4%, energy per token
   unchanged). Error against FP64 1.2e-5 -> 3.7e-6; golden KL against BF16 0.0467 (noise).
+- **P5-17: in_proj_a / b normalizes the residual itself.** The GDN layer's input RMSNorm wrote its FP32 rows
+  (42 MB per 2,048 tokens) only for in_proj_a / b. In the prefill it now writes 1 / rms per token, and the
+  in_proj_a / b kernel forms (x rstd) (1 + w) per element as the RMSNorm does: bit-identical, the norm 10.7 ms
+  less at 19K, in_proj_a / b 1.8 ms more; 19K +0.5%, energy per token -0.8%. The verify and decode preps still
+  read the normed rows.
 - **Not done: FP4 attention for P V (SageAttention3 style), a megakernel.** See [Not done](#not-done).
 
 ## Vision

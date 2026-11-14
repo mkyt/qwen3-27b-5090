@@ -105,6 +105,7 @@ SIGNATURES = {
     "q27t_silu_mul_quant_fp4_glu_bf16": ([P, I, I, F, F, F, P, P], I),
     "q27t_gemm_fp4_bf16": ([I, I, I, P, P, P, P, F, P], I),
     "q27t_linear_bf16_pair": ([P, P, P, I, I, I, P, P], I),
+    "q27t_norm_linear_bf16_pair": ([P, P, F, P, P, I, P, P, P, P], I),
     "q27t_attn_prep": ([P, P, P, P, P, I, I, P, P, I, P, P], I),
     "q27t_attention": ([P, P, I, I, P, P, I, P, P, P, SZ], I),
     "q27t_attention_decode": ([P, P, I, I, P, P, I, P, P, P, SZ], I),

@@ -210,7 +210,7 @@ __global__ void quant_fp4_weight_kernel(const bf16* w, int M, int K, float globa
 // instantiation: the block-wide maximum stays out of the other kinds' code).
 template <bool kRows>
 __global__ void rmsnorm_quant_kernel(const float* x, const bf16* w, float eps, float* out, QuantOut qo, bf16* cap,
-                                     int cap_ld) {
+                                     int cap_ld, float* rstd) {
   pdl_trigger();
   constexpr int D = dims::kHidden;
   const int t = blockIdx.x, kb = threadIdx.x;
@@ -236,6 +236,7 @@ __global__ void rmsnorm_quant_kernel(const float* x, const bf16* w, float eps, f
 #pragma unroll
   for (int j = 0; j < 16; j++) ss += v[j] * v[j];
   float r = rsqrtf(block_sum(ss) / D + eps);
+  if (rstd && kb == 0) rstd[t] = r;
 #pragma unroll
   for (int j = 0; j < 16; j++) v[j] = v[j] * r * (1.f + __bfloat162float(wv[j]));
   if (out) {
@@ -470,12 +471,17 @@ __global__ void __launch_bounds__(kAbWarps * 32) linear_bf16_pair_tc_kernel(cons
 // whatever the pipeline depth: 77 us for one layer of 2,048 tokens. The split is fixed, so rows do not
 // depend on T or on the other rows.
 constexpr int kAb2Mt = 1, kAb2Tok = 16 * kAb2Mt, kAb2Warps = 6 * kAb2Mt, kAb2Stages = 3, kAb2Split = 4;
-constexpr int kAb2XBytes = kAb2Tok * kAbK * 4, kAb2Stage = kAb2XBytes + kAbWBytes, kAb2Smem = kAb2Stages * kAb2Stage;
+constexpr int kAb2XBytes = kAb2Tok * kAbK * 4, kAb2Stage = kAb2XBytes + kAbWBytes + kAbK * 2,
+              kAb2Smem = kAb2Stages * kAb2Stage;  // x, w, the RMSNorm weights (rstd != null)
 static_assert(kAb2Tok * kAbN * 4 <= kAb2Smem, "partial sums reuse the stages");
 
+// rstd (P5-17): x is the residual stream and the input is RMSNorm(x) = (x rstd[t]) (1 + norm_w), formed per
+// element exactly as rmsnorm_quant forms it (so it need not write the normed rows).
 __global__ void __launch_bounds__(kAb2Warps * 32) linear_bf16_pair_tc2_kernel(const float* x, const bf16* wa,
                                                                               const bf16* wb, int T, int K,
-                                                                              float* outa, float* outb) {
+                                                                              float* outa, float* outb,
+                                                                              const float* rstd,
+                                                                              const bf16* norm_w) {
   pdl_trigger();
   namespace cg = cooperative_groups;
   extern __shared__ __align__(128) uint8_t ab2_smem[];
@@ -501,9 +507,17 @@ __global__ void __launch_bounds__(kAb2Warps * 32) linear_bf16_pair_tc2_kernel(co
         cp_async16z(st + kAb2XBytes + n * 128 + ((u ^ (n & 7)) << 4), w, true);
       }
     }
+    if (rstd && tid < kAbK / 8) cp_async16z(st + kAb2XBytes + kAbWBytes + tid * 16, norm_w + k0 + tid * 8, true);
     cp_commit();
   };
   pdl_wait();
+  float rr[2] = {1.f, 1.f};  // rstd of rows r0, r0 + 8
+  if (rstd)
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+      const int t = t0 + 16 * mt + r0 + 8 * h;
+      rr[h] = t < T ? rstd[t] : 0.f;
+    }
 #pragma unroll
   for (int kt = 0; kt < kAb2Stages - 1; kt++) {
     if (kt < nk) issue(kt); else cp_commit();
@@ -515,13 +529,18 @@ __global__ void __launch_bounds__(kAb2Warps * 32) linear_bf16_pair_tc2_kernel(co
     if (kt + kAb2Stages - 1 < nk) issue(kt + kAb2Stages - 1); else cp_commit();
     const uint32_t st = sbase + (kt % kAb2Stages) * kAb2Stage;
     const float* xs = reinterpret_cast<const float*>(ab2_smem + (kt % kAb2Stages) * kAb2Stage);
+    const bf16* nw = reinterpret_cast<const bf16*>(ab2_smem + (kt % kAb2Stages) * kAb2Stage + kAb2XBytes + kAbWBytes);
 #pragma unroll
     for (int kk = 0; kk < kAbK / 16; kk++) {
       uint32_t hi[4], lo[4];
 #pragma unroll
       for (int q = 0; q < 4; q++) {  // a[q]: row r0 + 8 (q % 2), cols c2 + 8 (q / 2)
         const int r = 16 * mt + r0 + 8 * (q % 2), c = kk * 16 + c2 + 8 * (q / 2);
-        const float2 v = *reinterpret_cast<const float2*>(xs + r * 64 + (((c / 4) ^ (r & 7)) * 4) + c % 4);
+        float2 v = *reinterpret_cast<const float2*>(xs + r * 64 + (((c / 4) ^ (r & 7)) * 4) + c % 4);
+        if (rstd) {
+          const float2 g = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(nw + c));
+          v.x = v.x * rr[q % 2] * (1.f + g.x), v.y = v.y * rr[q % 2] * (1.f + g.y);
+        }
         const __nv_bfloat162 h = __floats2bfloat162_rn(v.x, v.y);
         const float2 hf = __bfloat1622float2(h);
         hi[q] = *reinterpret_cast<const uint32_t*>(&h);
@@ -697,12 +716,12 @@ void linear_bf16(const float* x, const bf16* w, int T, int N, int K, float* out,
 }
 
 void rmsnorm_quant(const float* x, const bf16* w, int T, float eps, float* out, QuantOut q, cudaStream_t s, bf16* cap,
-                   int cap_ld) {
+                   int cap_ld, float* rstd) {
   if (T == 0) return;
   if (q.kind == QuantOut::kFp8Row)
-    launch_pdl(rmsnorm_quant_kernel<true>, dim3(T), dim3(dims::kHidden / 16), 0, s, x, w, eps, out, q, cap, cap_ld);
+    launch_pdl(rmsnorm_quant_kernel<true>, dim3(T), dim3(dims::kHidden / 16), 0, s, x, w, eps, out, q, cap, cap_ld, rstd);
   else
-    launch_pdl(rmsnorm_quant_kernel<false>, dim3(T), dim3(dims::kHidden / 16), 0, s, x, w, eps, out, q, cap, cap_ld);
+    launch_pdl(rmsnorm_quant_kernel<false>, dim3(T), dim3(dims::kHidden / 16), 0, s, x, w, eps, out, q, cap, cap_ld, rstd);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -740,8 +759,17 @@ void silu_mul_quant_fp4_glu(const bf16* gu, int T, int I, float alpha_gate, floa
   silu_mul_quant_fp4_glu_impl(gu, T, I, alpha_gate, alpha_up, input_scale, q, sf, s);
 }
 
+bool linear_bf16_pair_norm_ok(int T) {
+  if (T <= 8) return false;
+  const char* e = getenv("Q27_AB_TC");
+  if (e && *e && atoi(e) == 1) return false;
+  const char* f = getenv("Q27_AB_NORM");
+  return !(f && *f) || atoi(f) != 0;
+}
+
 void linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T, int N, int K, float* outa, float* outb,
-                      cudaStream_t s) {
+                      cudaStream_t s, const float* rstd, const bf16* norm_w) {
+  Q27_CHECK(!rstd || linear_bf16_pair_norm_ok(T), "linear_bf16_pair: the RMSNorm form needs linear_bf16_pair_norm_ok");
   Q27_CHECK(K % 256 == 0, "linear_bf16_pair: K must be a multiple of 256");
   if (T == 0) return;
   if (T > 8) {
@@ -755,7 +783,7 @@ void linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T, int
       (void)init;
       Q27_CHECK(K % (kAbK * kAb2Split) == 0, "linear_bf16_pair: K must split in 4 x 64");
       launch_pdl_cluster(linear_bf16_pair_tc2_kernel, dim3((T + kAb2Tok - 1) / kAb2Tok * kAb2Split), dim3(kAb2Warps * 32),
-                         kAb2Smem, s, kAb2Split, x, wa, wb, T, K, outa, outb);
+                         kAb2Smem, s, kAb2Split, x, wa, wb, T, K, outa, outb, rstd, norm_w);
       Q27_CUDA(cudaGetLastError());
       return;
     }
