@@ -34,8 +34,9 @@ and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 - **Speculative decoding** with the [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) block drafter (blocks of up to
   16 tokens, the verify width adapting to the acceptance; [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) with
   `SPEC=dflash2`), batched across concurrent requests; each request's tokens are bit-identical to running it alone.
-  DSpine is faster for one request (JSON 1.36x, code 1.07x); with four or eight requests at once DFlash2 is 4–7%
-  faster, so a server that mostly runs many requests at once may prefer `SPEC=dflash2`.
+  DSpine is faster for one request (JSON 1.37x, code 1.08x). In a batch each DSpine request verifies 4 to 16 rows of
+  its own, chosen from its recent acceptance; on long reasoning DFlash2 is still 3–6% faster with four or eight
+  requests at once, so a server that mostly runs many such requests may prefer `SPEC=dflash2`.
 - **NVFP4 weights including the Gated DeltaNet projections**
   ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), GPTQ from the BF16 original;
   the attention projections stay FP8 because quantizing them cost parallel tool calls): decode reads 14 GiB of

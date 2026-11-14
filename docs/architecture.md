@@ -197,8 +197,8 @@ last layer's write redone for every candidate of the predecessor (a 16 x 16 tabl
 below walks that table. A sequence verifies 16 rows while its tokens per step stay high and 8 otherwise
 (`Q27_SPEC_ADAPT`). In batched steps each sequence verifies 4, 8, 12 or 16 rows of its own (`Q27_SPEC_ADAPT_BATCH`):
 the rows are packed, the kernels take each lane's first row and count, and every few steps (8) the engine moves one
-lane's rows at a time while that raises the step's expected tokens per ms, from each lane's recent tokens per step
-and a model of the step time (about 11 + 0.18 per lane + 1.1 per 16 rows begun + 0.11 per row ms; the GEMMs step up
+lane's rows at a time while that raises the step's expected tokens per ms, from each lane's tokens per step at
+the widths it ran (moving averages; untried widths extrapolated) and a model of the step time (about 11 + 0.18 per lane + 1.1 per 16 rows begun + 0.11 per row ms; the GEMMs step up
 every 16 rows). A new split of the rows updates the step's CUDA graph in place. `SPEC=dflash2` selects DFlash2, described next.
 
 The DFlash2 draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"

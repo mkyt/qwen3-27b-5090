@@ -1,0 +1,72 @@
+{
+  "label": "lc-latest",
+  "model": "qwen3.8-27b",
+  "started": "2026-11-14T16:45:41.758144",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "lc-latest",
+    "scenarios": "longctx",
+    "seed": 0,
+    "thinking": false,
+    "decode_reps": 2,
+    "decode_max_tokens": 1024,
+    "agent_sessions": "1,4",
+    "agent_turns": 8,
+    "agent_max_tokens": 512,
+    "system_tokens": 4000,
+    "tools": 20,
+    "tool_output_min": 800,
+    "tool_output_max": 3000,
+    "longctx_tokens": "32000,120000",
+    "longctx_max_tokens": 256,
+    "extra_body": "{}"
+  },
+  "results": {
+    "longctx": [
+      {
+        "target_tokens": 32000,
+        "cold": {
+          "prompt_tokens": 19460,
+          "ttft": 1.676,
+          "prefill_tps": 11612.3,
+          "decode_tps": 192.23
+        },
+        "warm": {
+          "prompt_tokens": 19456,
+          "ttft": 0.055,
+          "prefill_tps": 354505.4,
+          "decode_tps": 300.49
+        },
+        "prefix_cache_hit_rate": 0.4983,
+        "prefix_cache_hits": 19392,
+        "prefix_cache_queries": 38916,
+        "prefix_cache_reusable": 19442,
+        "prefix_cache_hit_of_reusable": 0.9974,
+        "spec_mean_accept_len": 3.52,
+        "spec_draft_acceptance": null
+      },
+      {
+        "target_tokens": 120000,
+        "cold": {
+          "prompt_tokens": 72969,
+          "ttft": 7.935,
+          "prefill_tps": 9195.5,
+          "decode_tps": 152.09
+        },
+        "warm": {
+          "prompt_tokens": 72965,
+          "ttft": 1.109,
+          "prefill_tps": 65794.0,
+          "decode_tps": 221.82
+        },
+        "prefix_cache_hit_rate": 0.4491,
+        "prefix_cache_hits": 65536,
+        "prefix_cache_queries": 145934,
+        "prefix_cache_reusable": 72953,
+        "prefix_cache_hit_of_reusable": 0.8983,
+        "spec_mean_accept_len": 2.582,
+        "spec_draft_acceptance": null
+      }
+    ]
+  }
+}
