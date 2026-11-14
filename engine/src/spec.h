@@ -64,6 +64,10 @@ struct SpecSampling {
   int block = 0, block_next = 0, block_due = 0;
   float accept_ema = 0.f;
   bool pinned = false;  // the width stays (Model::spec_set_block)
+  // Batched steps (Model::batch_prepare): the lane's rows (4 / 8 / 12 / 16, DSpine) and the moving average of its tokens
+  // per batched step at those rows. Past batched steps decide them, as the single width above.
+  int lane_rows = 8;
+  float lane_ema = 4.25f;
   bool penalized() const { return pen.presence != 0.f || pen.frequency != 0.f; }
   bool same(const SpecSampling& o) const {  // (the settings a captured step depends on)
     return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && paths == o.paths &&

@@ -247,7 +247,7 @@ def main():
         if any(ms[i] for i in lanes):
             for z, (i, chain) in enumerate(zip(lanes, eng.spec_draft_lanes(areas))):
                 if ms[i]:
-                    write_masks(eng, ms[i], chain, 8 * z, eos)
+                    write_masks(eng, ms[i], chain, 16 * z, eos)  # (lane z: mask rows 16 z ..)
         for i, toks in zip(lanes, eng.spec_step_lanes(areas)):
             for t in toks:
                 if t in eos or len(outs[i]) >= n:

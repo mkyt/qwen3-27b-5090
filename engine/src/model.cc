@@ -1,12 +1,12 @@
 #include "model.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <numeric>
 #include <tuple>
 #include <vector>
 
@@ -404,6 +404,9 @@ void Model::configure() {
   adapt_up_ = env_f("Q27_SPEC_ADAPT_UP", 4.5f);
   adapt_down_ = env_f("Q27_SPEC_ADAPT_DOWN", 4.0f);
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
+  batch_adapt_ = adapt_on_ && env_int("Q27_SPEC_ADAPT_BATCH", 1) != 0;
+  batch_hyst_ = std::max(0.f, env_f("Q27_SPEC_ADAPT_HYST", 0.01f));
+  batch_period_ = std::max(1, env_int("Q27_SPEC_ADAPT_PERIOD", 8));
   spec_pipeline_ = env_int("Q27_SPEC_PIPELINE", 1) != 0;
   mlp_bf16_ = env_int("Q27_MLP_BF16", 1) != 0;
   mlp_fused_ = env_int("Q27_MLP_FUSED", 1) != 0;
@@ -1529,6 +1532,7 @@ int32_t Model::spec_begin(const int32_t* ids, int n, const SpecSampling& smp, ui
   // The full block first; the average starts between the thresholds.
   spec_smp_.block = spec_smp_.block_next = spec_smp_.block_due = draft_->block();
   spec_smp_.accept_ema = 0.5f * (adapt_up_ + adapt_down_);
+  spec_smp_.lane_rows = std::min(ddims::kBlock, draft_->block()), spec_smp_.lane_ema = 4.25f;
   return first;
 }
 
@@ -1724,7 +1728,7 @@ void Model::spec_adapt(SpecSampling& smp, int n) const {
     smp.block_next = full;
 }
 
-cudaGraphExec_t Model::capture(const std::function<void()>& body) {
+cudaGraphExec_t Model::capture(const std::function<void()>& body, cudaGraphExec_t update) {
   cudaGraph_t graph;
   cudaGraphExec_t exec;
   trace_clear_launches();
@@ -1735,6 +1739,15 @@ cudaGraphExec_t Model::capture(const std::function<void()>& body) {
   mark(nullptr);
   prof_.capturing = false;
   Q27_CUDA(cudaStreamEndCapture(s_, &graph));
+  if (update) {  // the same kernels with other arguments or grids: update in place (no instantiate)
+    cudaGraphExecUpdateResultInfo info;
+    if (cudaGraphExecUpdate(update, graph, &info) == cudaSuccess) {
+      Q27_CUDA(cudaGraphDestroy(graph));
+      return update;
+    }
+    (void)cudaGetLastError();
+    Q27_CUDA(cudaGraphExecDestroy(update));
+  }
   Q27_CUDA(cudaGraphInstantiate(&exec, graph, 0));
   Q27_CUDA(cudaGraphDestroy(graph));
   return exec;
@@ -2022,8 +2035,8 @@ void Model::seq_suspend(int a) {
 // parity, commit count, budget, RNG, anchor) move into the b_* arrays when the batch starts and back when it
 // ends. A verify's commit is replayed at the start of the lane's next verify, in place (the lane's state has
 // one buffer here); ending the batch replays the last one.
-// Each lane verifies a block of its own rows (DSpine; see batch_prepare), cut to the step's row budget
-// (batch_rows_) from the lane with the lowest moving average up; the rows are packed (blr_), the graphs keyed by them.
+// Each lane verifies a block of its own rows (DSpine; see batch_rows) within the step's row budget (batch_rows_);
+// the rows are packed (blr_), the graphs keyed by the lanes' total rows and updated in place for another split.
 // The batched steps keep the sequences' adaptive widths (spec_adapt) up to date as their single steps do.
 
 Model::LaneRef Model::lane_ref(int z) {
@@ -2222,29 +2235,111 @@ void Model::batch_body(int n, int part) {
 }
 
 // The lanes' graph cache entry (the graph holds their state pointers: keyed by the lanes, the running one's state
-// buffer, their sampling and their rows), created when missing (the least recently used one goes beyond kGraphCache).
+// buffer, their sampling and their total rows), created when missing (the least recently used one goes beyond
+// kBatchGraphCache). Another split of the same total re-captures the graph and updates it in place (spec_step_lanes).
 Model::BatchGraph& Model::batch_graph(int n) {
   const int sb = std::count(blanes_.begin(), blanes_.end(), -1) ? sbuf_host_ : -1;
   auto same_acc = [&](const AcceptLanes& a) {
     for (int z = 0; z < n; z++) {
-      const SpecSampling &x = a.smp[z], &y = bacc_.smp[z];
-      if (!x.same(y)) return false;
+      SpecSampling x = a.smp[z];
+      x.block = bacc_.smp[z].block;  // (the rows: updated in place, see below)
+      if (!x.same(bacc_.smp[z])) return false;
     }
     return true;
   };
   for (auto& g : bgraphs_)
-    if (g.lanes == blanes_ && g.sbuf == sb && g.acc.lr == bacc_.lr && same_acc(g.acc)) {
+    if (g.lanes == blanes_ && g.sbuf == sb && g.lr.total() == blr_.total() && same_acc(g.acc)) {
       g.used = ++graph_clock_;
       return g;
     }
-  if (bgraphs_.size() >= size_t(kGraphCache)) {
+  if (bgraphs_.size() >= size_t(kBatchGraphCache)) {
     auto lru = std::min_element(bgraphs_.begin(), bgraphs_.end(), [](auto& a, auto& b) { return a.used < b.used; });
     for (auto x : {lru->exec, lru->exec2})
       if (x) Q27_CUDA(cudaGraphExecDestroy(x));
     bgraphs_.erase(lru);
   }
   bgraphs_.push_back({blanes_, sb, bacc_, nullptr, ++graph_clock_});
-  return bgraphs_.back();
+  BatchGraph& g = bgraphs_.back();
+  g.lr = g.lr2 = blr_;
+  return g;
+}
+
+namespace {
+// Tokens per step at c rows of a lane that made e per step at w rows: a geometric acceptance a (1 + a + .. + a^(w-1) = e).
+float geo_tokens(float e, int w, int c) {
+  e = std::clamp(e, 1.01f, float(w) - 0.01f);
+  float lo = 0.f, hi = 0.9999f;
+  for (int i = 0; i < 40; i++) {
+    const float a = 0.5f * (lo + hi);
+    ((1.f - powf(a, float(w))) / (1.f - a) < e ? lo : hi) = a;
+  }
+  const float a = 0.5f * (lo + hi);
+  return (1.f - powf(a, float(c))) / (1.f - a);
+}
+// A batched step's time (ms) by lanes and total rows (measured on an RTX 5090 at 400 W, gdnfp4 weights, NVFP4 KV,
+// 4K context, 4 and 8 lanes: 11.05 + 0.18 x lanes + 1.1 per 16 rows begun + 0.11 x rows; only its shape matters).
+float batch_step_ms(int lanes, int rows) {
+  return 11.05f + 0.18f * float(lanes) + 1.1f * float((rows + 15) / 16) + 0.11f * float(rows);
+}
+}  // namespace
+
+// The lanes' rows of a batched step (DSpine). Rule (P3-38, chosen on recorded DSpine steps): each lane's expected
+// tokens at c rows, est(c), come from the moving average of its tokens per step at the rows it ran; the step's time is
+// about batch_step_ms(lanes, total rows) (the GEMMs step up at every 16 rows of the total; how the rows split does
+// not matter). From the lanes' current rows, the move of one lane's rows that raises sum(est) / time most is taken
+// while it gains more than Q27_SPEC_ADAPT_HYST (relative; each new split re-captures the step's graph, about 1.2 ms),
+// within the row budget (batch_rows_). Pinned (spec_set_block) lanes keep their width, masked ones 8 (the rule off:
+// Q27_SPEC_ADAPT_BATCH=0, every lane 8).
+void Model::batch_rows(int n, int* w) {
+  const int full = std::min(draft_->block(), kSpecBlock);
+  int cur[kMaxLanes];
+  bool fixed[kMaxLanes];
+  float est[kMaxLanes][5] = {};  // est[z][c / 4]
+  for (int z = 0; z < n; z++) {
+    SpecSampling& m = lane_smp(z);
+    fixed[z] = m.pinned || m.masked || !batch_adapt_;
+    cur[z] = m.pinned ? std::clamp(m.block_due, 2, kSpecBlock) : fixed[z] ? std::min(ddims::kBlock, full) : m.lane_rows;
+    for (int c = 4; c <= full; c += 4) est[z][c / 4] = geo_tokens(m.lane_ema, std::max(cur[z], 2), c);
+    w[z] = cur[z];
+  }
+  auto ema = [&](int z) { return lane_smp(z).lane_ema; };
+  int total = std::accumulate(w, w + n, 0);
+  while (total > batch_rows_) {  // the budget: 4 rows off the lane with the lowest average (ties: the widest)
+    int c = -1;
+    for (int z = 0; z < n; z++)
+      if (w[z] > 4 && (c < 0 || ema(z) < ema(c) || (ema(z) == ema(c) && w[z] > w[c]))) c = z;
+    Q27_CHECK(c >= 0, "spec_step_lanes: the lanes' rows do not fit the step");
+    const int cut = std::min(4, w[c] - 4);
+    w[c] -= cut, total -= cut;
+  }
+  auto tokens = [&](int z, int c) { return c % 4 ? geo_tokens(lane_smp(z).lane_ema, std::max(cur[z], 2), c) : est[z][c / 4]; };
+  float sum = 0.f;
+  for (int z = 0; z < n; z++) sum += tokens(z, w[z]);
+  float obj = sum / batch_step_ms(n, total);
+  const bool decide = batch_period_ <= 1 || bstep_ % batch_period_ == 0;  // (between: the rows stay)
+  for (int it = 0; decide && it < n; it++) {
+    int bz = -1, bc = 0;
+    float bobj = obj * (1.f + batch_hyst_);
+    for (int z = 0; z < n; z++) {
+      if (fixed[z]) continue;
+      for (int c = 4; c <= full; c += 4) {
+        const int t = total - w[z] + c;
+        if (c == w[z] || t > batch_rows_) continue;
+        const float o = (sum - tokens(z, w[z]) + est[z][c / 4]) / batch_step_ms(n, t);
+        if (o > bobj) bobj = o, bz = z, bc = c;
+      }
+    }
+    if (bz < 0) break;
+    sum += est[bz][bc / 4] - tokens(bz, w[bz]);
+    total += bc - w[bz];
+    w[bz] = bc, obj = bobj;
+  }
+  for (int z = 0; z < n; z++) {  // (the average is of the rows the lane ran: rescaled to the new ones)
+    SpecSampling& m = lane_smp(z);
+    if (fixed[z] || w[z] == cur[z]) continue;
+    m.lane_ema = geo_tokens(m.lane_ema, cur[z], w[z]);
+    m.lane_rows = w[z];
+  }
 }
 
 // batch_enter, the lanes' rows (see above) and the pages for them (the KV of lane z's verify block at pos ..).
@@ -2252,25 +2347,12 @@ void Model::batch_prepare(const int32_t* lanes, int n) {
   Q27_CHECK(draft_ && max_lanes() > 1, "spec_step_lanes: batched steps need a draft model and MAX_SEQS > 1");
   batch_enter(lanes, n);
   // Lanes of different rows need DSpine (DFlash2's blocks are 8) and the FP8-MMA verify; else every lane has 8.
-  // (For now a lane takes its sequence's width only when pinned, spec_set_block: the others have no rule yet:
-  // they keep 8, or the draft's block when shorter.)
   const bool vary = draft_->dspine() && attention_lanes_vary(opt_.kv_type);
-  int w[kMaxLanes], total = 0;
-  for (int z = 0; z < n; z++) {
-    const SpecSampling& m = lane_smp(z);
-    w[z] = !vary ? ddims::kBlock
-                 : m.pinned ? std::clamp(m.block_due, 2, kSpecBlock) : std::min(ddims::kBlock, draft_->block());
-    total += w[z];
-  }
-  while (total > batch_rows_) {  // the budget: 4 rows off the lane with the lowest average (ties: the widest)
-    int c = -1;
-    for (int z = 0; z < n; z++)
-      if (w[z] > 4 && (c < 0 || lane_smp(z).accept_ema < lane_smp(c).accept_ema ||
-                       (lane_smp(z).accept_ema == lane_smp(c).accept_ema && w[z] > w[c])))
-        c = z;
-    Q27_CHECK(c >= 0, "spec_step_lanes: the lanes' rows do not fit the step");
-    const int cut = std::min(4, w[c] - 4);
-    w[c] -= cut, total -= cut;
+  int w[kMaxLanes];
+  if (!vary) {
+    std::fill(w, w + n, ddims::kBlock);
+  } else {
+    batch_rows(n, w);
   }
   blr_.set(n, w);
   bsl_.lr = bacc_.lr = blr_;
@@ -2291,7 +2373,10 @@ bool Model::batch_part(int n, int part) {
   }
   BatchGraph& g = batch_graph(n);
   cudaGraphExec_t& x = part == 1 ? g.exec : g.exec2;
+  LaneRows& lr = part == 1 ? g.lr : g.lr2;
+  if (x && !(lr == blr_)) x = capture([&] { batch_body(n, part); }, x);  // (other rows: updated in place)
   if (!x) x = capture([&] { batch_body(n, part); });
+  lr = blr_;
   Q27_CUDA(cudaGraphLaunch(x, s_));
   return true;
 }
@@ -2322,7 +2407,9 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     bwarm_ = true;
   } else {
     BatchGraph& g = batch_graph(n);
+    if (g.exec && !(g.lr == blr_)) g.exec = capture([&] { batch_body(n); }, g.exec);  // (other rows: updated in place)
     if (!g.exec) g.exec = capture([&] { batch_body(n); });
+    g.lr = blr_;
     exec = g.exec;
     Q27_CUDA(cudaGraphLaunch(exec, s_));
   }
@@ -2352,8 +2439,10 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     *r.spec_last = o[k - 1];
     stat_steps_++, stat_tokens_ += k;
     spec_adapt(lane_smp(z), k);  // (the width of the sequence's later steps, batched or not)
+    lane_smp(z).lane_ema += adapt_alpha_ * (float(k) - lane_smp(z).lane_ema);  // (its rows in later batched steps)
   }
   bpar_ ^= 1;
+  bstep_++;
 }
 
 }  // namespace q27

@@ -219,7 +219,8 @@ class Model {
   bool evict_checkpoint();           // the least recently used one; false when there is none
   void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
   void spec_part(const SpecSampling& smp, int part);      // a masked step's part, captured by its settings
-  cudaGraphExec_t capture(const std::function<void()>& body);
+  // Captures body; with update, updates that graph in place when only arguments / grids differ (else replaces it).
+  cudaGraphExec_t capture(const std::function<void()>& body, cudaGraphExec_t update = nullptr);
   void spec_flush();  // replays the last verify's commits into the GDN / conv states
   void set_sbuf(int b);  // host side of the GDN state buffer switch
   int spec_block_of(const SpecSampling& smp) const { return smp.block > 0 ? smp.block : draft_->block(); }
@@ -387,6 +388,7 @@ class Model {
     cudaGraphExec_t exec;  // (masked lanes: the draft part)
     uint64_t used;
     cudaGraphExec_t exec2 = nullptr;  // masked lanes: the rest
+    LaneRows lr, lr2;  // the rows exec / exec2 were captured with (other rows: re-captured and updated in place)
   };
   std::vector<BatchGraph> bgraphs_;
   struct LaneRef {  // the host state of a lane's sequence
@@ -404,6 +406,11 @@ class Model {
   struct BatchGraph;
   BatchGraph& batch_graph(int n);
   void batch_prepare(const int32_t* lanes, int n);
+  void batch_rows(int n, int* rows);  // the lanes' rows of a batched step (DSpine)
+  bool batch_adapt_ = false;
+  float batch_hyst_ = 0.01f;
+  int batch_period_ = 8;   // batched steps between the decisions (Q27_SPEC_ADAPT_PERIOD)
+  uint64_t bstep_ = 0;     // batched steps run
   bool batch_part(int n, int part);
   GdnSpec gdn_spec_lanes(int gdn_layer) const;
   struct Region {
@@ -463,6 +470,9 @@ class Model {
   // Captured graphs by sampling settings (sequences with different settings take turns, Phase 6); the
   // least recently used one is destroyed beyond kGraphCache. graph_exec_ / spec_graph_ point into them.
   static constexpr int kGraphCache = 4;
+  // Batched steps: an entry per lanes, sampling and total rows (the launches depend on the total; the lanes' split of
+  // it only changes arguments and grids, so a step of other rows updates the entry's graph in place).
+  static constexpr int kBatchGraphCache = 8;
   struct CachedGraph {
     GraphKey key;
     SpecSampling smp;

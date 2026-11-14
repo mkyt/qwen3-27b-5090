@@ -81,6 +81,9 @@ services:
       Q27_DRAFT_BLOCK: ${Q27_DRAFT_BLOCK:-}        # DSpine: rows of a single sequence's draft block, 2..16 (default 16)
       Q27_DRAFT_WINDOW: ${Q27_DRAFT_WINDOW:-}      # DSpine: context window of the draft, 256..8192 (default 2048; trained 8192)
       Q27_SPEC_ADAPT: ${Q27_SPEC_ADAPT:-}          # DSpine: 1 (default) = 16 or 8 rows from the recent acceptance, 0 = always 16
+      Q27_SPEC_ADAPT_BATCH: ${Q27_SPEC_ADAPT_BATCH:-}  # DSpine, requests stepping together: 1 (default) = 4 / 8 / 12 / 16 rows each from its recent acceptance, 0 = 8
+      Q27_SPEC_ADAPT_HYST: ${Q27_SPEC_ADAPT_HYST:-}    # Q27_SPEC_ADAPT_BATCH: relative gain a change of rows needs (default 0.01)
+      Q27_SPEC_ADAPT_PERIOD: ${Q27_SPEC_ADAPT_PERIOD:-}  # Q27_SPEC_ADAPT_BATCH: batched steps between the decisions (default 8)
       Q27_DRAFT_QUANT: ${Q27_DRAFT_QUANT:-fp4}     # draft linear layers: fp4 | fp8 | bf16
       Q27_DRAFT_VOCAB: ${Q27_DRAFT_VOCAB:-/work/bench/draft-vocab/vocab-128k.txt}  # candidate vocabulary; none: full
       STATE_HOST_CACHE: ${STATE_HOST_CACHE:-4}     # prefix cache: GiB of pinned state checkpoints (0: off)
