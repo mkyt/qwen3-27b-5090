@@ -71,6 +71,15 @@ using VideoFrameFn = std::function<void(int, const VideoFrame&, cudaStream_t)>;
 VideoDecodeStats video_decode(const uint8_t* data, size_t n, const VideoTrack& track, const std::vector<int>& want,
                               int sessions, const VideoFrameFn& on_frame);
 
+// Device memory a decode of the video takes while it runs (outside the engine's pools): NVDEC's surfaces for the
+// stream's first sequence header (the parser alone, on the CPU), the driver's state and video_frames' buffers, for
+// the sessions video_decode would run (sessions as there). An estimate on the safe side, to lend (Model::kv_lend).
+struct VideoMemory {
+  size_t bytes = 0, per_session = 0;
+  int sessions = 0, surfaces = 0;
+};
+VideoMemory video_memory(const uint8_t* data, size_t n, int out_w, int out_h, int sessions = 0);
+
 // The frame as RGB [height][width][3] uint8 into out (device): BT.601 / 709 / 2020 per its matrix
 // (unspecified: BT.601), limited or full range, each pixel taking its 2 x 2 block's chroma (FFmpeg's default).
 void video_frame_rgb(const VideoFrame& f, uint8_t* out, cudaStream_t s);

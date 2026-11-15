@@ -218,6 +218,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   const char* high = getenv("Q27_PAGES_HIGH");
   pool_.init(kv_total, high && atoi(high) != 0);
   const size_t o_kv = kv_.add("K | V pages (and parking areas)", size_t(kv_total) * per_page);
+  kv_.use_vmm();  // (parts of it can be lent: kv_lend)
   if (opt.plan_only) {  // (the caller compares the device pools with the budget, as check_and_log does)
     slot_used_.assign(slots, false);
     return;
@@ -1926,8 +1927,9 @@ void Model::seq_give(SeqState& st) {
 
 int Model::area_first(int a) const { return pool_.pages() - (a + 1) * park_pages_; }
 
-void Model::reserve_area(int a) {
-  const int lo = area_first(a), hi = lo + park_pages_;
+void Model::reserve_area(int a) { reserve_range(area_first(a), area_first(a) + park_pages_); }
+
+void Model::reserve_range(int lo, int hi) {
   auto held = [&] {  // pages of the area the KV pool holds
     std::vector<int32_t> v;
     for (int p = lo; p < hi; p++)
@@ -1959,9 +1961,61 @@ void Model::reserve_area(int a) {
       if (st.used) remap(st.pages);
     for (Checkpoint& c : ckpts_) remap(c.pages);
     if (!seq_pages_.empty()) upload_pages(page_table_, seq_pages_.data(), seq_pages_.size());
-    log("parking area %d: moved %d KV pages out", a, int(moved.size()));
+    log("KV pages %d .. %d: moved %d pages out", lo, hi - 1, int(moved.size()));
   }
-  for (int p = lo; p < hi; p++) Q27_CHECK(pool_.take(p), "reserve_area: a page of the area is in use");
+  for (int p = lo; p < hi; p++) Q27_CHECK(pool_.take(p), "reserve_range: a page of the range is in use");
+}
+
+int Model::kv_lend(size_t bytes) {
+  // (without the prefix cache the pool is sized to max_tokens and the parking areas: nothing to spare)
+  if (!kv_.vmm() || !cache_on_ || bytes == 0) return -1;
+  // Whole blocks (contiguous memory, the pool being block-major) covering `bytes` of whole VMM chunks.
+  const size_t block_bytes = size_t(kv_block_) * kKvSlices * kv_page_bytes_;
+  const int blocks = int(ceil_div(bytes + 2 * Pool::kVmmChunk, block_bytes));
+  // The highest gap below the parking areas that no other loan holds.
+  std::vector<std::pair<int, int>> held;  // (hi, lo) of the loans out, highest first
+  for (const Loan& l : loans_)
+    if (l.hi) held.emplace_back(l.hi, l.lo);
+  std::sort(held.rbegin(), held.rend());
+  const int n = blocks * kv_block_;
+  int top = pool_.pages() - int(parked_.size()) * park_pages_;
+  for (const auto& [hi, lo] : held) {
+    if (top - n >= hi) break;
+    top = std::min(top, lo);
+  }
+  const int lo = top - n;
+  if (lo < kv_block_) return -1;
+  try {
+    reserve_range(lo, top);
+  } catch (const KvFull&) {
+    return -1;
+  }
+  // (no work in flight may still read the moved pages: the engine's stream and the checkpoint copies finish first)
+  Q27_CUDA(cudaStreamSynchronize(s_));
+  if (cs_) Q27_CUDA(cudaStreamSynchronize(cs_));
+  const size_t off = size_t(kv_page(lo, 0) - kv_.at<char>(0));
+  Loan l{lo, top, kv_.release(off, size_t(top - lo) / kv_block_ * block_bytes)};
+  int id = 0;
+  while (id < int(loans_.size()) && loans_[id].hi) id++;
+  if (id == int(loans_.size())) loans_.push_back(l);
+  else loans_[id] = l;
+  log("lent %.0f MiB of the KV pool (pages %d .. %d) for video decoding", l.mem.second / 1048576.0, lo, top - 1);
+  return id;
+}
+
+void Model::kv_unlend(int id) {
+  Q27_CHECK(id >= 0 && id < int(loans_.size()) && loans_[id].hi, "kv_unlend: no such loan");
+  Loan& l = loans_[id];
+  kv_.restore(l.mem);
+  for (int p = l.lo; p < l.hi; p++) pool_.unref(p);
+  l.hi = 0;
+}
+
+size_t Model::kv_lent() const {
+  size_t n = 0;
+  for (const Loan& l : loans_)
+    if (l.hi) n += l.mem.second;
+  return n;
 }
 
 void Model::release_area(int a) {

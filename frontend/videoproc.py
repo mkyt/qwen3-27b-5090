@@ -149,3 +149,16 @@ def frames(raw, plan, sessions=0):
     slot = {i: data[k * frame:(k + 1) * frame] for k, i in enumerate(want) if i < shown}
     last = slot[got[-1]]
     return [slot.get(i, last) for i in plan.indices]
+
+
+def memory(raw, plan, sessions=0):
+    """(bytes, sessions): the device memory frames(raw, plan, sessions) takes while it runs, outside the engine's
+    pools (NVDEC's surfaces for the stream's first sequence header, the driver's state, the resize buffers; read by
+    the parser on the CPU, no decoder), and the parallel decoders it would run. The worker lends that much of the KV
+    pool for the decode (Engine.kv_lend)."""
+    from q27lib import lib
+
+    out = (ctypes.c_double * 4)()
+    w, h = plan.size
+    _check(lib().q27_video_memory(raw, len(raw), w, h, sessions, out), "q27_video_memory")
+    return int(out[0]), int(out[1])

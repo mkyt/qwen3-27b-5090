@@ -33,6 +33,10 @@ namespace {
 
 constexpr int kDisplayDelay = 4;  // pictures the parser queues before showing (the SDK's 2..4)
 constexpr int kExtraSurfaces = 4;  // decode surfaces beyond the stream's minimum, for kDisplayDelay
+// video_memory: per decoder, besides its surfaces (the driver's state, VP9's buffers, the resize; measured 12 to 57 MiB
+// over the surfaces from 360p to 4K, VP9 the most) and in all (CUDA's stream-ordered pool, the resize weights).
+constexpr size_t kSessionOverhead = size_t(72) << 20;
+constexpr size_t kDecodeOverhead = size_t(16) << 20;
 
 struct Cuvid {
   tcuvidGetDecoderCaps* GetDecoderCaps = nullptr;
@@ -373,15 +377,86 @@ VideoDecodeStats decode_parts(const uint8_t* data, const VideoTrack& track, cons
   return st;
 }
 
+// The sessions video_decode runs: one per NVDEC engine (or `sessions`), each at least 2 kMinPartSamples long.
+int decode_sessions(const Cuvid& api, const VideoTrack& track, int sessions) {
+  const int parts = sessions > 0 ? sessions : std::min(4, nvdec_engines(api, track.codec));
+  return std::max(1, std::min(parts, track.frames() / (2 * kMinPartSamples)));
+}
+
 }  // namespace
+
+VideoMemory video_memory(const uint8_t* data, size_t n, int out_w, int out_h, int sessions) {
+  const VideoTrack track = video_demux(data, n);
+  const Cuvid& api = cuvid();
+  Q27_CUDA(cudaSetDevice(0));
+  // The parser alone (on the CPU, no decoder) up to the first sequence header.
+  struct Probe {
+    CUVIDEOFORMAT fmt{};
+    bool seen = false;
+  } pr;
+  CUVIDPARSERPARAMS pp{};
+  pp.CodecType = codec_of(track.codec);
+  pp.ulMaxNumDecodeSurfaces = 1;
+  pp.pUserData = &pr;
+  pp.pfnSequenceCallback = [](void* u, CUVIDEOFORMAT* f) {
+    auto* p = static_cast<Probe*>(u);
+    if (!p->seen) p->fmt = *f, p->seen = true;
+    return int(f->min_num_decode_surfaces);
+  };
+  pp.pfnDecodePicture = [](void*, CUVIDPICPARAMS*) { return 1; };
+  pp.pfnDisplayPicture = [](void*, CUVIDPARSERDISPINFO*) { return 1; };
+  CUvideoparser parser = nullptr;
+  if (api.CreateVideoParser(&parser, &pp) != CUDA_SUCCESS) throw std::runtime_error("cuvidCreateVideoParser failed");
+  std::vector<uint8_t> buf;
+  for (int k = 0; k < std::min(track.frames(), 8) && !pr.seen; k++) {
+    const VideoSample& smp = track.samples[k];
+    const uint8_t* p = data + smp.offset;
+    buf.clear();
+    if (k == 0) buf.insert(buf.end(), track.prefix.begin(), track.prefix.end());
+    if (track.nal_length) {
+      for (size_t at = 0; at + track.nal_length <= smp.size;) {
+        size_t len = 0;
+        for (int q = 0; q < track.nal_length; q++) len = len << 8 | p[at + q];
+        at += track.nal_length;
+        if (len > smp.size - at) break;
+        static const uint8_t sc[4] = {0, 0, 0, 1};
+        buf.insert(buf.end(), sc, sc + 4);
+        buf.insert(buf.end(), p + at, p + at + len);
+        at += len;
+      }
+    } else {
+      buf.insert(buf.end(), p, p + smp.size);
+    }
+    CUVIDSOURCEDATAPACKET pk{};
+    pk.payload_size = tcu_ulong(buf.size());
+    pk.payload = buf.data();
+    if (api.ParseVideoData(parser, &pk) != CUDA_SUCCESS) break;
+  }
+  api.DestroyVideoParser(parser);
+  if (!pr.seen) throw VideoError("the video's first pictures have no sequence header NVDEC can read");
+  const CUVIDEOFORMAT& f = pr.fmt;
+  VideoMemory m;
+  m.sessions = decode_sessions(api, track, sessions);
+  m.surfaces = int(f.min_num_decode_surfaces) + kExtraSurfaces;
+  // A surface: luma and half-height chroma, pitch-aligned, 1 or 2 bytes a sample (NV12 / P016).
+  const size_t bytes = f.bit_depth_luma_minus8 ? 2 : 1;
+  const size_t surface = size_t(round_up(int64_t(f.coded_width), 256)) * round_up(int64_t(f.coded_height), 64) * 3 / 2 * bytes;
+  const int w = f.display_area.right - f.display_area.left, h = f.display_area.bottom - f.display_area.top;
+  const size_t ow = out_w ? out_w : w, oh = out_h ? out_h : h;
+  // Each session: its decode and output surfaces, the driver's own state, and the resize buffers (one frame of RGB
+  // at most each, video_frames).
+  const size_t own = kSessionOverhead + size_t(w) * h * 3 + ow * oh * 3;
+  m.per_session = size_t(m.surfaces + 2) * surface + own;
+  m.bytes = size_t(m.sessions) * m.per_session + kDecodeOverhead;
+  return m;
+}
 
 VideoDecodeStats video_decode(const uint8_t* data, size_t n, const VideoTrack& track, const std::vector<int>& want,
                               int sessions, const VideoFrameFn& on_frame) {
   const double t0 = now_ms();
   if (want.empty() || n == 0) return {};
   const Cuvid& api = cuvid();
-  int parts = sessions > 0 ? sessions : std::min(4, nvdec_engines(api, track.codec));
-  parts = std::max(1, std::min(parts, track.frames() / (2 * kMinPartSamples)));
+  const int parts = decode_sessions(api, track, sessions);
   VideoDecodeStats st;
   try {
     st = decode_parts(data, track, want, parts, on_frame);

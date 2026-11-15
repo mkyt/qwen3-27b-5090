@@ -29,6 +29,9 @@ SIGNATURES = {
     "q27_seq_swap": ([P, I], I),
     "q27_seq_drop": ([P, I], I),
     "q27_seq_suspend": ([P, I], I),
+    "q27_kv_lend": ([P, I64, P], I),
+    "q27_kv_unlend": ([P, I], I),
+    "q27_kv_lent": ([P], I64),
     "q27_has_draft": ([P], I),
     "q27_spec_block": ([P], I),
     "q27_last_step_block": ([P], I),
@@ -51,6 +54,7 @@ SIGNATURES = {
     "q27_mm_encode_frames": ([P, I, I, P, P], I),
     "q27_video_probe": ([P, I64, P], I),
     "q27_video_frames": ([P, I64, P, I, I, I, I, P, P], I),
+    "q27_video_memory": ([P, I64, I, I, I, P], I),
     "q27_mm_embeds": ([P, I, P], I),
     "q27_mm_put": ([P, I, P], I),
     "q27_debug_kv": ([P, I, I, I, P], I),
@@ -391,6 +395,20 @@ class Engine:
     def seq_drop(self, area):
         """Gives the pages of the sequence parked in `area` back."""
         self._check(lib().q27_seq_drop(self.h, area), "q27_seq_drop")
+
+    def kv_lend(self, nbytes):
+        """Lends `nbytes` of device memory out of the KV pool (video decoding); returns the loan id, or -1 when the
+        pool cannot spare it (or is not VMM). Return it with kv_unlend."""
+        out = ctypes.c_int()
+        self._check(lib().q27_kv_lend(self.h, int(nbytes), ctypes.byref(out)), "q27_kv_lend")
+        return out.value
+
+    def kv_unlend(self, loan):
+        self._check(lib().q27_kv_unlend(self.h, loan), "q27_kv_unlend")
+
+    def kv_lent(self):
+        """Bytes of the KV pool on loan now."""
+        return lib().q27_kv_lent(self.h)
 
     def seq_suspend(self, area):
         """Saves the sequence parked in `area` as a prefix cache checkpoint, then drops it."""

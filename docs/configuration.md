@@ -434,6 +434,7 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_ATTN_TC8_GRP=0` | With the FP8 MMAs (`Q27_ATTN_TC_F8`), compute T <= 2 in one warp instead of four (same result; static) |
 | `Q27_KV_BLOCK=N` | Pages per block of the KV pool (P7-13; default the smallest count whose slice is >= 2 MiB: 57 for NVFP4, 32 for FP8, 16 for BF16). 1 lays pages out one by one (long-context decode 1.5% slower). Read at startup |
 | `Q27_PAGES_HIGH=1` | Hand out KV pages from the top (tests, P7-13): the KV cache then occupies the parking areas, so every park moves pages. Read at startup |
+| `Q27_KV_VMM=0` | Allocate the KV pool in one `cudaMalloc` instead of through CUDA's virtual memory management: then no KV pool memory is lent to video decoding, and NVDEC's surfaces are taken beyond the VRAM budget. Read at startup |
 | `Q27_ATTN_PREFILL_TC=0` | Prefill attention on CUDA cores (static) |
 | `Q27_GDN_CHUNK=0` / `1` | GDN in prefill: 0 = sequential (static); 1 = the chunk prep writes W and U (P5-2, read per call). Default 2: the prep writes only (I + L)^-1 and the chunk kernel forms delta itself (P5-14, prefill +1.9% at 19K) |
 | `Q27_AB_TC=1` | Prefill in_proj_a / b (T > 8): one block per 32 tokens over all of K (before P5-16, read per call). Default: K split in 4 over a cluster, partial sums added in order (prompts of 128 / 512 tokens +7.4 / +6.4%) |

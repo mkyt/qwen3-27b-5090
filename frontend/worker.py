@@ -169,6 +169,10 @@ class Scheduler:
         self.credit = 0.0        # decode time owed to decoding requests by the prefills (DECODE_SHARE)
         self.history = collections.deque(maxlen=64)  # recent sequences (prompt + output) as int32 bytes
         self.decoder = None      # threads that decode images (prefetch)
+        # Loans of KV pool memory for decoding videos on NVDEC (Engine.kv_lend: the driver allocates the decoder's
+        # surfaces outside the engine's pools), made and returned on this thread; a decoder thread queues its loan
+        # here when it is done.
+        self.returns = collections.deque()
         self.m = collections.Counter()
         self.last_metrics = self.last_stats = 0.0
         self.cache_full = False  # every state slot of the prefix cache allocated (poll)
@@ -180,6 +184,7 @@ class Scheduler:
         self.conn.send(msg)
 
     def poll(self, block):
+        self.unlend()
         # Idle: allocate the prefix cache's state slots one by one (not at startup, so the engine is ready sooner),
         # then wake up now and then for a stats snapshot.
         if block and not self.cache_full:
@@ -262,16 +267,44 @@ class Scheduler:
             if start + gh * gw > s.reusable:
                 key = i if src[0] == "image" else ("video", src[1])
                 if key not in s.decoding:
-                    s.decoding[key] = self.decoder.submit(self.decode, s, key)
+                    sessions, loan = self.lend(s, key)
+                    f = self.decoder.submit(self.decode, s, key, sessions)
+                    if loan >= 0:
+                        f.add_done_callback(lambda _, loan=loan: self.returns.append(loan))  # (cancelled too)
+                    s.decoding[key] = f
+
+    def lend(self, s, key):
+        """(sessions, loan): the parallel decoders for video `key` and a loan of KV pool memory covering what they take
+        (-1: none; an image, or a pool that cannot spare it: then one decoder, the memory taken beyond the budget)."""
+        if not isinstance(key, tuple):
+            return 0, -1
+        import videoproc
+
+        raw, plan = s.images[2][key[1]]
+        try:
+            need, sessions = videoproc.memory(raw, plan)
+        except ValueError:  # (the decode reports it)
+            return 0, -1
+        loan = self.engine.kv_lend(need)
+        if loan < 0 and sessions > 1:
+            need, sessions = videoproc.memory(raw, plan, 1)
+            loan = self.engine.kv_lend(need)
+        if loan < 0:
+            log(f"{s.rid}: decoding a video with {need / 2**20:.0f} MiB of device memory not lent by the KV pool")
+        return sessions, loan
+
+    def unlend(self):
+        while self.returns:
+            self.engine.kv_unlend(self.returns.popleft())
 
     @staticmethod
-    def decode(s, key):
+    def decode(s, key, sessions=0):
         """The pixels of image `key` (imageproc.rgb) or the frames of video ("video", k) (videoproc.frames)."""
         spans, srcs, videos = s.images
         if isinstance(key, tuple):
             import videoproc
 
-            return videoproc.frames(*videos[key[1]])
+            return videoproc.frames(*videos[key[1]], sessions=sessions)
         import imageproc
 
         _, raw, size, _ = srcs[key]
@@ -570,11 +603,18 @@ class Scheduler:
             def pixels(key):
                 nonlocal waited
                 t1, f = time.time(), s.decoding.pop(key, None)
+                loan = -1
                 try:
-                    return f.result() if f is not None else self.decode(s, key)
+                    if f is not None:
+                        return f.result()
+                    sessions, loan = self.lend(s, key)
+                    return self.decode(s, key, sessions)
                 except Exception as e:  # noqa: BLE001 - any decoder error is the client's
                     raise ImageError(f"cannot decode {'video' if isinstance(key, tuple) else 'image'}: {e}") from e
                 finally:
+                    if loan >= 0:
+                        self.engine.kv_unlend(loan)
+                    self.unlend()
                     waited += time.time() - t1
 
             i, frames = 0, {}
@@ -659,7 +699,7 @@ class Scheduler:
         step, n0 = 0.0, len(s.out)
         while not s.dead and s.phase == DECODE:  # (a forced output makes it a prefill again)
             now = time.time()
-            last = (others and now + step >= t0 + turn) or self.conn.poll(0)
+            last = (others and now + step >= t0 + turn) or self.conn.poll(0) or bool(self.returns)
             ts = time.time()
             if self.spec:
                 if s.gm is not None:
@@ -708,7 +748,8 @@ class Scheduler:
                 s.steps += 1
                 self.count_draft(s, toks, max(1, self.engine.last_lane_block(z) or 8) - 1)
                 self.emit(s, toks, self.engine.logprobs(z) if s.logprobs >= 0 else None)
-            if any(s.dead or s.phase != DECODE for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0):
+            if (any(s.dead or s.phase != DECODE for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0)
+                    or self.returns):
                 break
         dt = time.time() - t0
         self.measure(len(seqs), sum(len(s.out) for s in seqs) - n0, dt)

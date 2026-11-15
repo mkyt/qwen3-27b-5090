@@ -148,6 +148,18 @@ At startup the engine computes a plan, allocates each pool once and never calls 
   failing that it raises `KvFull` without changing anything. The kernels see only page numbers: the page table
   holds `(p / G) * 32G + p % G`. As a result, starting with `MAX_SEQS=8` costs only the lanes' buffers, and one
   request still gets the full 262K context.
+- **Video decoding borrows from the KV pool.** NVDEC's decode surfaces are allocated by the driver when a decoder is
+  created, outside the pools: about 0.4 GiB per decoder for 4K 10-bit (0.8 GiB with the two decoders of one
+  video), 0.05 to 0.1 GiB below 1080p. Reserving that at startup would cost every user about 47K tokens of KV
+  cache for a feature few use, and leaving it out of the plan pushes a full process past the point where WDDM
+  starts moving memory to the host. So the KV pool is mapped through CUDA's virtual memory management (32 MiB
+  chunks, the same addresses for its whole life) and, before a video is decoded, the server lends the memory the
+  decode will take: `q27_video_memory` reads the stream's first sequence header with NVDEC's parser alone (on the
+  CPU) and sizes the surfaces, `kv_lend` empties whole blocks just below the parking areas as parking does (pages
+  moved, checkpoints evicted if it must) and unmaps their chunks, and `kv_unlend` maps them again when the decode
+  is done (tens of milliseconds each way; running kernels are not waited for). If the pool cannot spare it, the
+  video is decoded with one decoder and the memory is taken beyond the budget. Without VMM (`Q27_KV_VMM=0`) the
+  pool is one allocation and nothing is lent.
 - **Host memory** (pinned): the embedding table (2.4 GiB), the prefix-cache checkpoints (`STATE_HOST_CACHE`,
   4 GiB), the vision tower (0.9 GiB) and the image embeddings.
 
@@ -478,7 +490,8 @@ and computes plainly.
   - a verify row equals the decode of the same token (speculative and plain greedy decoding agree),
   - a request in a batch equals the request alone,
   - a prefill resumed from a checkpoint equals the prefill that ran through, at any 64-aligned boundary,
-  - parking, swapping and moving KV pages change nothing,
+  - parking, swapping and moving KV pages change nothing, nor does lending KV pool memory for a video decode
+    (`scripts/lend_test.py`) or mapping the pool through VMM (golden identical with `Q27_KV_VMM=0`),
   - `VISION=host` equals `VISION=bf16`.
 
   One caveat: the skinny GEMM splits K differently for one row than for several (it is faster), so a decode row

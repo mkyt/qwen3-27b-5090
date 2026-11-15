@@ -173,6 +173,15 @@ class Model {
   void seq_suspend(int a);
   int park_slots() const { return int(parked_.size()); }
 
+  // Device memory lent for a while (video decoding on NVDEC, whose surfaces the driver allocates outside the pools):
+  // kv_lend moves the KV pages out of whole blocks just below the parking areas (below earlier loans), evicting
+  // checkpoints if it must, as seq_park does, and gives their memory back to the device (the KV pool is VMM).
+  // Returns a loan id, or -1 with nothing changed but evicted checkpoints when the pool cannot spare `bytes` or
+  // the pool is not VMM. kv_unlend(id) maps memory there again and gives the pages back to the pool.
+  int kv_lend(size_t bytes);
+  void kv_unlend(int id);
+  size_t kv_lent() const;  // bytes on loan now
+
   // Batched speculative steps (P6-10). One step of each of n (2..8) sequences in decode (after spec_begin):
   // lanes[z] is -1 for the running sequence or a parking area. Their draft blocks and verify rows run as one
   // batch (the GEMMs read the weights once for all), each lane exactly as its own spec_step of the same width: the
@@ -425,6 +434,12 @@ class Model {
   void seq_scalars(int32_t* host, bool save);          // device scalars of the running sequence <-> host
   int area_first(int a) const;                         // the first KV page of parking area a
   void reserve_area(int a);                            // moves the KV pages out of area a and takes it
+  void reserve_range(int lo, int hi);                  // moves the KV pages out of [lo, hi) and takes them (KvFull)
+  struct Loan {
+    int lo = 0, hi = 0;                                // KV pages taken
+    std::pair<size_t, size_t> mem;                     // the kv_ pool's bytes released
+  };
+  std::vector<Loan> loans_;                            // (index: loan id; hi == 0: returned)
   void release_area(int a);                            // gives area a's pages to the KV pool
   void seq_take(SeqState& st);                         // the running sequence's host state -> st (none left)
   void seq_give(SeqState& st);                         // st -> the running sequence (after reset / seq_take)

@@ -308,6 +308,14 @@ int q27_seq_swap(void* m, int area) {
 int q27_seq_drop(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->seq_drop(area); });
 }
+// Device memory lent for video decoding (Model::kv_lend): *id is the loan, or -1 when the pool cannot spare it.
+int q27_kv_lend(void* m, int64_t bytes, int* id) {
+  return guard([&] { *id = static_cast<Model*>(m)->kv_lend(size_t(std::max<int64_t>(0, bytes))); });
+}
+int q27_kv_unlend(void* m, int id) {
+  return guard([&] { static_cast<Model*>(m)->kv_unlend(id); });
+}
+int64_t q27_kv_lent(void* m) { return int64_t(static_cast<Model*>(m)->kv_lent()); }
 int q27_seq_suspend(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->seq_suspend(area); });
 }
@@ -423,6 +431,16 @@ int q27_video_probe(const uint8_t* data, int64_t n, double* out) {
     const double v[6] = {double(t.codec), double(t.width), double(t.height), double(t.frames()), t.fps,
                          double(t.skip_front)};
     std::memcpy(out, v, sizeof v);
+  });
+}
+
+// Device memory decoding a video to out_w x out_h takes (video_memory; the parser on the CPU, no decoder):
+// out [4] = bytes, sessions, bytes per session, decode surfaces. -3: the file cannot be used.
+int q27_video_memory(const uint8_t* data, int64_t n, int out_w, int out_h, int sessions, double* out) {
+  return guard([&] {
+    const VideoMemory v = video_memory(data, size_t(n), out_w, out_h, sessions);
+    const double r[4] = {double(v.bytes), double(v.sessions), double(v.per_session), double(v.surfaces)};
+    std::memcpy(out, r, sizeof r);
   });
 }
 

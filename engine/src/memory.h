@@ -12,6 +12,17 @@ namespace q27 {
 class Pool {
  public:
   explicit Pool(std::string name, bool host_pinned = false) : name_(std::move(name)), host_(host_pinned) {}
+  // A device pool committed through CUDA's virtual memory management, in chunks of kVmmChunk: parts of it can give
+  // their memory back and take it again at the same addresses (release / restore). Where VMM is missing (or
+  // Q27_KV_VMM=0) the pool is one cudaMalloc and releases nothing.
+  static constexpr size_t kVmmChunk = size_t(32) << 20;
+  void use_vmm() { vmm_wanted_ = !host_; }
+  bool vmm() const { return !chunks_.empty(); }
+  // Gives back the memory of the whole chunks inside [offset, offset + bytes); returns the range released (empty
+  // without VMM). Nothing may touch it until restore. The caller makes sure no work in flight uses it.
+  std::pair<size_t, size_t> release(size_t offset, size_t bytes);
+  // Maps fresh memory under a range release returned (its contents are undefined).
+  void restore(std::pair<size_t, size_t> range);
   ~Pool();
   Pool(const Pool&) = delete;
   Pool& operator=(const Pool&) = delete;
@@ -42,6 +53,10 @@ class Pool {
   void* base_ = nullptr;
   bool owned_ = true;
   std::vector<std::pair<std::string, size_t>> items_;
+  bool vmm_wanted_ = false;
+  std::vector<unsigned long long> chunks_;  // (VMM) the physical allocation of each chunk, 0 while released
+  bool commit_vmm();
+  void map_chunk(size_t i);
 };
 
 struct Budget {
