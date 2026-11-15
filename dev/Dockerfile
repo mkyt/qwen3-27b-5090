@@ -20,6 +20,8 @@ COPY pyproject.toml uv.lock /opt/dev/
 # The download cache stays outside the image (BuildKit), so a change to the dependencies fetches only the difference.
 RUN --mount=type=cache,target=/root/.cache/uv cd /opt/dev && uv sync --frozen --python 3.12
 ENV PATH=/opt/venv/bin:${PATH} \
-    HF_HUB_OFFLINE=1
+    HF_HUB_OFFLINE=1 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+# (video: the video decoder's libnvcuvid, which native Linux mounts only when asked)
 
 WORKDIR /work

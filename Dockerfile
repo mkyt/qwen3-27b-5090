@@ -54,9 +54,10 @@ FROM gcr.io/distroless/cc-debian13@sha256:58e12be899275afaa05f1b03051ab19037ed7f
 COPY --from=python /opt/python /opt/python
 COPY --from=python /opt/venv /opt/venv
 COPY --from=build /usr/local/cuda/lib64/libcudart.so.13* /opt/q27/
-# (what the nvidia/cuda images set for the container runtime: all GPUs, the compute and nvidia-smi libraries)
+# (for the container runtime: all GPUs, the compute and nvidia-smi libraries as the nvidia/cuda images ask, and the
+# video decoder's libnvcuvid for video input: native Linux mounts it only when asked; WSL2 mounts every driver library)
 ENV NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     LD_LIBRARY_PATH=/opt/q27 \
     PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     Q27_LIB=/opt/q27/libq27.so \
