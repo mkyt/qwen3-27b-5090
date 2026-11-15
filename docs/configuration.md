@@ -123,7 +123,9 @@ everywhere above.
 | `CHECKPOINT_INTERVAL` | 8192 | Distance between checkpoints inside a long prompt (a multiple of 64) |
 | `VISION` | `host` | Image input. `host`: the vision tower's BF16 weights (0.86 GiB) stay in pinned host memory and are streamed to the GPU one layer ahead of the computation; the KV pool loses 192 tokens, small images take +13 ms (the copy is about 20 ms), 1024x1024 and larger +1–4 ms; output identical to `bf16`. `fp8`: E4M3 weights with per-row scales on the GPU, widened per layer (0.43 GiB; embedding error about 3x that of `bf16`, answers can change). `bf16`: BF16 weights on the GPU (fastest, 0.86 GiB). `off`: requests with images get HTTP 400 (the engine library's default). Activations and the weight staging (90 MiB) share the prefill's buffers |
 | `IMAGE_MAX_PIXELS` | 4194304 | Images are resized to at most this many pixels (2048x2048 = 4,096 tokens, 370 ms in the vision tower) |
-| `IMAGE_TOKENS` | 16384 | Image and video tokens per request (embeddings in pinned host memory, 10 KiB per token: 160 MiB; a video takes at most 12,288). More: HTTP 400 |
+| `IMAGE_TOKENS` | 16384 | Image and video tokens per request (embeddings in pinned host memory, 10 KiB per token: 160 MiB). More: HTTP 400. Unset or empty: 16,384, or `VIDEO_MAX_TOKENS` when that is more |
+| `VIDEO_MAX_TOKENS` | the checkpoint's 12,288 | Tokens of a video at most (the pixels of all its sampled frames together, 2,048 per token; the checkpoint's `size.longest_edge`), besides the time stamps of its pairs. A pair of frames takes at most 768 tokens all the same, so a video of up to 16 pairs (16 s at 2 frames per second) keeps its size; longer ones get larger frames. A request's `mm_processor_kwargs.size.longest_edge` replaces it for that request ([Long videos](#long-videos)) |
+| `VIDEO_MAX_FRAMES` | the checkpoint's 768 | Frames sampled from a video at most (2 per second until then), and the most a request's `num_frames` / `min_frames` / `max_frames` may ask for |
 | `VRAM_BUDGET_GIB` / `WDDM_MARGIN_GIB` | free − 0.6 / 0.6 | VRAM budget and the margin kept free for the display driver. The budget is never above the automatic one (free − margin, at most 30.3 GiB for the process): beyond it the driver moves memory to system RAM without an error, about 7 times slower. A higher `VRAM_BUDGET_GIB` is lowered, with a line in the log |
 | `Q27_DEVICE_FREE_BYTES` | set by the server | Free VRAM with other programs counted (NVML), which the engine's budget uses if it is below what `cudaMemGetInfo` says |
 | `MIN_KV_TOKENS` | 0 | Do not start the engine if the KV pool would hold fewer tokens (other programs are using the GPU, or a low budget). 0: start with the KV pool that fits ([Too little VRAM](#too-little-vram)) |
@@ -141,6 +143,83 @@ everywhere above.
 | `Q27_ATTN_FP8` | empty | Prefill attention MMAs, read per call. Empty: `2` with FP8 KV, `3` with NVFP4 KV (`2` without the staging buffer). FP8 KV: `2` QK^T and P·V in FP8, `1` P·V only, `0` BF16. NVFP4 KV: `3` QK^T on native FP4 MMAs (Q quantized to NVFP4, K as cached, V from the E4M3 staging buffer; P7-8), `2` K and V rounded to E4M3 for FP8 MMAs, otherwise exact in f16 |
 | `Q27_ATTN_FP4_STAGE` | 1 | NVFP4 KV prefill: `1` converts the context to an E4M3 staging buffer once per layer and chunk (mode 3: V only, 1 KiB per token of `max_tokens`, 256 MiB at 262K; with `Q27_ATTN_FP8=2` at startup K and V, 2 KiB per token, bit-identical to per-CTA conversion). `0`: convert in every CTA (mode 2). Sized at startup, read per call |
 | `Q27_ATTN_TC_F8` | empty | Decode / verify attention MMAs, read per call. Empty or `1`: FP8 with FP8 and NVFP4 KV (P7-7; FP8 KV since P3-36), `0`: BF16 / f16 (a 16-row verify then takes two launches with FP8 KV). FP8 means Q in E4M3 with per-row scales, NVFP4 KV re-rounded to E4M3, P in E4M3: 8% faster speculative steps at 131K and at 8 x 32K, no change on golden or needle retrieval |
+
+## Long videos
+
+By default a video is sampled as the checkpoint's processor does it: 2 frames per second, at most 768 frames and
+12,288 tokens. That fits short clips, but a 10-minute 1080p video gets 224 x 128 pixels a frame. Two settings give a
+video more of the context, `VIDEO_MAX_TOKENS` (T below) and `VIDEO_MAX_FRAMES` (F), with the sampling rate (fps) of
+a request:
+
+```bash
+VIDEO_MAX_TOKENS=131072 VIDEO_MAX_FRAMES=2048 docker compose up -d serve
+```
+
+Or per request, within `IMAGE_TOKENS` and `VIDEO_MAX_FRAMES`:
+`"mm_processor_kwargs": {"fps": 2, "max_frames": 2048, "size": {"longest_edge": 268435456}}`
+(`size.longest_edge` is T in pixels: 2,048 per token; `num_frames` takes a frame count instead of `fps`).
+
+### How a video becomes tokens
+
+| Step | Rule | Depends on |
+| --- | --- | --- |
+| 1. Frames n | duration x fps, within 4..F (and the video's own frame count), rounded up to an even count | duration, fps, F |
+| 2. Pairs | n / 2. The language model sees each pair of frames as one image, after its time as text | n |
+| 3. Pixels per frame | min(768 tokens' worth, T x 2,048 / n) | T, n |
+| 4. Frame size | the aspect ratio kept, both sides multiples of 32, within step 3; a smaller video is not enlarged | resolution, aspect ratio |
+| 5. Tokens | (height / 32) x (width / 32) per pair, times the pairs | steps 1-4 |
+
+Each pair also takes 8 to 11 tokens of text (its time, `<12.5 seconds>`, and the vision start / end). The model
+sees time in steps of a pair: 2 / fps seconds, or 2 x duration / F once the frames reach F.
+
+### Three regimes
+
+| Regime | When | Tokens per pair | Tokens of the video | Time step of the pairs |
+| --- | --- | --- | --- | --- |
+| A: the per-pair cap | n <= 2T / 768 (32 frames by default) | 768 (1152 x 640 for 16:9), or the video's own size | pairs x 768: grows with duration x fps, below T | 2 / fps s |
+| B: the token bound | 2T / 768 < n < F | about 2T / n: smaller for longer videos and higher fps | about T | 2 / fps s |
+| C: the frame bound | duration x fps >= F | about 2T / F | about T | 2 x duration / F s: coarser for longer videos |
+
+- **Duration**: in A the tokens grow with it; in B the frames get smaller; in C the frames get farther apart.
+- **fps**: sets the number of frames only. In B and C the total stays about T, so a higher fps trades frame size
+  for finer time; in C it changes nothing.
+- **T**: sets where A ends (T / 384 frames) and the frame size in B and C; videos in A do not change.
+- **F**: sets where C starts (F / fps seconds) and its time step. Raising F without T gives more, smaller frames.
+- **Resolution**: matters only when the video is smaller than step 3 allows (640 x 360 takes at most 220 tokens a
+  pair); larger videos, 1080p or 4K, end up the same size, only the aspect ratio counts.
+- The totals fall a little short of T because both sides are rounded down to multiples of 32 (10,752 of 12,288).
+
+### Examples (1080p unless noted; frame size in parentheses)
+
+| Video | Default (T 12,288, F 768) | T 131,072, F 2,048 |
+| --- | --- | --- |
+| 10 s, 2 fps | 10 pairs x 720 (1152 x 640) = 7,200 (A) | the same, 7,200 (A) |
+| 60 s, 1 fps | 30 x 390 (832 x 480) = 11,700 (B) | 30 x 720 = 21,600 (A) |
+| 60 s, 2 fps | 60 x 190 (608 x 320) = 11,400 (B) | 60 x 720 = 43,200 (A) |
+| 60 s, 4 fps | 120 x 91 (416 x 224) = 10,920 (B) | 120 x 720 = 86,400 (A) |
+| 10 min, 1 fps | 300 x 32 (256 x 128) = 9,600 (B) | 300 x 405 (864 x 480) = 121,500 (B) |
+| 10 min, 2 fps | 384 x 28 (224 x 128) = 10,752; a pair every 1.6 s (C) | 600 x 209 (608 x 352) = 125,400; every 1.0 s (B) |
+| 1 hour, 2 fps | 384 x 28 = 10,752; a pair every 9.4 s (C) | 1,024 x 120 (480 x 256) = 122,880; every 3.5 s (C) |
+| 640 x 360, 60 s, 2 fps | 60 x 190 = 11,400 (B) | 60 x 220 (640 x 352, its own size) = 13,200 (A) |
+
+For a long video, put it in B or C, where the total reaches T: raise T for detail in each frame, F (and fps) for
+finer time.
+
+### Limits and costs
+
+- `IMAGE_TOKENS` follows `VIDEO_MAX_TOKENS` unless it is set: the embeddings take 10 KiB of pinned host memory per
+  token (1.25 GiB for 131,072), allocated when the engine starts. A request with more tokens of images and videos
+  gets HTTP 400.
+- The tokens of the videos, their pairs' text included, must fit the context: 1,024 pairs add about 10K tokens of
+  text.
+- A frame takes at least about 4,300 pixels (about 4 tokens), so with a very high F and a low T (more than about
+  0.48 T frames) the total goes above T. The defaults never get there.
+- The resized frames are held in host memory while the video is encoded: 3 bytes per pixel, 6 KiB per token (about
+  0.8 GiB for 131,072 tokens).
+- The vision tower's time grows with the pairs and the prefill's with the tokens, as for a long text prompt; the
+  pairs already in the prefix cache are not decoded or encoded again on the next turn.
+- How well the model answers on many more frames or tokens than the checkpoint's defaults is the model's, not the
+  engine's: compare on your own videos.
 
 ## Concurrency
 

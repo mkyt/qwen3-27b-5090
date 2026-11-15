@@ -216,7 +216,8 @@ class Images:
         if k != len(loaded):
             raise ApiError(400, f"{len(loaded)} images and videos for {k} pads in the prompt")
         if (rows := sum(gh * gw for _, gh, gw in spans)) > self.max_tokens:
-            raise ApiError(400, f"the images and videos take {rows} tokens, more than IMAGE_TOKENS ({self.max_tokens})")
+            raise ApiError(400, f"the images and videos take {rows} tokens, more than IMAGE_TOKENS ({self.max_tokens}; "
+                                "the server's setting)")
         return out, spans, srcs, videos
 
 
@@ -802,7 +803,7 @@ class Server:
             try:
                 from videoproc import options_of
 
-                opts = options_of(video)
+                opts = options_of(video, proc.video.max_frames)
             except ValueError as e:
                 raise ApiError(400, str(e)) from e
             ids, spans, srcs, videos = proc.prepare(ids, media, self.pads, self.encode, opts)

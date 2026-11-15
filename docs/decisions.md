@@ -375,6 +375,12 @@ gate without an explicit decision, recorded below with its numbers.
   pair), bit-identical to one pair per call; one pass per pair would stream the weights 300 times for a 5-minute
   video with `VISION=host`. The per-frame pixel cap of qwen-vl-utils (transformers' default from v5.22; without it a
   10-second clip costs nearly the 12,288 tokens of a long video).
+- **P4-18: the checkpoint's video bounds by default, more on request.** A video takes at most 12,288 tokens and 768
+  frames by default, as the checkpoint's processor (and vLLM / transformers) does it; `VIDEO_MAX_TOKENS` /
+  `VIDEO_MAX_FRAMES` raise them for the server and `mm_processor_kwargs.size.longest_edge` for a request
+  (transformers' own key, so its plan and ids still match). The defaults stay because answers then match the
+  reference engines; on a 3-minute video at 129,857 tokens the model gave the same times as at 13,445 for two
+  scenes, but described the video without the times it was asked for.
 - **Videos decoded by the engine on NVDEC, without FFmpeg.** PyAV (FFmpeg) took the serving image from 198 to
   369 MB and, through FFmpeg's NVDEC path (one picture at a time), was slower than its CPU decoder: NVDEC was 19 to
   46% busy. The engine feeds the driver's parser itself with up to four pictures in flight, maps only the sampled

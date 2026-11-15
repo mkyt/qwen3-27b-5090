@@ -297,16 +297,44 @@ def test_gpu_resize_is_pil(gpu, size):
 
 
 def test_options_of():
-    assert videoproc.options_of(None) is None and videoproc.options_of({"size": 1}) is None
+    assert videoproc.options_of(None) is None and videoproc.options_of({"other": 1, "size": {}}) is None
     assert videoproc.options_of({"fps": 1, "max_frames": 64}) == {"fps": 1.0, "max_frames": 64}
+    assert videoproc.options_of({"size": {"longest_edge": 1 << 26, "shortest_edge": 1}}) == {"max_pixels": 1 << 26}
+    assert videoproc.options_of({"max_frames": 2000}, max_frames=4096) == {"max_frames": 2000}
     for bad in ({"fps": 0}, {"fps": "2"}, {"fps": True}, {"num_frames": 0}, {"num_frames": 2.5}, {"max_frames": 10**6},
-                {"fps": 1, "num_frames": 8}, {"min_frames": 9, "max_frames": 8}, [1]):
+                {"fps": 1, "num_frames": 8}, {"min_frames": 9, "max_frames": 8}, [1], {"max_frames": 769},
+                {"size": 1}, {"size": {"longest_edge": 0}}, {"size": {"longest_edge": 2.5e7}}):
         with pytest.raises(ValueError):
             videoproc.options_of(bad)
 
 
+def test_server_bounds(model, monkeypatch):
+    """VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES replace the checkpoint's 12,288 tokens and 768 frames; a request's
+    size.longest_edge replaces either. A pair takes at most 768 tokens all the same."""
+    base = videoproc.VideoProcessor(model)
+    assert (base.max_tokens, base.max_frames) == (12288, 768)
+    hour = base.plan(108000, 30.0, 1920, 1080)  # (an hour at 30 fps)
+    monkeypatch.setenv("VIDEO_MAX_TOKENS", "131072")
+    monkeypatch.setenv("VIDEO_MAX_FRAMES", "2048")
+    big = videoproc.VideoProcessor(model)
+    assert (big.max_tokens, big.max_frames) == (131072, 2048)
+    long = big.plan(108000, 30.0, 1920, 1080)
+    tokens = lambda p: p.grid[0] * p.grid[1] * p.grid[2] // 4  # noqa: E731
+    assert (hour.grid[0], long.grid[0]) == (384, 1024)
+    assert tokens(hour) <= 12288 < tokens(long) <= 131072
+    short = big.plan(1200, 30.0, 1920, 1080)  # (40 s: 80 frames, 40 pairs at the per-pair cap)
+    assert tokens(base.plan(1200, 30.0, 1920, 1080)) <= 12288 < tokens(short) <= 40 * 768
+    asked = base.plan(108000, 30.0, 1920, 1080, options={"max_pixels": 131072 * 2048})
+    assert asked.grid[0] == 384 and tokens(hour) < tokens(asked) <= 131072
+    monkeypatch.setenv("VIDEO_MAX_TOKENS", "0")
+    with pytest.raises(ValueError):
+        videoproc.VideoProcessor(model)
+
+
 @pytest.mark.parametrize("opts", [{"fps": 0.5}, {"fps": 4, "max_frames": 24}, {"num_frames": 6}, {"num_frames": 9},
-                                  {"fps": 1, "min_frames": 30}])
+                                  {"fps": 1, "min_frames": 30},
+                                  {"fps": 4, "size": {"longest_edge": 4 << 20, "shortest_edge": 4096}},
+                                  {"fps": 2, "size": {"longest_edge": 64 << 20, "shortest_edge": 4096}}])
 def test_plan_options_match_transformers(engine_lib, model, opts):
     """A request's fps / num_frames / min_frames / max_frames give transformers' frames, grid and ids."""
     transformers = pytest.importorskip("transformers")
@@ -328,7 +356,7 @@ def test_plan_options_match_transformers(engine_lib, model, opts):
         ref = proc(text=[prompt], videos=[decode_all(raw)], video_metadata=[md], do_sample_frames=True,
                    cap_pixels_per_frame=True, return_tensors="np", return_metadata=True,
                    **({"num_frames": opts["num_frames"], "fps": None} if "num_frames" in opts
-                      else {k: opts[k] for k in ("fps",) if k in opts}))
+                      else {k: opts[k] for k in ("fps", "size") if k in opts}))
     finally:
         vp.min_frames, vp.max_frames = saved
     sampled = ref["video_metadata"][0].frames_indices.tolist()

@@ -17,6 +17,7 @@ videos it has to encode.
 import ctypes
 import json
 import math
+import os
 import pathlib
 from dataclasses import dataclass
 
@@ -103,26 +104,44 @@ class VideoProcessor:
         self.patch, self.merge, self.temporal = c["patch_size"], c["merge_size"], c["temporal_patch_size"]
         self.min_pixels, self.max_pixels = c["size"]["shortest_edge"], c["size"]["longest_edge"]
         self.fps, self.min_frames, self.max_frames = c["fps"], c["min_frames"], c["max_frames"]
-        self.max_video_tokens = c["max_video_tokens"]
+        self.max_video_tokens = c["max_video_tokens"]  # (of a pair of frames)
+        # VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES: the server's own bounds of a video in place of the checkpoint's
+        # (12,288 tokens = its size.longest_edge, 768 frames); a request may ask up to VIDEO_MAX_FRAMES frames.
+        if tokens := os.environ.get("VIDEO_MAX_TOKENS"):
+            self.max_pixels = _positive("VIDEO_MAX_TOKENS", tokens) * self.pixels_per_token
+        if frames := os.environ.get("VIDEO_MAX_FRAMES"):
+            self.max_frames = _positive("VIDEO_MAX_FRAMES", frames)
         rescale = c.get("rescale_factor", 1 / 255)
         mean = [_f32(_f32(v) * _f32(1.0 / rescale)) for v in c.get("image_mean", [0.5] * 3)]
         std = [_f32(_f32(v) * _f32(1.0 / rescale)) for v in c.get("image_std", [0.5] * 3)]
         self.norm = tuple(mean + std)
 
+    @property
+    def pixels_per_token(self):
+        """Pixels of all frames together per token (32 x 32 pixels of each frame of a pair: 2,048)."""
+        return (self.patch * self.merge) ** 2 * self.temporal
+
+    @property
+    def max_tokens(self):
+        """The tokens of a video at most (without a request's size), its pairs' time stamps aside."""
+        return self.max_pixels // self.pixels_per_token
+
     def plan(self, total, fps, width, height, frame_pixels=None, options=None):
         """The Plan of a video of `total` frames at `fps` of width x height (frame_pixels: a further cap on the
         pixels of a frame, the vision tower's IMAGE_MAX_PIXELS). options: a request's overrides (options_of):
         "fps" (frames sampled per second) or "num_frames" (that many, as transformers' sample_frames takes them),
-        "min_frames" / "max_frames" (the bounds of the fps count)."""
+        "min_frames" / "max_frames" (the bounds of the fps count), "max_pixels" (size.longest_edge: the pixels of all
+        frames together)."""
         o = options or {}
         if "num_frames" in o:
-            n = min(o["num_frames"], MAX_FRAMES)
+            n = o["num_frames"]
         else:
             n = int(total / fps * o.get("fps", self.fps))
             n = min(max(n, o.get("min_frames", self.min_frames)), o.get("max_frames", self.max_frames), total)
         indices = linspace_round(total - 1, n)
         factor = self.patch * self.merge
-        per_frame = max(min(self.max_video_tokens * factor * factor, self.max_pixels // n), int(self.min_pixels * 1.05))
+        max_pixels = o.get("max_pixels", self.max_pixels)
+        per_frame = max(min(self.max_video_tokens * factor * factor, max_pixels // n), int(self.min_pixels * 1.05))
         if frame_pixels:
             per_frame = min(per_frame, frame_pixels)
         rh, rw = smart_resize(n, height, width, self.temporal, factor, self.min_pixels, per_frame * n)
@@ -134,12 +153,25 @@ class VideoProcessor:
         return Plan(tuple(indices), (rw, rh), (len(indices) // t, rh // self.patch, rw // self.patch), times)
 
 
-MAX_FRAMES = 768  # (the most frames a request may ask for: the processor's own max_frames)
+MAX_FRAMES = 768  # (the most frames a request may ask for by default: the processor's own max_frames)
+MAX_REQUEST_PIXELS = 1 << 40  # (size.longest_edge of a request at most; IMAGE_TOKENS bounds the tokens)
 
 
-def options_of(kw):
-    """A request's video options (vLLM's `mm_processor_kwargs`: fps, num_frames, min_frames, max_frames), checked;
-    None without any. Raises ValueError (HTTP 400) for a bad value; other keys are ignored."""
+def _positive(name, v):
+    try:
+        n = int(v)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise ValueError(f"{name} must be a positive integer, got {v!r}")
+    return n
+
+
+def options_of(kw, max_frames=MAX_FRAMES):
+    """A request's video options (vLLM's `mm_processor_kwargs`: fps, num_frames, min_frames, max_frames, and
+    transformers' size.longest_edge, the pixels of all frames together, as "max_pixels"), checked; None without
+    any. max_frames: the most frames a request may ask for (VideoProcessor.max_frames). Raises ValueError (HTTP
+    400) for a bad value; other keys are ignored."""
     if kw is None:
         return None
     if not isinstance(kw, dict):
@@ -153,12 +185,22 @@ def options_of(kw):
     for k in ("num_frames", "min_frames", "max_frames"):
         if k in kw:
             v = kw[k]
-            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= MAX_FRAMES:
-                raise ValueError(f"mm_processor_kwargs.{k} must be an integer in [1, {MAX_FRAMES}]")
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= max_frames:
+                raise ValueError(f"mm_processor_kwargs.{k} must be an integer in [1, {max_frames}] (VIDEO_MAX_FRAMES)")
             out[k] = v
+    if "size" in kw:
+        size = kw["size"]
+        if not isinstance(size, dict):
+            raise ValueError('mm_processor_kwargs.size must be an object, e.g. {"longest_edge": 50331648}')
+        if "longest_edge" in size:
+            v = size["longest_edge"]
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= MAX_REQUEST_PIXELS:
+                raise ValueError("mm_processor_kwargs.size.longest_edge (the pixels of all frames together) must be a "
+                                 "positive integer")
+            out["max_pixels"] = v
     if "fps" in out and "num_frames" in out:
         raise ValueError("mm_processor_kwargs: fps and num_frames are mutually exclusive")
-    if out.get("min_frames", 1) > out.get("max_frames", MAX_FRAMES):
+    if out.get("min_frames", 1) > out.get("max_frames", max_frames):
         raise ValueError("mm_processor_kwargs: min_frames is above max_frames")
     return out or None
 

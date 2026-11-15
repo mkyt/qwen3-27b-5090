@@ -235,7 +235,9 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
   at 2 frames per second (4 to 768 frames) and costs at most 12,288 tokens, as the checkpoint's processor does it
   with qwen-vl-utils' per-frame cap; the model sees each second's pair of frames with its time
   ([Images and videos](docs/architecture.md#11-vision-tower)). A request can sample otherwise with vLLM's
-  `"mm_processor_kwargs": {"fps": 1}` (or `num_frames`, `min_frames`, `max_frames`).
+  `"mm_processor_kwargs": {"fps": 1}` (or `num_frames`, `min_frames`, `max_frames`, and `"size": {"longest_edge": N}`,
+  the pixels of all frames together: 2,048 per token). For long videos the server can take more:
+  `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES` ([Long videos](docs/configuration.md#long-videos)).
 - Special tokens written in messages (e.g. `<|im_start|>` in a pasted file or a tool result) are read as text, not as
   turn markers. `/v1/completions` takes them as tokens.
 
