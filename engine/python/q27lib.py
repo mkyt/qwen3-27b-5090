@@ -54,7 +54,7 @@ SIGNATURES = {
     "q27_mm_encode_frames": ([P, I, I, P, P], I),
     "q27_video_probe": ([P, I64, P], I),
     "q27_video_frames": ([P, I64, P, I, I, I, I, P, P], I),
-    "q27_video_memory": ([P, I64, I, I, I, P], I),
+    "q27_video_memory": ([P, I64, I, I, I, I, P], I),
     "q27_mm_embeds": ([P, I, P], I),
     "q27_mm_put": ([P, I, P], I),
     "q27_debug_kv": ([P, I, I, I, P], I),

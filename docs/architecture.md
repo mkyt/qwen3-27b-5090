@@ -399,7 +399,8 @@ over the temporal patch instead of one image twice; attention, position embeddin
   FFmpeg: PyAV's wheel doubled the serving image. The server reads the frame count, rate and size from the header
   (`q27_video_probe`, no GPU), enough for the plan (the frames, the size, the token ids and the times); the engine
   process decodes the videos it has to encode while the request waits. Pairs in a cached prefix are not encoded
-  again.
+  again, nor decoded: the decode starts at the closed key frame before the first pair past the prefix (asking a
+  4K, 60-second video again with a new question decodes 0.24 s instead of 2.5 s).
 - Only the sampled frames leave the decoder: the parser queues four pictures ahead, so decoding overlaps the
   mapping of a wanted one, which is converted to RGB (BT.601 / 709 / 2020 per the stream, each pixel taking its
   2x2 block's chroma as FFmpeg's default conversion does, which is what the reference readers give the model) and

@@ -310,6 +310,13 @@ bool closed_key(const uint8_t* data, const VideoTrack& t, int k) {
   return false;
 }
 
+// The sample decoding starts at for frames from `first` on: the closed key frame at or before it.
+int start_sample(const uint8_t* data, const VideoTrack& track, int first) {
+  int k0 = std::min(track.frames() - 1, std::max(0, first + track.skip_front));
+  while (k0 > 0 && !closed_key(data, track, k0)) k0--;
+  return k0;
+}
+
 int nvdec_engines(const Cuvid& api, VideoCodec c) {
   static int n = [&] {
     Q27_CUDA(cudaSetDevice(0));
@@ -326,10 +333,13 @@ VideoDecodeStats decode_parts(const uint8_t* data, const VideoTrack& track, cons
                               const VideoFrameFn& on_frame) {
   const Cuvid& api = cuvid();
   const int n = track.frames();
-  // Cuts: the closed key frames nearest to n * j / parts, at least kMinPartSamples apart.
-  std::vector<int> cuts{0};
+  // The decode starts at the closed key frame at or before the first wanted frame (the samples before it are not
+  // needed), and is cut at the closed key frames nearest to the j / parts points of the rest, at least
+  // kMinPartSamples apart.
+  const int k0 = start_sample(data, track, want.front());
+  std::vector<int> cuts{k0};
   for (int j = 1; j < parts; j++) {
-    const int target = int(int64_t(n) * j / parts);
+    const int target = k0 + int(int64_t(n - k0) * j / parts);
     int best = -1;
     for (int d = 0; d < n && best < 0; d++)
       for (int k : {target + d, target - d})
@@ -377,15 +387,16 @@ VideoDecodeStats decode_parts(const uint8_t* data, const VideoTrack& track, cons
   return st;
 }
 
-// The sessions video_decode runs: one per NVDEC engine (or `sessions`), each at least 2 kMinPartSamples long.
-int decode_sessions(const Cuvid& api, const VideoTrack& track, int sessions) {
+// The sessions video_decode runs from sample k0: one per NVDEC engine (or `sessions`), each at least
+// 2 kMinPartSamples long.
+int decode_sessions(const Cuvid& api, const VideoTrack& track, int sessions, int k0) {
   const int parts = sessions > 0 ? sessions : std::min(4, nvdec_engines(api, track.codec));
-  return std::max(1, std::min(parts, track.frames() / (2 * kMinPartSamples)));
+  return std::max(1, std::min(parts, (track.frames() - k0) / (2 * kMinPartSamples)));
 }
 
 }  // namespace
 
-VideoMemory video_memory(const uint8_t* data, size_t n, int out_w, int out_h, int sessions) {
+VideoMemory video_memory(const uint8_t* data, size_t n, int out_w, int out_h, int sessions, int first) {
   const VideoTrack track = video_demux(data, n);
   const Cuvid& api = cuvid();
   Q27_CUDA(cudaSetDevice(0));
@@ -436,7 +447,7 @@ VideoMemory video_memory(const uint8_t* data, size_t n, int out_w, int out_h, in
   if (!pr.seen) throw VideoError("the video's first pictures have no sequence header NVDEC can read");
   const CUVIDEOFORMAT& f = pr.fmt;
   VideoMemory m;
-  m.sessions = decode_sessions(api, track, sessions);
+  m.sessions = decode_sessions(api, track, sessions, start_sample(data, track, first));
   m.surfaces = int(f.min_num_decode_surfaces) + kExtraSurfaces;
   // A surface: luma and half-height chroma, pitch-aligned, 1 or 2 bytes a sample (NV12 / P016).
   const size_t bytes = f.bit_depth_luma_minus8 ? 2 : 1;
@@ -456,7 +467,7 @@ VideoDecodeStats video_decode(const uint8_t* data, size_t n, const VideoTrack& t
   const double t0 = now_ms();
   if (want.empty() || n == 0) return {};
   const Cuvid& api = cuvid();
-  const int parts = decode_sessions(api, track, sessions);
+  const int parts = decode_sessions(api, track, sessions, start_sample(data, track, want.front()));
   VideoDecodeStats st;
   try {
     st = decode_parts(data, track, want, parts, on_frame);

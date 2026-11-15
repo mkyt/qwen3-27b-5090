@@ -266,21 +266,25 @@ class Scheduler:
         for i, ((start, gh, gw), src) in enumerate(zip(spans, srcs)):
             if start + gh * gw > s.reusable:
                 key = i if src[0] == "image" else ("video", src[1])
-                if key not in s.decoding:
-                    sessions, loan = self.lend(s, key)
-                    f = self.decoder.submit(self.decode, s, key, sessions)
+                if key not in s.decoding:  # (a video: from its first pair past the prefix on)
+                    g = src[2] if src[0] == "video" else 0
+                    sessions, loan = self.lend(s, key, g)
+                    f = self.decoder.submit(self.decode, s, key, sessions, g)
                     if loan >= 0:
                         f.add_done_callback(lambda _, loan=loan: self.returns.append(loan))  # (cancelled too)
+                    f.first_pair = g
                     s.decoding[key] = f
 
-    def lend(self, s, key):
-        """(sessions, loan): the parallel decoders for video `key` and a loan of KV pool memory covering what they take
-        (-1: none; an image, or a pool that cannot spare it: then one decoder, the memory taken beyond the budget)."""
+    def lend(self, s, key, g=0):
+        """(sessions, loan): the parallel decoders for video `key` from its pair g on and a loan of KV pool memory
+        covering what they take (-1: none; an image, or a pool that cannot spare it: then one decoder, the memory
+        taken beyond the budget)."""
         if not isinstance(key, tuple):
             return 0, -1
         import videoproc
 
         raw, plan = s.images[2][key[1]]
+        plan = videoproc.tail(plan, g)
         try:
             need, sessions = videoproc.memory(raw, plan)
         except ValueError:  # (the decode reports it)
@@ -298,13 +302,15 @@ class Scheduler:
             self.engine.kv_unlend(self.returns.popleft())
 
     @staticmethod
-    def decode(s, key, sessions=0):
-        """The pixels of image `key` (imageproc.rgb) or the frames of video ("video", k) (videoproc.frames)."""
+    def decode(s, key, sessions=0, g=0):
+        """The pixels of image `key` (imageproc.rgb) or the frames of video ("video", k) from its pair g on
+        (videoproc.frames; only the samples from the closed key frame before them are decoded)."""
         spans, srcs, videos = s.images
         if isinstance(key, tuple):
             import videoproc
 
-            return videoproc.frames(*videos[key[1]], sessions=sessions)
+            raw, plan = videos[key[1]]
+            return videoproc.frames(raw, videoproc.tail(plan, g), sessions=sessions)
         import imageproc
 
         _, raw, size, _ = srcs[key]
@@ -600,15 +606,19 @@ class Scheduler:
             self.engine.mm_set(spans)
             t0, encoded, waited = time.time(), 0, 0.0
 
-            def pixels(key):
+            def pixels(key, g=0):
+                """The image's pixels, or the video's frames from its pair g on."""
                 nonlocal waited
                 t1, f = time.time(), s.decoding.pop(key, None)
                 loan = -1
                 try:
-                    if f is not None:
-                        return f.result()
-                    sessions, loan = self.lend(s, key)
-                    return self.decode(s, key, sessions)
+                    if f is not None and f.first_pair <= g:  # (prefetched from its first pair past the prefix)
+                        out = f.result()
+                        return out[2 * (g - f.first_pair):] if isinstance(key, tuple) else out
+                    if f is not None:  # (the cache restored less than the prefetch expected: earlier pairs too)
+                        f.cancel()
+                    sessions, loan = self.lend(s, key, g)
+                    return self.decode(s, key, sessions, g)
                 except Exception as e:  # noqa: BLE001 - any decoder error is the client's
                     raise ImageError(f"cannot decode {'video' if isinstance(key, tuple) else 'image'}: {e}") from e
                 finally:
@@ -632,10 +642,9 @@ class Scheduler:
                 j = i
                 while j < len(spans) and srcs[j][0] == "video" and srcs[j][1] == k:
                     j += 1
-                if k not in frames:
-                    frames[k] = pixels(("video", k))
-                g0 = src[2]
-                self.engine.mm_encode_frames(i, frames[k][2 * g0:2 * (g0 + j - i)], src[3])
+                # (the pairs from the first one past the restored prefix to the video's end: decoded from there)
+                frames[k] = pixels(("video", k), src[2])
+                self.engine.mm_encode_frames(i, frames[k][:2 * (j - i)], src[3])
                 i, encoded = j, encoded + j - i
             frames.clear()
             self.drop_decoding(s)  # (the pixels are not kept: a suspended request that needs them decodes again)

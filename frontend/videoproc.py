@@ -128,6 +128,15 @@ class VideoProcessor:
         return Plan(tuple(indices), (rw, rh), (len(indices) // t, rh // self.patch, rw // self.patch), times)
 
 
+def tail(plan, g):
+    """The Plan of pairs g.. of a plan (the frames a request still has to encode when its first g pairs are in the
+    prefix cache)."""
+    if g == 0:
+        return plan
+    t = len(plan.indices) // plan.grid[0]
+    return Plan(plan.indices[t * g:], plan.size, (plan.grid[0] - g, *plan.grid[1:]), plan.times[g:])
+
+
 def frames(raw, plan, sessions=0):
     """The resized frames of a Plan, [height][width][3] uint8 bytes each, in the plan's order: decoded on NVDEC
     and resized on the GPU (sessions: parallel decoders, 0: one per NVDEC engine). A frame the stream turns out
@@ -154,11 +163,12 @@ def frames(raw, plan, sessions=0):
 def memory(raw, plan, sessions=0):
     """(bytes, sessions): the device memory frames(raw, plan, sessions) takes while it runs, outside the engine's
     pools (NVDEC's surfaces for the stream's first sequence header, the driver's state, the resize buffers; read by
-    the parser on the CPU, no decoder), and the parallel decoders it would run. The worker lends that much of the KV
+    the parser on the CPU, no decoder), and the parallel decoders it would run (from the closed key frame before the
+    plan's first frame: a tail takes fewer). The worker lends that much of the KV
     pool for the decode (Engine.kv_lend)."""
     from q27lib import lib
 
     out = (ctypes.c_double * 4)()
     w, h = plan.size
-    _check(lib().q27_video_memory(raw, len(raw), w, h, sessions, out), "q27_video_memory")
+    _check(lib().q27_video_memory(raw, len(raw), w, h, sessions, min(plan.indices), out), "q27_video_memory")
     return int(out[0]), int(out[1])

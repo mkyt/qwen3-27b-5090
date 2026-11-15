@@ -434,11 +434,11 @@ int q27_video_probe(const uint8_t* data, int64_t n, double* out) {
   });
 }
 
-// Device memory decoding a video to out_w x out_h takes (video_memory; the parser on the CPU, no decoder):
-// out [4] = bytes, sessions, bytes per session, decode surfaces. -3: the file cannot be used.
-int q27_video_memory(const uint8_t* data, int64_t n, int out_w, int out_h, int sessions, double* out) {
+// Device memory decoding a video's frames from `first` on to out_w x out_h takes (video_memory; the parser on the
+// CPU, no decoder): out [4] = bytes, sessions, bytes per session, decode surfaces. -3: the file cannot be used.
+int q27_video_memory(const uint8_t* data, int64_t n, int out_w, int out_h, int sessions, int first, double* out) {
   return guard([&] {
-    const VideoMemory v = video_memory(data, size_t(n), out_w, out_h, sessions);
+    const VideoMemory v = video_memory(data, size_t(n), out_w, out_h, sessions, first);
     const double r[4] = {double(v.bytes), double(v.sessions), double(v.per_session), double(v.surfaces)};
     std::memcpy(out, r, sizeof r);
   });

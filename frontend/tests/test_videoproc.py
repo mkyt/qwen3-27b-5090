@@ -11,6 +11,7 @@ Skipped where PyAV, the engine library or the checkpoint is missing (transformer
 """
 
 import base64
+import ctypes
 import io
 import pathlib
 import random
@@ -231,6 +232,44 @@ def test_gpu_resize_is_pil(gpu, size):
     small = videoproc.frames(raw, _plan(idx, (ow, oh)))
     for a, b in zip(full, small):
         assert Image.frombytes("RGB", (w, h), a).resize((ow, oh), Image.BICUBIC).tobytes() == b
+
+
+def test_tail_plan():
+    plan = videoproc.Plan(tuple(range(0, 40, 2)), (64, 32), (10, 2, 4), tuple(float(t) for t in range(10)))
+    assert videoproc.tail(plan, 0) is plan
+    t = videoproc.tail(plan, 7)
+    assert t.indices == plan.indices[14:] and t.times == plan.times[7:] and t.grid == (3, 2, 4) and t.size == plan.size
+
+
+def _decoded(raw, plan, sessions):
+    """(frames, pictures NVDEC decoded) of videoproc.frames' call."""
+    from q27lib import lib
+
+    want = sorted(set(plan.indices))
+    w, h = plan.size
+    buf = ctypes.create_string_buffer(len(want) * w * h * 3)
+    st = (ctypes.c_double * 5)()
+    assert lib().q27_video_frames(raw, len(raw), (ctypes.c_int32 * len(want))(*want), len(want), w, h, sessions, buf,
+                                  st) == 0
+    return buf.raw, int(st[1])
+
+
+@pytest.mark.parametrize("kind", ["bframes", "hevc", "av1"])
+def test_tail_decodes_from_its_key_frame(gpu, kind):
+    """The frames of a plan's tail (the pairs past a cached prefix) are those of the whole plan, decoded from the
+    closed key frame before them (HEVC's CRA pictures are open: from the start, or an IDR)."""
+    codec, opts = CODECS[kind]
+    opts = {**(opts or {}), "g": "48"} if kind != "av1" else {**opts, "g": "48"}
+    raw = encode(400, 30, 320, 240, codec=codec, options=opts)
+    plan = _plan(videoproc.linspace_round(399, 100), (160, 128))
+    full = videoproc.frames(raw, plan, sessions=1)
+    _, all_pictures = _decoded(raw, plan, 1)
+    for g in (1, 17, 30, 49):
+        for sessions in (1, 2):
+            assert videoproc.frames(raw, videoproc.tail(plan, g), sessions=sessions) == full[2 * g:], (g, sessions)
+    _, pictures = _decoded(raw, videoproc.tail(plan, 45), 1)
+    if kind != "hevc":  # (x265's key frames are open CRA pictures: no closed one to start at)
+        assert pictures < all_pictures // 2, (pictures, all_pictures)
 
 
 def test_parallel_decoders_match_one(gpu):
