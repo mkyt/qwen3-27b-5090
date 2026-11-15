@@ -1,0 +1,22 @@
+# Video prompts: engine (NVIDIA's checkpoint, KV bf16, VISION=bf16; the server's path: demuxer, NVDEC, PIL resize)
+# against the reference model (PyAV frames, transformers' processor, reference vision tower fp32 + language model),
+# scripts/video_check.py ref / engine. Clips: sample_demo_1.mp4 (640x360, 25 fps, 10 s; "demo") and tennis.mp4
+# (1280x720, 30 fps, 6 s; Hugging Face test fixtures), each asked in English (-0) and Japanese (-1).
+# The prompt ids are identical. KL(reference || engine) over the top-20, and top-1 agreement:
+# "between pairs" = the timestamp text between the frame pairs, "after the video" = the question and the template.
+case       between pairs KL / top-1     after the video KL / top-1
+-- reference vs engine
+demo-0                1.535 / 0.63             0.0179 / 0.95
+demo-1                1.350 / 0.63             0.0448 / 1.00
+tennis-0              0.994 / 0.73             0.1028 / 0.95
+tennis-1              0.994 / 0.73             0.0351 / 1.00
+-- reference with the engine's vision embeddings vs engine (the language model alone)
+demo-0                0.779 / 0.72             0.0184 / 0.95
+demo-1                1.080 / 0.67             0.0930 / 0.96
+tennis-0              1.050 / 0.67             0.0477 / 0.95
+tennis-1              1.050 / 0.67             0.0137 / 1.00
+-- reference vs reference with the engine's vision embeddings (only the embeddings differ)
+demo-0                1.744 / 0.67             0.0118 / 1.00
+demo-1                0.855 / 0.69             0.1001 / 0.96
+tennis-0              0.865 / 0.71             0.0891 / 1.00
+tennis-1              0.865 / 0.71             0.0466 / 1.00

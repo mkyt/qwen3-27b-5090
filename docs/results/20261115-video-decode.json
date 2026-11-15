@@ -1,0 +1,38 @@
+{
+ "what": "videoproc.frames, 120 frames of a 60 s 30 fps video",
+ "rows": [
+  {
+   "file": "bench_4k_av1_10.mp4",
+   "mb": 160.0,
+   "frames": 120,
+   "size": [
+    608,
+    320
+   ],
+   "decoders_2": 2.552,
+   "decoders_1": 4.171
+  },
+  {
+   "file": "bench_4k_hevc_10.mp4",
+   "mb": 227.0,
+   "frames": 120,
+   "size": [
+    608,
+    320
+   ],
+   "decoders_2": 2.0,
+   "decoders_1": 3.362
+  },
+  {
+   "file": "bench_1080_h264.mp4",
+   "mb": 160.1,
+   "frames": 120,
+   "size": [
+    608,
+    320
+   ],
+   "decoders_2": 1.065,
+   "decoders_1": 1.466
+  }
+ ]
+}

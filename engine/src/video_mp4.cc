@@ -78,6 +78,7 @@ struct Trex {
 
 struct Track {
   uint32_t id = 0, timescale = 0, handler = 0, entry = 0;
+  int rotation = 0;
   int width = 0, height = 0;
   std::vector<uint8_t> config;  // avcC / hvcC / av1C body
   // sample table
@@ -109,6 +110,11 @@ void parse_stsd(const uint8_t* d, const Box& b, Track& t) {
   size_t at = c.at;
   if (!next_box(d, at, b.end, e)) bad("no sample description");
   t.entry = e.type;
+  // (only the video sample entries decoded here have the visual layout; an audio track's mp4a, a text track's tx3g
+  // and the like are not read)
+  if (e.type != fourcc("avc1") && e.type != fourcc("avc3") && e.type != fourcc("hvc1") && e.type != fourcc("hev1") &&
+      e.type != fourcc("av01") && e.type != fourcc("vp09"))
+    return;
   Cur s{d, e.body, e.end};
   s.skip(6 + 2 + 16);  // reserved, data reference index, pre-defined / reserved
   t.width = s.u16(), t.height = s.u16();
@@ -199,6 +205,16 @@ void parse_trak(const uint8_t* d, const Box& trak, std::vector<Track>& out) {
       Cur c = full(d, b, v, fl);
       c.skip(v == 1 ? 16 : 8);
       t.id = c.u32();
+      // The display matrix's rotation (a b / c d in 16.16; FFmpeg's av_display_rotation_get): quarter turns only.
+      c.skip(4 + (v == 1 ? 8 : 4) + 8 + 2 + 2 + 2 + 2);  // reserved, duration, reserved, layer, group, volume
+      const int32_t a = int32_t(c.u32()), bb = int32_t(c.u32());
+      c.u32();
+      const int32_t cc = int32_t(c.u32()), dd = int32_t(c.u32());
+      const int32_t one = 1 << 16;
+      if (a == one && dd == one && !bb && !cc) t.rotation = 0;
+      else if (!a && !dd && bb == -one && cc == one) t.rotation = 1;
+      else if (a == -one && dd == -one && !bb && !cc) t.rotation = 2;
+      else if (!a && !dd && bb == one && cc == -one) t.rotation = 3;
     } else if (b.type == fourcc("edts")) {
       each_box(d, b.body, b.end, [&](const Box& e) {
         if (e.type != fourcc("elst")) return;
@@ -423,6 +439,7 @@ VideoTrack mp4_demux(const uint8_t* d, size_t n) {
   VideoTrack v;
   v.codec = codec;
   v.width = t->width, v.height = t->height;
+  v.rotation = t->rotation;
   video_configure(t->config, v);
   // Durations and composition offsets in decode order: the sample table's, then the fragments'.
   std::vector<uint32_t> dur(t->durations.begin(), t->durations.begin() + std::min(t->durations.size(), t->sizes.size()));

@@ -36,7 +36,8 @@ VIDEOS = [(30, 10, 160, 120), (35, 5, 96, 200), (91, 30, 1280, 720), (1700, 2, 6
           (240, 24, 32, 400)]
 
 
-def encode(frames, fps, width, height, seed=0, codec="libx264", options=None, container=None, fmt="mp4"):
+def encode(frames, fps, width, height, seed=0, codec="libx264", options=None, container=None, fmt="mp4",
+           pix_fmt="yuv420p"):
     """A video of smooth random frames moving sideways (the codec's 4:2:0, so the decode is not the identity)."""
     from PIL import Image
 
@@ -46,7 +47,7 @@ def encode(frames, fps, width, height, seed=0, codec="libx264", options=None, co
     buf = io.BytesIO()
     with av.open(buf, "w", format=fmt, options=container or {}) as c:
         s = c.add_stream(codec, rate=fps)
-        s.width, s.height, s.pix_fmt = width + width % 2, height + height % 2, "yuv420p"
+        s.width, s.height, s.pix_fmt = width + width % 2, height + height % 2, pix_fmt
         s.options = {"crf": "18", "preset": "ultrafast", **(options or {})} if codec == "libx264" else (options or {})
         for i in range(frames):
             img = np.roll(base, i, axis=1)[:s.height, :s.width]
@@ -143,6 +144,67 @@ def test_probe_matches_pyav(engine_lib, kind):
     assert videoproc.probe(raw) == pyav_probe(raw) == (45, float(rate), 176, 144)
 
 
+@pytest.mark.parametrize("fmt", ["mp4", "matroska"])
+def test_audio_track_is_skipped(engine_lib, fmt):
+    """A file with an audio track before and after the video track (the sample description of mp4a is not a
+    visual one): the video track's probe, and its frames with a GPU, are those of the file without audio."""
+    video = encode(30, 10, 160, 120, fmt=fmt)
+    buf = io.BytesIO()
+    with av.open(io.BytesIO(video)) as src, av.open(buf, "w", format=fmt) as dst:
+        a0 = dst.add_stream("aac", rate=48000)
+        v = dst.add_stream_from_template(src.streams.video[0], opaque=True)
+        a1 = dst.add_stream("aac", rate=48000)
+        for a in (a0, a1):
+            silence = av.AudioFrame.from_ndarray(np.zeros((1, 1024 * 30), np.float32), format="flt", layout="mono")
+            silence.sample_rate = 48000
+            for p in a.encode(silence):
+                dst.mux(p)
+            for p in a.encode():
+                dst.mux(p)
+        for p in src.demux(video=0):
+            if p.size:
+                p.stream = v
+                dst.mux(p)
+    with_audio = buf.getvalue()
+    assert videoproc.probe(with_audio)[:1] == videoproc.probe(video)[:1] == (30,)
+    try:
+        plan = _plan([0, 7, 8, 29], (160, 128))
+        assert videoproc.frames(with_audio, plan) == videoproc.frames(video, plan)
+    except RuntimeError:
+        pass  # (no NVDEC)
+
+
+def rotated(raw, k):
+    """The MP4 with its video track's display matrix turning it k quarter turns counter-clockwise (FFmpeg's
+    -display_rotation 90 k): the frames stay as they are, players show them turned."""
+    import struct
+
+    one = 1 << 16
+    a, b, c, d = [(one, 0, 0, one), (0, -one, one, 0), (-one, 0, 0, -one), (0, one, -one, 0)][k]
+    i = raw.find(b"tkhd")
+    at = i + 4 + 4 + (32 if raw[i + 4] == 1 else 20) + 8 + 8
+    return raw[:at] + struct.pack(">9i", a, b, 0, c, d, 0, 0, 0, 1 << 30) + raw[at + 36:]
+
+
+@pytest.mark.parametrize("k", [1, 2, 3])
+def test_rotated_video_comes_upright(engine_lib, k):
+    """A rotated video's probe is its upright size and its frames are the unrotated ones turned (numpy's rot90),
+    as FFmpeg shows them (transformers' PyAV reader does not turn them)."""
+    raw = encode(20, 10, 320, 192)
+    rot = rotated(raw, k)
+    total, fps, w, h = videoproc.probe(rot)
+    assert (total, w, h) == (20, *((192, 320) if k % 2 else (320, 192)))
+    size = (96, 160) if k % 2 else (160, 96)
+    try:
+        got = videoproc.frames(rot, _plan([0, 5, 6, 19], size))
+    except RuntimeError as e:
+        pytest.skip(f"no NVDEC: {e}")
+    base = videoproc.frames(raw, _plan([0, 5, 6, 19], (160, 96)))
+    for a, b in zip(got, base):
+        assert np.array_equal(np.frombuffer(a, np.uint8).reshape(size[1], size[0], 3),
+                              np.rot90(np.frombuffer(b, np.uint8).reshape(96, 160, 3), k))
+
+
 def test_mkv_without_default_duration(engine_lib):
     """The rate from the frames' timestamps (libavformat guesses 30.3 from its first packets here)."""
     raw = encode(37, Fraction(30000, 1001), 176, 144, codec="libx264", fmt="matroska")
@@ -234,6 +296,74 @@ def test_gpu_resize_is_pil(gpu, size):
         assert Image.frombytes("RGB", (w, h), a).resize((ow, oh), Image.BICUBIC).tobytes() == b
 
 
+def test_options_of():
+    assert videoproc.options_of(None) is None and videoproc.options_of({"size": 1}) is None
+    assert videoproc.options_of({"fps": 1, "max_frames": 64}) == {"fps": 1.0, "max_frames": 64}
+    for bad in ({"fps": 0}, {"fps": "2"}, {"fps": True}, {"num_frames": 0}, {"num_frames": 2.5}, {"max_frames": 10**6},
+                {"fps": 1, "num_frames": 8}, {"min_frames": 9, "max_frames": 8}, [1]):
+        with pytest.raises(ValueError):
+            videoproc.options_of(bad)
+
+
+@pytest.mark.parametrize("opts", [{"fps": 0.5}, {"fps": 4, "max_frames": 24}, {"num_frames": 6}, {"num_frames": 9},
+                                  {"fps": 1, "min_frames": 30}])
+def test_plan_options_match_transformers(engine_lib, model, opts):
+    """A request's fps / num_frames / min_frames / max_frames give transformers' frames, grid and ids."""
+    transformers = pytest.importorskip("transformers")
+    from transformers.video_utils import VideoMetadata
+
+    import server
+    from tokenizer import Tokenizer
+
+    raw = encode(91, 30, 640, 360)
+    total, rate, w, h = videoproc.probe(raw)
+    plan = videoproc.VideoProcessor(model).plan(total, rate, w, h, options=videoproc.options_of(opts))
+    proc = transformers.AutoProcessor.from_pretrained(model)
+    md = VideoMetadata(total_num_frames=total, fps=rate, duration=total / rate, width=w, height=h)
+    prompt = "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>What happens?<|im_end|>\n"
+    vp = proc.video_processor
+    saved = vp.min_frames, vp.max_frames
+    vp.min_frames, vp.max_frames = opts.get("min_frames", vp.min_frames), opts.get("max_frames", vp.max_frames)
+    try:
+        ref = proc(text=[prompt], videos=[decode_all(raw)], video_metadata=[md], do_sample_frames=True,
+                   cap_pixels_per_frame=True, return_tensors="np", return_metadata=True,
+                   **({"num_frames": opts["num_frames"], "fps": None} if "num_frames" in opts
+                      else {k: opts[k] for k in ("fps",) if k in opts}))
+    finally:
+        vp.min_frames, vp.max_frames = saved
+    sampled = ref["video_metadata"][0].frames_indices.tolist()
+    assert sampled == list(plan.indices[:len(sampled)])
+    assert ref["video_grid_thw"].tolist() == [list(plan.grid)]
+    tok = Tokenizer(model)
+    pads = tuple(tok.token_id(x) for x in ("<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"))
+    url = "data:video/mp4;base64," + base64.b64encode(raw).decode()
+    ids, *_ = server.Images(model, 4194304).prepare(tok.encode(prompt), [("video", url)], pads, tok.encode,
+                                                   videoproc.options_of(opts))
+    assert [pads[1] if i >= 248320 else i for i in ids] == ref["input_ids"][0].tolist()
+
+
+def test_pair_ids_depend_on_its_frames(engine_lib, model):
+    """Plans of two options with the same grid but other frames give other pad ids (no false prefix-cache hit)."""
+    import server
+    from tokenizer import Tokenizer
+
+    raw = encode(91, 30, 640, 360)
+    tok = Tokenizer(model)
+    pads = tuple(tok.token_id(x) for x in ("<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"))
+    url = "data:video/mp4;base64," + base64.b64encode(raw).decode()
+    prompt = tok.encode("<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>Hi<|im_end|>\n")
+    imgs = server.Images(model, 4194304)
+    a = imgs.prepare(prompt, [("video", url)], pads, tok.encode, {"num_frames": 6})
+    b = imgs.prepare(prompt, [("video", url)], pads, tok.encode, {"num_frames": 6})
+    c = imgs.prepare(prompt, [("video", url)], pads, tok.encode, {"fps": 0.6})  # (also 6 frames: other indices?)
+    assert a[0] == b[0]
+    pa, pc = a[3][0][1], c[3][0][1]
+    if pa.grid == pc.grid and pa.indices != pc.indices:
+        assert a[0] != c[0]
+    d = imgs.prepare(prompt, [("video", url)], pads, tok.encode, {"num_frames": 8})
+    assert a[0] != d[0]
+
+
 def test_tail_plan():
     plan = videoproc.Plan(tuple(range(0, 40, 2)), (64, 32), (10, 2, 4), tuple(float(t) for t in range(10)))
     assert videoproc.tail(plan, 0) is plan
@@ -270,6 +400,49 @@ def test_tail_decodes_from_its_key_frame(gpu, kind):
     _, pictures = _decoded(raw, videoproc.tail(plan, 45), 1)
     if kind != "hevc":  # (x265's key frames are open CRA pictures: no closed one to start at)
         assert pictures < all_pictures // 2, (pictures, all_pictures)
+
+
+def nearest_rgb(raw):
+    """RGB of the decoded YUV planes (PyAV's, so the decoder is out of it) by this engine's formula: each pixel takes
+    the chroma sample of its block (2 x 2 for 4:2:0, 2 x 1 for 4:2:2, its own for 4:4:4), BT.601 limited range."""
+    with av.open(io.BytesIO(raw)) as c:
+        out = []
+        for f in c.decode(video=0):
+            wide = f.format.name.endswith("le")
+            dt, m = (np.uint16, 4.0) if wide else (np.uint8, 1.0)
+            if wide and "10" not in f.format.name:
+                raise ValueError(f.format.name)
+            pl = [np.frombuffer(f.planes[i], dt).reshape(f.planes[i].height, -1)[:, :f.planes[i].width].astype(np.float64)
+                  for i in range(3)]
+            y, u, v = pl
+            sy, sx = y.shape[0] // u.shape[0], y.shape[1] // u.shape[1]
+            u, v = (np.repeat(np.repeat(c_, sy, 0), sx, 1)[:y.shape[0], :y.shape[1]] for c_ in (u, v))
+            kr, kb = 0.299, 0.114
+            kg = 1 - kr - kb
+            Y, Cb, Cr = (y - 16 * m) * 255 / 219 / m, (u - 128 * m) * 255 / 224 / m, (v - 128 * m) * 255 / 224 / m
+            rgb = np.stack([Y + 2 * (1 - kr) * Cr, Y - 2 * (1 - kb) * kb / kg * Cb - 2 * (1 - kr) * kr / kg * Cr,
+                            Y + 2 * (1 - kb) * Cb], -1)
+            out.append(np.clip(np.rint(rgb), 0, 255))
+        return np.stack(out)
+
+
+@pytest.mark.parametrize("codec,pix_fmt", [("libx264", "yuv422p"), ("libx264", "yuv422p10le"), ("libx265", "yuv422p"),
+                                           ("libx265", "yuv422p10le"), ("libx265", "yuv444p"), ("libx265", "yuv444p10le"),
+                                           ("libx264", "yuv420p10le"), ("libx264", "yuv420p")])
+def test_chroma_formats(gpu, codec, pix_fmt):
+    """4:2:2 and 4:4:4, 8 and 10 bits: the frames are the engine's formula on the decoded planes (within the float
+    rounding of one step), and for 8 bits PyAV's RGB within its conversion's rounding. (For 10 bits FFmpeg converts
+    otherwise, 4 to 6 steps away on these colorful frames: not reproduced by nearest, bilinear or bicubic chroma.)"""
+    opts = {"x265-params": "log-level=error"} if codec == "libx265" else None
+    raw = encode(12, 10, 320, 240, codec=codec, options=opts, pix_fmt=pix_fmt)
+    got = np.stack([np.frombuffer(b, np.uint8).reshape(240, 320, 3)
+                    for b in videoproc.frames(raw, _plan(list(range(12)), (320, 240)))]).astype(int)
+    d = np.abs(got - nearest_rgb(raw))
+    p = np.abs(got - decode_all(raw))
+    print(f"{codec} {pix_fmt}: vs the formula max {d.max():.0f} (mean {d.mean():.4f}), vs PyAV mean {p.mean():.2f} max {p.max()}")
+    assert d.max() <= 1 and d.mean() < 0.01
+    if "10" not in pix_fmt:
+        assert p.mean() < 1.5 and np.quantile(p, 0.999) <= 4
 
 
 def test_parallel_decoders_match_one(gpu):

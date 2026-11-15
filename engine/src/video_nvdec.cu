@@ -131,14 +131,18 @@ struct Session {
         return surfaces;
       return fail("the video changes its size or format midway", true);
     }
-    if (f->chroma_format != cudaVideoChromaFormat_420)
-      return fail("only 4:2:0 video is supported (this one has another chroma subsampling)", true);
+    if (f->chroma_format != cudaVideoChromaFormat_420 && f->chroma_format != cudaVideoChromaFormat_422 &&
+        f->chroma_format != cudaVideoChromaFormat_444)
+      return fail("monochrome video is not supported", true);
     CUVIDDECODECAPS caps{};
     caps.eCodecType = f->codec, caps.eChromaFormat = f->chroma_format, caps.nBitDepthMinus8 = f->bit_depth_luma_minus8;
     if (api.GetDecoderCaps(&caps) != CUDA_SUCCESS) return fail("cuvidGetDecoderCaps failed", false);
     if (!caps.bIsSupported)
       return fail(std::string("NVDEC does not decode this ") + video_codec_name(track.codec) + " stream (" +
-                      std::to_string(8 + f->bit_depth_luma_minus8) + "-bit)", true);
+                      std::to_string(8 + f->bit_depth_luma_minus8) + "-bit " +
+                      (f->chroma_format == cudaVideoChromaFormat_420   ? "4:2:0"
+                       : f->chroma_format == cudaVideoChromaFormat_422 ? "4:2:2"
+                                                                       : "4:4:4") + ")", true);
     if (f->coded_width < caps.nMinWidth || f->coded_height < caps.nMinHeight)
       return fail("the video is smaller than NVDEC decodes (" + std::to_string(caps.nMinWidth) + "x" +
                       std::to_string(caps.nMinHeight) + ")", true);
@@ -153,7 +157,10 @@ struct Session {
     CUVIDDECODECREATEINFO ci{};
     ci.CodecType = f->codec;
     ci.ChromaFormat = f->chroma_format;
-    ci.OutputFormat = f->bit_depth_luma_minus8 ? cudaVideoSurfaceFormat_P016 : cudaVideoSurfaceFormat_NV12;
+    const bool wide = f->bit_depth_luma_minus8 > 0;
+    ci.OutputFormat = f->chroma_format == cudaVideoChromaFormat_444 ? (wide ? cudaVideoSurfaceFormat_YUV444_16Bit : cudaVideoSurfaceFormat_YUV444)
+                      : f->chroma_format == cudaVideoChromaFormat_422 ? (wide ? cudaVideoSurfaceFormat_P216 : cudaVideoSurfaceFormat_NV16)
+                                                                      : (wide ? cudaVideoSurfaceFormat_P016 : cudaVideoSurfaceFormat_NV12);
     ci.bitDepthMinus8 = f->bit_depth_luma_minus8;
     ci.DeinterlaceMode = f->progressive_sequence ? cudaVideoDeinterlaceMode_Weave : cudaVideoDeinterlaceMode_Adaptive;
     ci.ulNumOutputSurfaces = 2;
@@ -197,6 +204,7 @@ struct Session {
     f.luma = reinterpret_cast<const uint8_t*>(ptr);
     f.chroma = f.luma + size_t(pitch) * ((height + 1) & ~1);
     f.pitch = pitch, f.width = width, f.height = height, f.bits = 8 + fmt.bit_depth_luma_minus8;
+    f.chroma_format = fmt.chroma_format == cudaVideoChromaFormat_444 ? 2 : fmt.chroma_format == cudaVideoChromaFormat_422 ? 1 : 0;
     f.matrix = fmt.video_signal_description.matrix_coefficients;
     f.full_range = fmt.video_signal_description.video_full_range_flag;
     try {
@@ -451,12 +459,13 @@ VideoMemory video_memory(const uint8_t* data, size_t n, int out_w, int out_h, in
   m.surfaces = int(f.min_num_decode_surfaces) + kExtraSurfaces;
   // A surface: luma and half-height chroma, pitch-aligned, 1 or 2 bytes a sample (NV12 / P016).
   const size_t bytes = f.bit_depth_luma_minus8 ? 2 : 1;
-  const size_t surface = size_t(round_up(int64_t(f.coded_width), 256)) * round_up(int64_t(f.coded_height), 64) * 3 / 2 * bytes;
+  const size_t planes2 = f.chroma_format == cudaVideoChromaFormat_444 ? 6 : f.chroma_format == cudaVideoChromaFormat_422 ? 4 : 3;
+  const size_t surface = size_t(round_up(int64_t(f.coded_width), 256)) * round_up(int64_t(f.coded_height), 64) * planes2 / 2 * bytes;
   const int w = f.display_area.right - f.display_area.left, h = f.display_area.bottom - f.display_area.top;
   const size_t ow = out_w ? out_w : w, oh = out_h ? out_h : h;
   // Each session: its decode and output surfaces, the driver's own state, and the resize buffers (one frame of RGB
   // at most each, video_frames).
-  const size_t own = kSessionOverhead + size_t(w) * h * 3 + ow * oh * 3;
+  const size_t own = kSessionOverhead + size_t(w) * h * 3 + ow * oh * 3 * (track.rotation ? 2 : 1);
   m.per_session = size_t(m.surfaces + 2) * surface + own;
   m.bytes = size_t(m.sessions) * m.per_session + kDecodeOverhead;
   return m;
@@ -508,21 +517,34 @@ Yuv2Rgb coefficients(int matrix, int full, int bits) {
 }
 
 struct Src {
-  const uint8_t *luma, *chroma;
+  const uint8_t *luma, *chroma, *chroma_v;  // (chroma_v: 4:4:4's V plane; the others interleave U and V)
   size_t pitch;
-  int w, h, shift;  // shift: P016 samples down to their bits
-  bool wide;        // P016
+  int w, h, shift;  // shift: 16-bit samples down to their bits
+  bool wide;        // P016 / P216 / YUV444_16Bit
+  int cx, cy;       // chroma subsampling: 4:2:0 1, 1; 4:2:2 1, 0; 4:4:4 0, 0
   Yuv2Rgb c;
 };
 
 Src src_of(const VideoFrame& f) {
-  return {f.luma, f.chroma, f.pitch, f.width, f.height, 16 - f.bits, f.bits > 8, coefficients(f.matrix, f.full_range, f.bits)};
+  const int cf = f.chroma_format;
+  const uint8_t* v = cf == 2 ? f.chroma + f.pitch * size_t((f.height + 1) & ~1) : nullptr;
+  return {f.luma, f.chroma, v, f.pitch, f.width, f.height, 16 - f.bits, f.bits > 8, cf < 2 ? 1 : 0, cf == 0 ? 1 : 0,
+          coefficients(f.matrix, f.full_range, f.bits)};
 }
 
 __device__ __forceinline__ float luma_at(const Src& s, int x, int y) {
   return s.wide ? float(reinterpret_cast<const uint16_t*>(s.luma + y * s.pitch)[x] >> s.shift) : float(s.luma[y * s.pitch + x]);
 }
 __device__ __forceinline__ void chroma_at(const Src& s, int x, int y, float& u, float& v) {
+  if (s.chroma_v) {  // (4:4:4, planar)
+    if (s.wide) {
+      u = float(reinterpret_cast<const uint16_t*>(s.chroma + y * s.pitch)[x] >> s.shift);
+      v = float(reinterpret_cast<const uint16_t*>(s.chroma_v + y * s.pitch)[x] >> s.shift);
+    } else {
+      u = s.chroma[y * s.pitch + x], v = s.chroma_v[y * s.pitch + x];
+    }
+    return;
+  }
   if (s.wide) {
     const uint16_t* p = reinterpret_cast<const uint16_t*>(s.chroma + y * s.pitch) + 2 * x;
     u = float(p[0] >> s.shift), v = float(p[1] >> s.shift);
@@ -532,17 +554,31 @@ __device__ __forceinline__ void chroma_at(const Src& s, int x, int y, float& u, 
   }
 }
 
-// RGB of pixel (x, y), its chroma the sample of its 2 x 2 block: what FFmpeg's default conversion of 4:2:0 to
+// RGB of pixel (x, y), its chroma the sample of its 2 x 2 block (4:2:2: 2 x 1): what FFmpeg's default conversion of 4:2:0 to
 // RGB does (swscale), so what the reference pipelines (transformers' and qwen-vl-utils' readers) give the model.
 // (Interpolating the chroma, the more faithful picture, moved colorful frames by 5 to 7 steps on average.)
 __device__ __forceinline__ void rgb_at(const Src& s, int x, int y, uint8_t out[3]) {
   float u, v;
-  chroma_at(s, x >> 1, y >> 1, u, v);
+  chroma_at(s, x >> s.cx, y >> s.cy, u, v);
   const Yuv2Rgb& c = s.c;
   const float yy = (luma_at(s, x, y) - c.y0) * c.ry, uu = u - c.c0, vv = v - c.c0;
   out[0] = uint8_t(fminf(fmaxf(rintf(yy + c.rv * vv), 0.f), 255.f));
   out[1] = uint8_t(fminf(fmaxf(rintf(yy + c.gu * uu + c.gv * vv), 0.f), 255.f));
   out[2] = uint8_t(fminf(fmaxf(rintf(yy + c.bu * uu), 0.f), 255.f));
+}
+
+// RGB [h][w][3] turned k quarter turns counter-clockwise (numpy's rot90(src, k)) into dst ([w][h][3] for odd k).
+__global__ void turn_kernel(const uint8_t* src, int w, int h, int k, uint8_t* dst) {
+  const int dw = k % 2 ? h : w, dh = k % 2 ? w : h;
+  const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y;
+  if (x >= dw) return;
+  int sx, sy;
+  if (k == 1) sx = w - 1 - y, sy = x;
+  else if (k == 2) sx = w - 1 - x, sy = h - 1 - y;
+  else sx = y, sy = h - 1 - x;
+  const uint8_t* a = src + (size_t(sy) * w + sx) * 3;
+  uint8_t* o = dst + (size_t(y) * dw + x) * 3;
+  o[0] = a[0], o[1] = a[1], o[2] = a[2];
 }
 
 __global__ void rgb_kernel(Src s, uint8_t* out) {
@@ -700,13 +736,18 @@ VideoDecodeStats video_frames(const uint8_t* data, size_t n, const std::vector<i
   std::unique_ptr<Resize> rs;
   std::mutex mu;
   struct Bufs {
-    uint8_t *tmp = nullptr, *dev = nullptr;
+    uint8_t *tmp = nullptr, *dev = nullptr, *turned = nullptr;
   };
+  const int k_turn = track.rotation;
+  int rw = 0, rh = 0;  // (the resize's output: the upright size turned back for odd k_turn)
   std::deque<std::pair<cudaStream_t, Bufs>> bufs;  // (per session's stream; a deque keeps the others in place)
   int fw = 0, fh = 0;
   size_t frame = 0;
   auto cleanup = [&] {  // (every session's work is done: they synchronize each frame)
-    for (auto& [s, b] : bufs) cudaFreeAsync(b.tmp, xs), cudaFreeAsync(b.dev, xs);
+    for (auto& [s, b] : bufs) {
+      cudaFreeAsync(b.tmp, xs), cudaFreeAsync(b.dev, xs);
+      if (b.turned) cudaFreeAsync(b.turned, xs);
+    }
     rs.reset();
     cudaStreamSynchronize(xs);
     cudaStreamDestroy(xs);
@@ -718,8 +759,10 @@ VideoDecodeStats video_frames(const uint8_t* data, size_t n, const std::vector<i
         std::lock_guard<std::mutex> lk(mu);
         if (!rs) {
           fw = f.width, fh = f.height;
-          const int ow = out_w ? out_w : fw, oh = out_h ? out_h : fh;
-          rs = std::make_unique<Resize>(fw, fh, ow, oh, xs);
+          const int uw = k_turn % 2 ? fh : fw, uh = k_turn % 2 ? fw : fh;  // (upright)
+          const int ow = out_w ? out_w : uw, oh = out_h ? out_h : uh;
+          rw = k_turn % 2 ? oh : ow, rh = k_turn % 2 ? ow : oh;
+          rs = std::make_unique<Resize>(fw, fh, rw, rh, xs);
           frame = size_t(ow) * oh * 3;
         }
         if (f.width != fw || f.height != fh) throw VideoError("the video's frames change size");
@@ -730,12 +773,20 @@ VideoDecodeStats video_frames(const uint8_t* data, size_t n, const std::vector<i
           b = &bufs.back().second;
           Q27_CUDA(cudaMallocAsync(reinterpret_cast<void**>(&b->tmp), std::max<size_t>(1, rs->tmp_bytes()), xs));
           Q27_CUDA(cudaMallocAsync(reinterpret_cast<void**>(&b->dev), frame, xs));
+          if (k_turn) Q27_CUDA(cudaMallocAsync(reinterpret_cast<void**>(&b->turned), frame, xs));
           Q27_CUDA(cudaStreamSynchronize(xs));
         }
       }
       const size_t k = size_t(std::lower_bound(want.begin(), want.end(), i) - want.begin());
       rs->run(f, b->tmp, b->dev, s);
-      Q27_CUDA(cudaMemcpyAsync(out + k * frame, b->dev, frame, cudaMemcpyDeviceToHost, s));
+      const uint8_t* res = b->dev;
+      if (k_turn) {
+        const int dw = k_turn % 2 ? rh : rw;
+        turn_kernel<<<dim3((dw + 127) / 128, k_turn % 2 ? rw : rh), 128, 0, s>>>(b->dev, rw, rh, k_turn, b->turned);
+        Q27_CUDA(cudaGetLastError());
+        res = b->turned;
+      }
+      Q27_CUDA(cudaMemcpyAsync(out + k * frame, res, frame, cudaMemcpyDeviceToHost, s));
     });
     cleanup();
     return st;

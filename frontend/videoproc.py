@@ -109,11 +109,17 @@ class VideoProcessor:
         std = [_f32(_f32(v) * _f32(1.0 / rescale)) for v in c.get("image_std", [0.5] * 3)]
         self.norm = tuple(mean + std)
 
-    def plan(self, total, fps, width, height, frame_pixels=None):
+    def plan(self, total, fps, width, height, frame_pixels=None, options=None):
         """The Plan of a video of `total` frames at `fps` of width x height (frame_pixels: a further cap on the
-        pixels of a frame, the vision tower's IMAGE_MAX_PIXELS)."""
-        n = int(total / fps * self.fps)
-        n = min(max(n, self.min_frames), self.max_frames, total)
+        pixels of a frame, the vision tower's IMAGE_MAX_PIXELS). options: a request's overrides (options_of):
+        "fps" (frames sampled per second) or "num_frames" (that many, as transformers' sample_frames takes them),
+        "min_frames" / "max_frames" (the bounds of the fps count)."""
+        o = options or {}
+        if "num_frames" in o:
+            n = min(o["num_frames"], MAX_FRAMES)
+        else:
+            n = int(total / fps * o.get("fps", self.fps))
+            n = min(max(n, o.get("min_frames", self.min_frames)), o.get("max_frames", self.max_frames), total)
         indices = linspace_round(total - 1, n)
         factor = self.patch * self.merge
         per_frame = max(min(self.max_video_tokens * factor * factor, self.max_pixels // n), int(self.min_pixels * 1.05))
@@ -126,6 +132,35 @@ class VideoProcessor:
         stamps = [i / fps for i in indices]
         times = tuple((stamps[k] + stamps[k + t - 1]) / 2 for k in range(0, len(stamps), t))
         return Plan(tuple(indices), (rw, rh), (len(indices) // t, rh // self.patch, rw // self.patch), times)
+
+
+MAX_FRAMES = 768  # (the most frames a request may ask for: the processor's own max_frames)
+
+
+def options_of(kw):
+    """A request's video options (vLLM's `mm_processor_kwargs`: fps, num_frames, min_frames, max_frames), checked;
+    None without any. Raises ValueError (HTTP 400) for a bad value; other keys are ignored."""
+    if kw is None:
+        return None
+    if not isinstance(kw, dict):
+        raise ValueError("mm_processor_kwargs must be an object")
+    out = {}
+    if "fps" in kw:
+        v = kw["fps"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 60:
+            raise ValueError("mm_processor_kwargs.fps must be a number in (0, 60]")
+        out["fps"] = float(v)
+    for k in ("num_frames", "min_frames", "max_frames"):
+        if k in kw:
+            v = kw[k]
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= MAX_FRAMES:
+                raise ValueError(f"mm_processor_kwargs.{k} must be an integer in [1, {MAX_FRAMES}]")
+            out[k] = v
+    if "fps" in out and "num_frames" in out:
+        raise ValueError("mm_processor_kwargs: fps and num_frames are mutually exclusive")
+    if out.get("min_frames", 1) > out.get("max_frames", MAX_FRAMES):
+        raise ValueError("mm_processor_kwargs: min_frames is above max_frames")
+    return out or None
 
 
 def tail(plan, g):

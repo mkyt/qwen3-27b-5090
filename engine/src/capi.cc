@@ -423,13 +423,14 @@ int q27_mm_put(void* m, int i, const bf16* in) {
   return guard([&] { static_cast<Model*>(m)->mm_put(i, in); });
 }
 
-// Videos: the container's video track (no CUDA): out [6] = codec (VideoCodec), width, height, frames, frames
+// Videos: the container's video track (no CUDA): out [6] = codec (VideoCodec), width, height (upright: a rotated
+// video's turned), frames, frames
 // per second, frames an edit list leaves out at the start. -3: the file cannot be used (q27_last_error).
 int q27_video_probe(const uint8_t* data, int64_t n, double* out) {
   return guard([&] {
     const VideoTrack t = video_demux(data, size_t(n));
-    const double v[6] = {double(t.codec), double(t.width), double(t.height), double(t.frames()), t.fps,
-                         double(t.skip_front)};
+    const double v[6] = {double(t.codec), double(t.display_width()), double(t.display_height()), double(t.frames()),
+                         t.fps, double(t.skip_front)};
     std::memcpy(out, v, sizeof v);
   });
 }

@@ -395,7 +395,10 @@ over the temporal patch instead of one image twice; attention, position embeddin
   lists included; every offset and count checked against the file; `engine/src/video_mkv.cc`: Matroska / WebM on
   libwebm's `mkvparser`, the frame rate from `DefaultDuration` as libavformat rounds it, else from the frames'
   timestamps; compressed frames (`ContentEncoding`) are refused) and decodes on NVDEC through the driver's
-  `libnvcuvid` with its bitstream parser (H.264, HEVC, AV1, VP9; 8 or 10 bits; `engine/src/video_nvdec.cu`). No
+  `libnvcuvid` with its bitstream parser (H.264, HEVC, AV1, VP9; 8 or 10 bits; 4:2:0, and 4:2:2 / 4:4:4 where NVDEC
+  decodes them: H.264 and HEVC 4:2:2, HEVC 4:4:4 on an RTX 5090; `engine/src/video_nvdec.cu`). A rotation in the
+  container (an MP4 track's display matrix, Matroska's `ProjectionPoseRoll`, in quarter turns) is applied as FFmpeg
+  applies it: the frames are resized to the turned size and then turned, so a portrait phone video comes upright. No
   FFmpeg: PyAV's wheel doubled the serving image. The server reads the frame count, rate and size from the header
   (`q27_video_probe`, no GPU), enough for the plan (the frames, the size, the token ids and the times); the engine
   process decodes the videos it has to encode while the request waits. Pairs in a cached prefix are not encoded

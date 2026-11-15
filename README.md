@@ -230,10 +230,12 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
 - Send the previous turns' reasoning back: the chat template renders it, and the prefix cache only hits when it is there.
 - Images and videos as data URLs or http(s) URLs: `image_url` parts, and `video_url` parts as vLLM takes them
   (`{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`; up to 256 MB): MP4 / MOV or Matroska / WebM
-  with H.264, HEVC, AV1 or VP9, decoded on the GPU's video decoder (NVDEC). A video is sampled
+  with H.264, HEVC, AV1 or VP9 (4:2:0; H.264 and HEVC also 4:2:2, HEVC 4:4:4; 8 or 10 bits), decoded on the GPU's
+  video decoder (NVDEC); a phone video's rotation is applied. A video is sampled
   at 2 frames per second (4 to 768 frames) and costs at most 12,288 tokens, as the checkpoint's processor does it
   with qwen-vl-utils' per-frame cap; the model sees each second's pair of frames with its time
-  ([Images and videos](docs/architecture.md#11-vision-tower)).
+  ([Images and videos](docs/architecture.md#11-vision-tower)). A request can sample otherwise with vLLM's
+  `"mm_processor_kwargs": {"fps": 1}` (or `num_frames`, `min_frames`, `max_frames`).
 - Special tokens written in messages (e.g. `<|im_start|>` in a pasted file or a tool result) are read as text, not as
   turn markers. `/v1/completions` takes them as tokens.
 

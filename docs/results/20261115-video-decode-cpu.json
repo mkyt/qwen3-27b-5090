@@ -1,0 +1,59 @@
+[
+ {
+  "file": "bench_4k_av1_10.mp4",
+  "size": [
+   3840,
+   2160
+  ],
+  "frames": 1800,
+  "sampled": 120,
+  "nvdec": {
+   "wall_s": 4.544,
+   "cpu_s": 1.28,
+   "setup_ms": 114,
+   "decoded": 1800
+  },
+  "pyav_cpu": {
+   "wall_s": 8.982,
+   "cpu_s": 43.43
+  }
+ },
+ {
+  "file": "bench_4k_hevc_10.mp4",
+  "size": [
+   3840,
+   2160
+  ],
+  "frames": 1800,
+  "sampled": 120,
+  "nvdec": {
+   "wall_s": 4.049,
+   "cpu_s": 1.46,
+   "setup_ms": 105,
+   "decoded": 1800
+  },
+  "pyav_cpu": {
+   "wall_s": 6.605,
+   "cpu_s": 50.79
+  }
+ },
+ {
+  "file": "bench_1080_h264.mp4",
+  "size": [
+   1920,
+   1080
+  ],
+  "frames": 1800,
+  "sampled": 120,
+  "nvdec": {
+   "wall_s": 1.474,
+   "cpu_s": 0.46,
+   "setup_ms": 63,
+   "decoded": 1800
+  },
+  "pyav_cpu": {
+   "wall_s": 1.282,
+   "cpu_s": 15.26
+  }
+ }
+]

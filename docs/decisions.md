@@ -384,6 +384,12 @@ gate without an explicit decision, recorded below with its numbers.
   `mkvparser` (vendored, BSD; continuously fuzzed upstream), whose EBML parsing is not worth writing again. No CPU fallback: codecs NVDEC does not
   decode get HTTP 400. Each pixel takes its 2x2 block's chroma, as FFmpeg's default conversion: interpolating it
   moved colorful frames 5 to 7 steps away from what the reference readers (transformers', qwen-vl-utils') give.
+- **A video's rotation is applied, unlike transformers' default reader.** PyAV (transformers' default) returns the
+  frames as stored and leaves `frame.rotation` to the caller, so a portrait phone video reaches the model on its
+  side; FFmpeg's command line, players and browsers turn it. The engine turns it the way FFmpeg does.
+- **10-bit chroma as for 8 bits.** Each pixel takes its block's chroma sample at every bit depth. FFmpeg's 8-bit
+  conversion does the same; for 10-bit HEVC its RGB is within 1.3 steps of ours, for 10-bit H.264 (rare) it is 4 to
+  6 steps away on average by a conversion not reproduced here.
 - **NVDEC's memory lent by the KV pool, not reserved.** A decode takes up to 0.8 GiB (4K, two decoders) that the
   driver allocates outside the plan. A fixed reserve would cost every user 6.5% of the KV cache (about 47K tokens),
   and nothing at all leaves a full process 0.5 GiB past the budget for the decode. The KV pool is mapped through

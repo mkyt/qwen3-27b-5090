@@ -4,6 +4,7 @@
 // the frames' timestamps). mkvparser checks the elements against the file's length; the frames are checked
 // again here.
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -112,6 +113,11 @@ VideoTrack mkv_demux(const uint8_t* d, size_t n) {
   const long long w = vt->GetWidth(), h = vt->GetHeight();
   if (w <= 0 || h <= 0 || w > 65535 || h > 65535) bad("bad frame size");
   v.width = int(w), v.height = int(h);
+  // The rotation FFmpeg writes as ProjectionPoseRoll (degrees counter-clockwise, as its display matrix).
+  if (const mkvparser::Projection* pj = vt->GetProjection(); pj && pj->pose_roll != mkvparser::Projection::kValueNotPresent) {
+    const long q = std::lround(pj->pose_roll / 90.0);
+    if (std::fabs(pj->pose_roll - 90.0 * q) < 1.0) v.rotation = int(((q % 4) + 4) % 4);
+  }
   size_t priv_n = 0;
   const unsigned char* priv = vt->GetCodecPrivate(priv_n);
   try {

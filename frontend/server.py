@@ -166,12 +166,13 @@ class Images:
         except Exception as e:  # noqa: BLE001 - any decoder error is the client's
             raise ApiError(400, f"cannot decode {kind}: {e}") from e
 
-    def prepare(self, ids, media, pads, encode):
+    def prepare(self, ids, media, pads, encode, video_options=None):
         """(ids with each image's and video's pad expanded, [(start, gh, gw)] per image and pair of video frames,
         [source per span], [(encoded video, videoproc.Plan) per video]). The source of an image's span is
         ("image", encoded image, resized (width, height), norm) for imageproc.rgb and q27_mm_encode_rgb, of a
         video's pair ("video", video index, pair index, norm). pads: the ids of <|image_pad|>, <|video_pad|>,
-        <|vision_start|>, <|vision_end|>; encode(text) -> ids (the pairs' times)."""
+        <|vision_start|>, <|vision_end|>; encode(text) -> ids (the pairs' times). video_options: the request's
+        (videoproc.options_of)."""
         import hashlib
 
         from qwen27b.image_tokens import image_token_ids
@@ -196,7 +197,7 @@ class Images:
                 out.extend(image_token_ids(raw + repr(([1, gh, gw], self.max_pixels)).encode(), n))
                 continue
             try:
-                plan = self.video.plan(*size, frame_pixels=self.max_pixels)
+                plan = self.video.plan(*size, frame_pixels=self.max_pixels, options=video_options)
             except ValueError as e:
                 raise ApiError(400, f"cannot use the video: {e}") from e
             pairs, gh, gw = plan.grid
@@ -207,7 +208,9 @@ class Images:
                 out.append(vstart)
                 spans.append((len(out), gh // 2, gw // 2))
                 srcs.append(("video", len(videos), g, self.video.norm))
-                out.extend(image_token_ids(digest + repr((plan.grid, plan.size, g)).encode(), n))
+                # (the pair's own frames: plans of other options may share the grid)
+                pair = plan.indices[2 * g:2 * g + 2]
+                out.extend(image_token_ids(digest + repr((plan.grid, plan.size, g, pair)).encode(), n))
                 out.append(vend)
             videos.append((raw, plan))
         if k != len(loaded):
@@ -780,7 +783,7 @@ class Server:
         with self.tok_lock:
             self.tok = tok
 
-    def render(self, messages, tools, kwargs):
+    def render(self, messages, tools, kwargs, video=None):
         """Prompt ids (images and videos expanded) and the images, of chat messages. Special tokens' strings in what
         the client wrote stay text (Tokenizer.prompt_ids): only the template opens and ends turns, and places
         images and videos."""
@@ -796,7 +799,13 @@ class Server:
             if proc is None:
                 raise ApiError(400, "this server does not take images or videos (start the engine with VISION=host, "
                                     "fp8 or bf16)")
-            ids, spans, srcs, videos = proc.prepare(ids, media, self.pads, self.encode)
+            try:
+                from videoproc import options_of
+
+                opts = options_of(video)
+            except ValueError as e:
+                raise ApiError(400, str(e)) from e
+            ids, spans, srcs, videos = proc.prepare(ids, media, self.pads, self.encode, opts)
             images = (spans, srcs, videos)
         return ids, images
 
@@ -1140,7 +1149,7 @@ class Handler(BaseHTTPRequestHandler):
         choice = tool_choice_of(body.get("tool_choice"), tools)
         parse_tools = tools is not None and choice[0] != "none"
         messages = normalize_messages(body.get("messages"))
-        ids, images = self.srv.render(messages, tools, kwargs)
+        ids, images = self.srv.render(messages, tools, kwargs, body.get("mm_processor_kwargs"))
         left = self.srv.limit(len(ids))
         max_new = body.get("max_completion_tokens") or body.get("max_tokens") or left
         if max_new <= 0:
@@ -1412,7 +1421,7 @@ class Handler(BaseHTTPRequestHandler):
         messages, tools, namespaces, custom = responses_messages(body)
         kwargs = responses_template_kwargs(body, self.srv.thinking_default)
         thinking = kwargs.get("enable_thinking", True) is not False
-        ids, images = self.srv.render(normalize_messages(messages), tools, kwargs)
+        ids, images = self.srv.render(normalize_messages(messages), tools, kwargs, body.get("mm_processor_kwargs"))
         left = self.srv.limit(len(ids))
         max_new = min(body.get("max_output_tokens") or left, left)
         choice = tool_choice_of(body.get("tool_choice"), tools)
@@ -1562,7 +1571,8 @@ class Handler(BaseHTTPRequestHandler):
     def tokenize(self, body):
         if "messages" in body:
             kwargs = template_kwargs(body, self.srv.thinking_default)
-            ids, _ = self.srv.render(normalize_messages(body["messages"]), body.get("tools"), kwargs)
+            ids, _ = self.srv.render(normalize_messages(body["messages"]), body.get("tools"), kwargs,
+                                     body.get("mm_processor_kwargs"))
         else:
             ids = self.srv.encode(body.get("prompt", ""))
         self._json(200, {"tokens": ids, "count": len(ids), "max_model_len": self.srv.max_tokens})

@@ -88,6 +88,30 @@ Through the server (`scripts/bench_agentic.py --scenarios agent,longctx`).
   happened in the runs after the agent scenario on 2026-11-14, while a run of longctx alone reused all of it
   ([results/20261114-164555-lc-latest.json](results/20261114-164555-lc-latest.json)).
 
+### Video input
+
+A 60-second video at 30 fps is sampled to 120 frames (60 pairs, 11,400 tokens at 608 x 320); the engine decodes it
+on NVDEC and resizes the sampled frames on the GPU ([results/20261115-video-decode.json](results/20261115-video-decode.json);
+FFmpeg's CPU decoder and RGB conversion through PyAV, `pyav_cpu` in
+[results/20261115-video-decode-cpu.json](results/20261115-video-decode-cpu.json)):
+
+| Video | 2 decoders | 1 decoder | FFmpeg on 24 CPU threads (PyAV) |
+| --- | ---: | ---: | ---: |
+| 4K AV1 10-bit, 160 MB | 2.55 s | 4.17 s | 8.98 s (43 s of CPU time) |
+| 4K HEVC 10-bit, 227 MB | 2.00 s | 3.36 s | 6.61 s (51 s) |
+| 1080p H.264, 160 MB | 1.07 s | 1.47 s | 1.28 s (15 s) |
+
+Through the API, the 4K AV1 video with a question takes 5.3 to 5.7 s to the first token (decode, vision tower,
+prefill); asking about it again with another question takes 1.8 s, since only the pair the prefix cache does not
+hold is decoded and encoded. While a video decodes, the KV pool lends the decoder's memory (about 1 GiB for 4K on
+two decoders) and takes it back afterwards: the process never goes past its VRAM budget, and the KV cache holds as
+many tokens as without video support.
+
+On video prompts the engine is as close to the reference model as on images: on the text after the video, top-1
+agreement 95 to 100% and mean KL 0.01 to 0.10 ([results/20261115-video-golden.txt](results/20261115-video-golden.txt)).
+The timestamp text between the frame pairs is far more sensitive: there the reference model differs from itself by as
+much when only its vision embeddings are the engine's.
+
 ### KV cache capacity
 
 The KV pool holds 601,856 tokens with the defaults (605,504 with `SPEC=dflash2`: DSpine's tables take 0.25 GiB more) (the server log prints the memory plan at startup). One request can

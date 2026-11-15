@@ -36,6 +36,10 @@ struct VideoTrack {
   std::vector<VideoSample> samples;   // in decode order
   double fps = 0;                     // samples / duration (libavformat's average frame rate)
   int skip_front = 0;                 // frames an edit list leaves out at the start (in presentation order)
+  int rotation = 0;                   // quarter turns counter-clockwise that show a frame upright (the container's
+                                      // display matrix / ProjectionPoseRoll, as FFmpeg applies them; 0 .. 3)
+  int display_width() const { return rotation % 2 ? height : width; }
+  int display_height() const { return rotation % 2 ? width : height; }
   int frames() const { return int(samples.size()); }
 };
 
@@ -48,13 +52,15 @@ VideoTrack mkv_demux(const uint8_t* data, size_t n);
 // CodecPrivate holds as well) for v.codec.
 void video_configure(const std::vector<uint8_t>& config, VideoTrack& v);
 
-// A decoded frame on the device: NV12 (8-bit) or P016 (more bits, in the high bits of 16), pitch-linear,
-// luma then interleaved chroma at chroma; colors per matrix / full_range (H.273 matrix_coefficients).
+// A decoded frame on the device: NV12 / NV16 / YUV444 (8-bit) or P016 / P216 / YUV444_16Bit (more bits, in the high
+// bits of 16), pitch-linear, luma then the chroma at chroma (interleaved, or 4:4:4's U and V planes); colors per matrix / full_range (H.273 matrix_coefficients).
 struct VideoFrame {
   const uint8_t* luma = nullptr;
   const uint8_t* chroma = nullptr;
   size_t pitch = 0;
   int width = 0, height = 0, bits = 8;
+  int chroma_format = 0;  // 0: 4:2:0 (NV12 / P016), 1: 4:2:2 (NV16 / P216, chroma rows as tall as luma),
+                          // 2: 4:4:4 (planar U then V, each as large as luma)
   int matrix = 2, full_range = 0;
 };
 
@@ -86,7 +92,8 @@ VideoMemory video_memory(const uint8_t* data, size_t n, int out_w, int out_h, in
 void video_frame_rgb(const VideoFrame& f, uint8_t* out, cudaStream_t s);
 
 // Frames want[] of a video resized to out_w x out_h (0: their own size) as RGB [h][w][3] uint8 into host
-// memory out, one after another: PIL's bicubic resize (Image.resize, the same bytes) of video_frame_rgb.
+// memory out, one after another: PIL's bicubic resize (Image.resize, the same bytes) of video_frame_rgb. A rotated
+// video's frames come upright (out_w x out_h is the upright size): resized to the turned size, then turned.
 // The frames past the stream's end stay as they are (stats.presented tells). sessions as video_decode.
 VideoDecodeStats video_frames(const uint8_t* data, size_t n, const std::vector<int>& want, int out_w, int out_h,
                               uint8_t* out, int sessions = 0);
