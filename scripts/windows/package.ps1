@@ -70,6 +70,11 @@ Copy-Item engine\build\q27.dll "$app\engine\build\"
 Set-Content -Encoding ascii -NoNewline -Path (Join-Path $app "VERSION") -Value $Version  # (update.ps1 compares it with the release)
 Get-ChildItem -Recurse -Directory -Filter __pycache__ $app | Remove-Item -Recurse -Force
 Copy-Item LICENSE $dst
+# (the notices of the code compiled into q27.dll: libwebm's mkvparser, BSD; NVIDIA's NVDEC headers, MIT)
+New-Item -ItemType Directory -Force "$dst\licenses" | Out-Null
+Copy-Item engine\src\third_party\libwebm\LICENSE.TXT "$dst\licenses\libwebm-LICENSE.txt"
+Copy-Item engine\src\third_party\libwebm\PATENTS.TXT "$dst\licenses\libwebm-PATENTS.txt"
+Copy-Item engine\src\third_party\nvcodec\LICENSE.txt "$dst\licenses\nv-codec-headers-LICENSE.txt"
 Copy-Item scripts\windows\start.cmd, scripts\windows\update.cmd, scripts\windows\settings.example.ini $dst
 Copy-Item windows\tray\build\qwen3-27b-tray.exe $dst
 

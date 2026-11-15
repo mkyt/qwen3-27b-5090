@@ -1150,16 +1150,23 @@ void Model::mm_set(const int32_t* spans, int n) {
   Q27_CUDA(cudaStreamSynchronize(s_));
 }
 
-void Model::mm_encode(int i, const VisionPixels& pixels) {
-  Q27_CHECK(opt_.vision && i >= 0 && i < int(mm_spans_.size()), "mm_encode: no such image");
+void Model::mm_encode(int i, const VisionPixels* pixels, int n) {
+  Q27_CHECK(opt_.vision && n > 0 && i >= 0 && i + n <= int(mm_spans_.size()), "mm_encode: no such image");
   const MmSpan& sp = mm_spans_[i];
+  for (int k = 1; k < n; k++)  // (rows of consecutive spans are consecutive: mm_set)
+    Q27_CHECK(mm_spans_[i + k].gh == sp.gh && mm_spans_[i + k].gw == sp.gw, "mm_encode: images of different grids");
   const int gh = sp.gh * vdims::kMerge, gw = sp.gw * vdims::kMerge;
-  Q27_CHECK(int64_t(gh) * gw * vdims::kPatchPixels * vdims::kPatchPixels <= opt_.image_max_pixels,
-            "image larger than IMAGE_MAX_PIXELS");
+  const int64_t pixels_each = int64_t(gh) * gw * vdims::kPatchPixels * vdims::kPatchPixels;
+  Q27_CHECK(pixels_each <= opt_.image_max_pixels, "image larger than IMAGE_MAX_PIXELS");
+  const int per = int(std::min<int64_t>(n, opt_.image_max_pixels / pixels_each));  // (images per pass: the workspace)
   spec_flush();
   Q27_CUDA(cudaStreamSynchronize(s_));  // (the workspace overlays the prefill activations)
   mark("vision");
-  vision_encode(w_.vision, pixels, gh, gw, mm_ + size_t(sp.row) * kHidden, vis_ws_, vis_ws_bytes_, s_);
+  for (int k = 0; k < n; k += per) {
+    const int m = std::min(per, n - k);
+    vision_encode(w_.vision, pixels + k, m, gh, gw, mm_ + size_t(mm_spans_[i + k].row) * kHidden, vis_ws_,
+                  vis_ws_bytes_, s_);
+  }
   Q27_CUDA(cudaStreamSynchronize(s_));
   profile_collect();
 }

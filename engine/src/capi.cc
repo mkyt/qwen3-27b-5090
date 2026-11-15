@@ -10,6 +10,7 @@
 #include "kernels.h"
 #include "draft.h"
 #include "model.h"
+#include "video.h"
 
 using namespace q27;
 
@@ -25,6 +26,9 @@ int guard(F&& f) {
   } catch (const KvFull& e) {  // (recoverable: the caller frees pages and retries)
     g_error = e.what();
     return -2;
+  } catch (const VideoError& e) {  // (the client's video cannot be used: HTTP 400)
+    g_error = e.what();
+    return -3;
   } catch (const std::exception& e) {
     g_error = e.what();
     return -1;
@@ -382,11 +386,26 @@ int q27_mm_encode(void* m, int i, const float* pixels) {
   return guard([&] {
     VisionPixels px;
     px.patches = pixels;
-    static_cast<Model*>(m)->mm_encode(i, px);
+    static_cast<Model*>(m)->mm_encode(i, &px);
   });
 }
 int q27_mm_encode_rgb(void* m, int i, const uint8_t* rgb, const float* norm) {
-  return guard([&] { static_cast<Model*>(m)->mm_encode(i, rgb_pixels(rgb, norm)); });
+  return guard([&] {
+    const VisionPixels px = rgb_pixels(rgb, norm);
+    static_cast<Model*>(m)->mm_encode(i, &px);
+  });
+}
+// A video's frame pairs i .. i + n - 1 (spans of one grid): frames [2n] resized frames as in q27_mm_encode_rgb,
+// the pair of span i + k being frames[2k], frames[2k + 1].
+int q27_mm_encode_frames(void* m, int i, int n, const uint8_t* const* frames, const float* norm) {
+  return guard([&] {
+    std::vector<VisionPixels> px(std::max(n, 0));
+    for (int k = 0; k < n; k++) {
+      px[k] = rgb_pixels(frames[2 * k], norm);
+      px[k].rgb2 = frames[2 * k + 1];
+    }
+    static_cast<Model*>(m)->mm_encode(i, px.data(), n);
+  });
 }
 int q27_mm_embeds(void* m, int i, bf16* out) {
   return guard([&] { static_cast<Model*>(m)->mm_embeds(i, out); });
@@ -394,6 +413,30 @@ int q27_mm_embeds(void* m, int i, bf16* out) {
 
 int q27_mm_put(void* m, int i, const bf16* in) {
   return guard([&] { static_cast<Model*>(m)->mm_put(i, in); });
+}
+
+// Videos: the container's video track (no CUDA): out [6] = codec (VideoCodec), width, height, frames, frames
+// per second, frames an edit list leaves out at the start. -3: the file cannot be used (q27_last_error).
+int q27_video_probe(const uint8_t* data, int64_t n, double* out) {
+  return guard([&] {
+    const VideoTrack t = video_demux(data, size_t(n));
+    const double v[6] = {double(t.codec), double(t.width), double(t.height), double(t.frames()), t.fps,
+                         double(t.skip_front)};
+    std::memcpy(out, v, sizeof v);
+  });
+}
+
+// Frames want[n_want] (ascending) of a video, decoded on NVDEC and resized on the GPU to out_w x out_h (0: their
+// size; PIL's bicubic), as RGB [h][w][3] uint8 into out (host), one after another. sessions: parallel decoders
+// (0: one per NVDEC engine). stats [5] = frames presented, pictures decoded, sessions, setup ms, total ms.
+int q27_video_frames(const uint8_t* data, int64_t n, const int32_t* want, int n_want, int out_w, int out_h, int sessions,
+                     uint8_t* out, double* stats) {
+  return guard([&] {
+    const VideoDecodeStats st = video_frames(data, size_t(n), std::vector<int>(want, want + n_want), out_w, out_h, out,
+                                             sessions);
+    const double v[5] = {double(st.presented), double(st.decoded), double(st.sessions), st.setup_ms, st.total_ms};
+    std::memcpy(stats, v, sizeof v);
+  });
 }
 
 int q27_debug_kv(void* m, int layer, int pos, int n, void* out) {

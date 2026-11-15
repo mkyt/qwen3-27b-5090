@@ -228,7 +228,12 @@ context limit, VRAM budget), showing for every choice the context it leaves befo
   `CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144`.
 - **Codex** (Responses API): a provider with `base_url = "http://127.0.0.1:8000/v1"` and `wire_api = "responses"`.
 - Send the previous turns' reasoning back: the chat template renders it, and the prefix cache only hits when it is there.
-- Images as data URLs or http(s) URLs. No video.
+- Images and videos as data URLs or http(s) URLs: `image_url` parts, and `video_url` parts as vLLM takes them
+  (`{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`; up to 256 MB): MP4 / MOV or Matroska / WebM
+  with H.264, HEVC, AV1 or VP9, decoded on the GPU's video decoder (NVDEC). A video is sampled
+  at 2 frames per second (4 to 768 frames) and costs at most 12,288 tokens, as the checkpoint's processor does it
+  with qwen-vl-utils' per-frame cap; the model sees each second's pair of frames with its time
+  ([Images and videos](docs/architecture.md#11-vision-tower)).
 - Special tokens written in messages (e.g. `<|im_start|>` in a pasted file or a tool result) are read as text, not as
   turn markers. `/v1/completions` takes them as tokens.
 
@@ -348,7 +353,7 @@ End-to-end checks against a running server (`docker compose up -d serve`; `--bui
 ```bash
 python3 scripts/smoke_test.py                # a few requests
 python3 scripts/api_test.py                  # OpenAI / Anthropic APIs: streaming, tool calls, reasoning
-python3 scripts/vision_api_test.py           # images
+python3 scripts/vision_api_test.py           # images and videos
 ```
 
 The integration tests under `scripts/` (`decode_consistency.py`, `multiseq_test.py`, `prefix_cache_test.py`,

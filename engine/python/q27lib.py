@@ -48,6 +48,9 @@ SIGNATURES = {
     "q27_mm_set": ([P, P, I], I),
     "q27_mm_encode": ([P, I, P], I),
     "q27_mm_encode_rgb": ([P, I, P, P], I),
+    "q27_mm_encode_frames": ([P, I, I, P, P], I),
+    "q27_video_probe": ([P, I64, P], I),
+    "q27_video_frames": ([P, I64, P, I, I, I, I, P, P], I),
     "q27_mm_embeds": ([P, I, P], I),
     "q27_mm_put": ([P, I, P], I),
     "q27_debug_kv": ([P, I, I, I, P], I),
@@ -471,6 +474,14 @@ class Engine:
         """Runs the vision tower on image i from the resized image: rgb [32 * gh][32 * gw][3] uint8 bytes, norm
         mean[3] + std[3] (the server's image processor; normalized and arranged into patches on the device)."""
         self._check(lib().q27_mm_encode_rgb(self.h, i, rgb, (ctypes.c_float * 6)(*norm)), "q27_mm_encode_rgb")
+
+    def mm_encode_frames(self, i, frames, norm):
+        """Runs the vision tower on a video's frame pairs, images i .. i + len(frames) // 2 - 1 (one grid): frames
+        the resized frames as in mm_encode_rgb (bytes), two per pair, in order. Batched into few passes."""
+        n = len(frames) // 2
+        ptrs = (ctypes.c_char_p * (2 * n))(*frames[:2 * n])
+        self._check(lib().q27_mm_encode_frames(self.h, i, n, ptrs, (ctypes.c_float * 6)(*norm)),
+                    "q27_mm_encode_frames")
 
     def mm_embeds(self, i, rows):
         """Embeddings of image i as a uint16 (BF16 bits) numpy array [rows, 5120]."""

@@ -86,9 +86,10 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
   memory plan does not depend on a profiling run. (In the vLLM setup this replaced, the KV cache size varied
   between 4.3 and 6.5 GiB from one start to the next.) PyTorch is used only by the reference model and the tests.
   The server does not use it either, nor transformers: the tokenizer is `tokenizers` on the checkpoint's
-  `tokenizer.json`, the chat template renders with jinja2 as transformers sets it up, and images are
-  resized with PIL and normalized on the GPU (`frontend/requirements.txt`; `frontend/tests/test_tokenizer.py` compares
-  prompts, ids and image grids with transformers). The serving image (`Dockerfile`) is therefore 180 MB (a 45 MB
+  `tokenizer.json`, the chat template renders with jinja2 as transformers sets it up, images are
+  resized with PIL and normalized on the GPU, and videos are read and decoded by the engine library itself
+  (NVDEC; `frontend/requirements.txt`; `frontend/tests/test_tokenizer.py` and `test_videoproc.py` compare prompts,
+  ids, image grids and video frames with transformers). The serving image (`Dockerfile`) is therefore 180 MB (a 45 MB
   download): a distroless base (glibc and libstdc++), the CUDA runtime library, `libq27.so`, Python and those
   packages (1.21 GB on the nvidia/cuda base image, 456 MB of it the forward-compatibility driver package, which
   GeForce GPUs do not use; 350 MB on ubuntu:24.04).
@@ -365,6 +366,40 @@ images.
 - M-RoPE: rows of an image get (t, h, w) positions; after the last image, positions continue as position + delta
   (one device integer), so decode and the speculative graphs are unchanged, and text-only requests are
   bit-identical to the text path.
+
+**Videos.** The checkpoint's video processor samples 2 frames per second (4 to 768, an even count), resizes all of
+them to one size and caps the pixels per frame as qwen-vl-utils does (at most 768 tokens per pair of frames, 12,288
+per video; transformers' default from v5.22). Each pair of frames (the temporal patch) is, to the language model,
+an image of its own after its time as text, `<1.3 seconds><|vision_start|>...<|vision_end|>`, with the M-RoPE
+positions of an image (transformers' `get_rope_index` splits a video the same way), so the engine's image path
+takes it unchanged. In the vision tower a pair differs from an image only in that its patches take the two frames
+over the temporal patch instead of one image twice; attention, position embeddings and RoPE stay within the pair.
+
+- The vision tower encodes many pairs of one grid in one pass (attention over each pair's patches: the third
+  grid dimension of the attention kernel), as many as `IMAGE_MAX_PIXELS` holds, so a 5-minute video's 300 pairs
+  take 0.25 s instead of 300 weight streams (about 20 ms each with `VISION=host`). The result is bit-identical to
+  one pair per call.
+- The engine library reads the container itself (`engine/src/video_mp4.cc`: MP4 / MOV, fragmented files and edit
+  lists included; every offset and count checked against the file; `engine/src/video_mkv.cc`: Matroska / WebM on
+  libwebm's `mkvparser`, the frame rate from `DefaultDuration` as libavformat rounds it, else from the frames'
+  timestamps; compressed frames (`ContentEncoding`) are refused) and decodes on NVDEC through the driver's
+  `libnvcuvid` with its bitstream parser (H.264, HEVC, AV1, VP9; 8 or 10 bits; `engine/src/video_nvdec.cu`). No
+  FFmpeg: PyAV's wheel doubled the serving image. The server reads the frame count, rate and size from the header
+  (`q27_video_probe`, no GPU), enough for the plan (the frames, the size, the token ids and the times); the engine
+  process decodes the videos it has to encode while the request waits. Pairs in a cached prefix are not encoded
+  again.
+- Only the sampled frames leave the decoder: the parser queues four pictures ahead, so decoding overlaps the
+  mapping of a wanted one, which is converted to RGB (BT.601 / 709 / 2020 per the stream, each pixel taking its
+  2x2 block's chroma as FFmpeg's default conversion does, which is what the reference readers give the model) and
+  resized on the GPU in one pass per axis, PIL's bicubic bit for bit (fixed-point weights computed as
+  `libImaging/Resample.c` does). Only the resized frames (at most 75 MB for a video) go to host memory, for the
+  vision tower's input path.
+- One decoding session keeps one NVDEC engine busy (the RTX 5090 has two): a video of 256 frames or more is cut at
+  closed key frames (IDR / BLA, not CRA) into one part per engine, decoded at once; a part that shows another number
+  of frames than its samples (an open GOP after all) makes the video decode again in one part. 60 s at 30 fps,
+  120 frames sampled: 4K AV1 10-bit in 2.65 s (CPU time 1.3 s; FFmpeg on 24 CPU threads: 8.98 s, 43 s of CPU time),
+  4K HEVC 10-bit 2.01 s (6.61 s), 1080p H.264 at 20 Mbit/s 1.01 s (1.28 s). Through the API, the 4K AV1 video
+  (11,954 prompt tokens) answers in 5.7 s.
 
 ## 12. API server
 

@@ -25,7 +25,7 @@ starts. A request waiting for room rather than one suspended later keeps its tur
 Messages (pickled tuples). In: ("submit", rid, request), ("cancel", rid), ("config", changes, n), ("stop",).
 Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids][, logprobs: per id (logprob, [(id, logprob)])]), ("done", rid, finish, info),
 ("prefilled", rid, info: the prompt side of "done"'s info after a prefill ends, for a request a stop string ends),
-("error", rid, message[, HTTP status: 400 for an image that cannot be decoded]), ("metrics", dict), ("config", settings, n: the change answered, or None),
+("error", rid, message[, HTTP status: 400 for an image or video that cannot be decoded]), ("metrics", dict), ("config", settings, n: the change answered, or None),
 ("memory", the pools: once after "ready"), ("stats", snapshot: the requests, KV pool and device memory, every STATS_INTERVAL s while busy),
 ("event", rid, kind, text: an admission wait, a preemption, an engine error).
 """
@@ -54,7 +54,7 @@ def step_ms(n):
 
 
 class ImageError(Exception):
-    """An image of the request cannot be decoded (the client's error: 400)."""
+    """An image or video of the request cannot be decoded (the client's error: 400)."""
 
 
 def log(msg):
@@ -77,8 +77,10 @@ class Seq:
         self.bias = {int(k): float(v) for k, v in (req.get("logit_bias") or {}).items()}
         self.min_tokens, self.ignore_eos = req.get("min_tokens", 0), bool(req.get("ignore_eos"))
         self.rng = random.Random(req.get("seed"))
-        self.images = req.get("images")  # (spans [(start, gh, gw)], [(encoded image, resized size, norm)]) or None
-        self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), started on arrival
+        # (spans [(start, gh, gw)], [source per span], [(encoded video, plan)]) or None: server.py Images.prepare
+        self.images = req.get("images")
+        self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), ("video", k) -> of the
+        #                          video's frames (videoproc.frames), started on arrival
         self.arrival = now
         self.out = []            # generated tokens (EOS excluded)
         self.eng_ids = self.prompt  # what the engine runs (prompt + earlier output after a preemption)
@@ -248,17 +250,32 @@ class Scheduler:
         return m
 
     def prefetch(self, s):
-        """Starts decoding the images that lie past the reusable prefix, which begin() will likely encode, on
-        threads while the request waits (images inside the prefix are decoded only if the cache misses them)."""
-        import imageproc
-
+        """Starts decoding the images and videos that lie past the reusable prefix, which begin() will likely
+        encode, on threads while the request waits (those inside the prefix are decoded only if the cache misses
+        them)."""
         if self.decoder is None:
             from concurrent.futures import ThreadPoolExecutor
 
             self.decoder = ThreadPoolExecutor(2, thread_name_prefix="image")
-        for i, ((start, gh, gw), (raw, size, _)) in enumerate(zip(*s.images)):
+        spans, srcs, _ = s.images
+        for i, ((start, gh, gw), src) in enumerate(zip(spans, srcs)):
             if start + gh * gw > s.reusable:
-                s.decoding[i] = self.decoder.submit(imageproc.rgb, raw, size)
+                key = i if src[0] == "image" else ("video", src[1])
+                if key not in s.decoding:
+                    s.decoding[key] = self.decoder.submit(self.decode, s, key)
+
+    @staticmethod
+    def decode(s, key):
+        """The pixels of image `key` (imageproc.rgb) or the frames of video ("video", k) (videoproc.frames)."""
+        spans, srcs, videos = s.images
+        if isinstance(key, tuple):
+            import videoproc
+
+            return videoproc.frames(*videos[key[1]])
+        import imageproc
+
+        _, raw, size, _ = srcs[key]
+        return imageproc.rgb(raw, size)
 
     def drop_decoding(self, s):
         for f in s.decoding.values():
@@ -546,22 +563,41 @@ class Scheduler:
         else:  # (after a preemption or a forced output)
             log(f"{s.rid}: resumed at {len(s.eng_ids)} tokens, {cached} restored from the prefix cache")
         if s.images:
-            import imageproc
-
-            spans, srcs = s.images
+            spans, srcs, _ = s.images
             self.engine.mm_set(spans)
             t0, encoded, waited = time.time(), 0, 0.0
-            for i, (start, gh, gw) in enumerate(spans):
-                if start + gh * gw > cached:  # (images inside the restored prefix need no embeddings)
-                    raw, size, norm = srcs[i]
-                    t1, f = time.time(), s.decoding.pop(i, None)
-                    try:
-                        rgb = f.result() if f is not None else imageproc.rgb(raw, size)
-                    except Exception as e:  # noqa: BLE001 - any decoder error is the client's
-                        raise ImageError(f"cannot decode image: {e}") from e
+
+            def pixels(key):
+                nonlocal waited
+                t1, f = time.time(), s.decoding.pop(key, None)
+                try:
+                    return f.result() if f is not None else self.decode(s, key)
+                except Exception as e:  # noqa: BLE001 - any decoder error is the client's
+                    raise ImageError(f"cannot decode {'video' if isinstance(key, tuple) else 'image'}: {e}") from e
+                finally:
                     waited += time.time() - t1
-                    self.engine.mm_encode_rgb(i, rgb, norm)
-                    encoded += 1
+
+            i, frames = 0, {}
+            while i < len(spans):
+                start, gh, gw = spans[i]
+                src = srcs[i]
+                if start + gh * gw <= cached:  # (images inside the restored prefix need no embeddings)
+                    i += 1
+                    continue
+                if src[0] == "image":
+                    self.engine.mm_encode_rgb(i, pixels(i), src[3])
+                    i, encoded = i + 1, encoded + 1
+                    continue
+                k = src[1]  # (a video: its pairs from here to its end, encoded together)
+                j = i
+                while j < len(spans) and srcs[j][0] == "video" and srcs[j][1] == k:
+                    j += 1
+                if k not in frames:
+                    frames[k] = pixels(("video", k))
+                g0 = src[2]
+                self.engine.mm_encode_frames(i, frames[k][2 * g0:2 * (g0 + j - i)], src[3])
+                i, encoded = j, encoded + j - i
+            frames.clear()
             self.drop_decoding(s)  # (the pixels are not kept: a suspended request that needs them decodes again)
             log(f"{s.rid}: images {len(spans)} ({sum(gh * gw for _, gh, gw in spans)} tokens), encoded {encoded} "
                 f"in {time.time() - t0:.3f} s ({waited:.3f} s decoding or waiting for it)")

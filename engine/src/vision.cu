@@ -1,8 +1,8 @@
 // Vision tower (P4-12, see vision.h and reference/qwen27b/vision.py).
 //
-// Per image of P patches: patch embed (a GEMM on the flattened patches) + the bilinearly resampled position
+// Per image of P patches (several images of one grid, a video's frame pairs, go through in one pass): patch embed (a GEMM on the flattened patches) + the bilinearly resampled position
 // table, 27 pre-LN blocks, the 2x2 merger. GEMMs are gemm_bf16 (fp32 out); rows are processed in
-// chunks of kRows where a GEMM needs a wide temporary. Attention is non-causal over the image's patches:
+// chunks of kRows where a GEMM needs a wide temporary. Attention is non-causal over each image's patches:
 // a flash-attention kernel with BF16 mma.sync, head_dim 72 padded to 80 in shared memory.
 //
 // VISION=host / fp8: the weight matrices go through two BF16 staging buffers at the end of the workspace,
@@ -87,27 +87,28 @@ struct PixelNorm {
 };
 
 // BF16 patches [n / 1536][1536] from the rgb rows of a band of merge rows that starts with patch p0: element
-// (c, t, y, x) of patch p is pixel (16 * row + y - y0, 16 * col + x) of channel c, (v - mean) / std rounded as
-// the processor's fp32 (no contraction: a subtraction and a division, both round-to-nearest).
-__global__ void rgb_patches_kernel(const uint8_t* rgb, int width, int gw, int64_t p0, int y0, int64_t n, PixelNorm nm,
-                                   bf16* out) {
+// (c, t, y, x) of patch p is pixel (16 * row + y - y0, 16 * col + x) of channel c of frame t (frame 1 at
+// rgb + frame2; 0 for an image, whose two frames are the same), (v - mean) / std rounded as the processor's
+// fp32 (no contraction: a subtraction and a division, both round-to-nearest).
+__global__ void rgb_patches_kernel(const uint8_t* rgb, int64_t frame2, int width, int gw, int64_t p0, int y0, int64_t n,
+                                   PixelNorm nm, bf16* out) {
   constexpr int kPP = kPatchPixels * kPatchPixels, kPerChannel = kPatchDim / 3;
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x) {
-    const int e = int(i % kPatchDim), c = e / kPerChannel, q = e % kPP;
+    const int e = int(i % kPatchDim), c = e / kPerChannel, t = (e / kPP) % 2, q = e % kPP;
     int row, col;
     patch_rc(int(p0 + i / kPatchDim), gw, row, col);
     const int y = row * kPatchPixels + q / kPatchPixels - y0, x = col * kPatchPixels + q % kPatchPixels;
-    const float v = float(rgb[(int64_t(y) * width + x) * 3 + c]);
+    const float v = float(rgb[(t ? frame2 : 0) + (int64_t(y) * width + x) * 3 + c]);
     out[i] = __float2bfloat16_rn(__fdiv_rn(__fsub_rn(v, nm.mean[c]), nm.std[c]));
   }
 }
 
 // x[p] += patch bias + the position table resampled to the gh x gw grid (bilinear, align_corners; the sum
-// rounded to BF16 as the reference). Block per patch.
+// rounded to BF16 as the reference). Block per patch, of images of gh * gw patches each.
 __global__ void pos_embed_kernel(float* x, const bf16* bias, const bf16* table, int gh, int gw) {
   const int p = blockIdx.x;
   int row, col;
-  patch_rc(p, gw, row, col);
+  patch_rc(p % (gh * gw), gw, row, col);
   auto taps = [](int i, int n, int* t, float* w) {
     const float src = float(i) * float(kPosSide - 1) / float(max(n - 1, 1));
     const float f = floorf(src);
@@ -159,11 +160,12 @@ __global__ void __launch_bounds__(128) layernorm_kernel(const float* x, const bf
 }
 
 // qkv rows r0..r0+rows-1 ([rows][3][16][72] fp32, no bias) -> + bias, 2D RoPE on q and k (rotate_half over
-// the 72 dims: frequency j < 18 takes the patch row, 18..35 the column), BF16 into heads [3][16][P][72].
-__global__ void qkv_rope_kernel(const float* qkv, const bf16* bias, int r0, int P, int gw, bf16* heads) {
+// the 72 dims: frequency j < 18 takes the patch row, 18..35 the column, within the patch's image of pi
+// patches), BF16 into heads [3][16][P][72].
+__global__ void qkv_rope_kernel(const float* qkv, const bf16* bias, int r0, int P, int pi, int gw, bf16* heads) {
   const int r = blockIdx.x, p = r0 + r;
   int row, col;
-  patch_rc(p, gw, row, col);
+  patch_rc(p % pi, gw, row, col);
   const float* src = qkv + int64_t(r) * kThreeH;
   for (int e = threadIdx.x; e < kThreeH; e += blockDim.x) {
     const int which = e / kHidden, hd = (e % kHidden) / kHeadDim, d = e % kHeadDim;
@@ -209,18 +211,21 @@ constexpr size_t kAttnSmem = size_t(kBm + 4 * kBn) * kStr * sizeof(bf16);
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) { return uint32_t(__cvta_generic_to_shared(p)); }
 
-// Grid (ceil(P / 64), 16 heads), 128 threads. q, k, v: [16][P][72] BF16; out [P][16 * 72] BF16.
-__global__ void __launch_bounds__(128) vis_attn_kernel(const bf16* q, const bf16* k, const bf16* v, int P,
-                                                       float scale_log2, bf16* out) {
+// Grid (ceil(Pi / 64), 16 heads, images), 128 threads: attention within each image of Pi patches. q, k, v:
+// [16][P][72] BF16; out [P][16 * 72] BF16.
+__global__ void __launch_bounds__(128) vis_attn_kernel(const bf16* q, const bf16* k, const bf16* v, int P_all,
+                                                       int P, float scale_log2, bf16* out) {
   extern __shared__ __align__(16) bf16 sm[];
   bf16* sQ = sm;
   bf16* sK = sQ + kBm * kStr;   // [2][kBn][kStr]
   bf16* sV = sK + 2 * kBn * kStr;
   const int h = blockIdx.y, m0 = blockIdx.x * kBm;
+  const int64_t base = int64_t(blockIdx.z) * P;  // (the image's first patch)
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
-  const bf16* qh = q + int64_t(h) * P * kHeadDim;
-  const bf16* kh = k + int64_t(h) * P * kHeadDim;
-  const bf16* vh = v + int64_t(h) * P * kHeadDim;
+  const bf16* qh = q + (int64_t(h) * P_all + base) * kHeadDim;
+  const bf16* kh = k + (int64_t(h) * P_all + base) * kHeadDim;
+  const bf16* vh = v + (int64_t(h) * P_all + base) * kHeadDim;
+  out += base * kHidden;
 
   // Columns 72..87 of every row stay zero (cp.async fills 0..71).
   for (int r = tid; r < kBm + 4 * kBn; r += 128) {
@@ -466,25 +471,30 @@ void vision_pixels(const VisionPixels& px, int gh, int gw, bf16* out, void* tmp,
     Q27_CHECK(px.rgb, "vision: no pixels");
     PixelNorm nm;
     for (int c = 0; c < 3; c++) nm.mean[c] = px.mean[c], nm.std[c] = px.std[c];
+    const int frames = px.rgb2 ? 2 : 1;  // (the second frame's band follows the first's in tmp)
     const int width = gw * kPatchPixels, band_rows = kMerge * kPatchPixels;
     const int64_t band_bytes = int64_t(band_rows) * width * 3;
-    const int bands = int(std::min<int64_t>(int64_t(tmp_bytes) / band_bytes, gh / kMerge));
+    const int bands = int(std::min<int64_t>(int64_t(tmp_bytes) / (frames * band_bytes), gh / kMerge));
     Q27_CHECK(bands > 0, "vision: image wider than the staging buffer");
     for (int b0 = 0; b0 < gh / kMerge; b0 += bands) {
       const int nb = std::min(bands, gh / kMerge - b0);
       const int64_t p0 = int64_t(b0) * kMerge * gw, n = int64_t(nb) * kMerge * gw * kPatchDim;
-      Q27_CUDA(cudaMemcpyAsync(tmp, px.rgb + b0 * band_bytes, nb * band_bytes, cudaMemcpyHostToDevice, s));
-      rgb_patches_kernel<<<grid_for(n), 256, 0, s>>>(static_cast<const uint8_t*>(tmp), width, gw, p0, b0 * band_rows,
+      auto* t = static_cast<uint8_t*>(tmp);
+      Q27_CUDA(cudaMemcpyAsync(t, px.rgb + b0 * band_bytes, nb * band_bytes, cudaMemcpyHostToDevice, s));
+      if (px.rgb2)
+        Q27_CUDA(cudaMemcpyAsync(t + nb * band_bytes, px.rgb2 + b0 * band_bytes, nb * band_bytes, cudaMemcpyHostToDevice, s));
+      rgb_patches_kernel<<<grid_for(n), 256, 0, s>>>(t, px.rgb2 ? nb * band_bytes : 0, width, gw, p0, b0 * band_rows,
                                                      n, nm, out + p0 * kPatchDim);
     }
   }
   Q27_CUDA(cudaGetLastError());
 }
 
-void vision_encode(const VisionWeights& W, const VisionPixels& pixels, int gh, int gw, bf16* out, void* ws,
+void vision_encode(const VisionWeights& W, const VisionPixels* pixels, int n, int gh, int gw, bf16* out, void* ws,
                    size_t ws_bytes, cudaStream_t s) {
   Q27_CHECK(gh > 0 && gw > 0 && gh % kMerge == 0 && gw % kMerge == 0, "vision: the patch grid must be even");
-  const int P = gh * gw;
+  Q27_CHECK(n > 0 && int64_t(n) * gh * gw < (int64_t(1) << 31), "vision: bad image count");
+  const int Pi = gh * gw, P = n * Pi;  // (patches of an image, of all)
   const Ws w = carve(ws, P, W.mode);
   Q27_CHECK(w.bytes <= ws_bytes, "vision: image larger than the workspace (IMAGE_MAX_PIXELS)");
   static bool attr = false;
@@ -494,9 +504,10 @@ void vision_encode(const VisionWeights& W, const VisionPixels& pixels, int gh, i
   }
 
   Stager st(W, w, s);  // (the first two stages start copying now)
-  // Pixels -> BF16 in heads, through tmp.
+  // Pixels -> BF16 in heads, through tmp (the tmp copies are ordered on s: one image's after the previous one's).
   bf16* px = w.heads;
-  vision_pixels(pixels, gh, gw, px, w.tmp, size_t(kRows) * kMergedDim * 4, s);
+  for (int i = 0; i < n; i++)
+    vision_pixels(pixels[i], gh, gw, px + int64_t(i) * Pi * kPatchDim, w.tmp, size_t(kRows) * kMergedDim * 4, s);
   gemm_bf16(P, kHidden, kPatchDim, px, st.get(0, 0), 1.f, nullptr, 0.f, w.x, s);
   st.done(0);
   pos_embed_kernel<<<P, 256, 0, s>>>(w.x, W.patch_b, W.pos, gh, gw);
@@ -512,10 +523,10 @@ void vision_encode(const VisionWeights& W, const VisionPixels& pixels, int gh, i
     for (int r0 = 0; r0 < P; r0 += kRows) {
       const int rows = std::min(kRows, P - r0);
       gemm_bf16(rows, kThreeH, kHidden, w.ln + int64_t(r0) * kHidden, qkv_w, 1.f, nullptr, 0.f, w.tmp, s);
-      qkv_rope_kernel<<<rows, 256, 0, s>>>(w.tmp, B.qkv_b, r0, P, gw, w.heads);
+      qkv_rope_kernel<<<rows, 256, 0, s>>>(w.tmp, B.qkv_b, r0, P, Pi, gw, w.heads);
     }
-    vis_attn_kernel<<<dim3((P + kBm - 1) / kBm, kHeads), 128, kAttnSmem, s>>>(w.heads, w.heads + hs, w.heads + 2 * hs,
-                                                                              P, scale_log2, w.o);
+    vis_attn_kernel<<<dim3((Pi + kBm - 1) / kBm, kHeads, n), 128, kAttnSmem, s>>>(w.heads, w.heads + hs,
+                                                                                  w.heads + 2 * hs, P, Pi, scale_log2, w.o);
     Q27_CUDA(cudaGetLastError());
     gemm_bf16(P, kHidden, kHidden, w.o, proj_w, 1.f, w.x, 1.f, w.x, s);
     add_bias_kernel<<<grid_for(int64_t(P) * kHidden), 256, 0, s>>>(w.x, B.proj_b, P, kHidden);

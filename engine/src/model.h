@@ -188,10 +188,11 @@ class Model {
   // start .. start + gh * gw - 1, gh x gw the merged grid. mm_set (after reset / prefix_begin, before the
   // forward call) gives the request's images: spans [n][3] = (start, gh, gw), ascending. mm_encode runs
   // the vision tower on image i (its pixels in host memory: VisionPixels, 2 gh x 2 gw patches) into its
-  // embedding rows; images whose positions the restored prefix covers need no encoding. mm_embeds copies them
-  // out (tests).
+  // embedding rows; images whose positions the restored prefix covers need no encoding. mm_encode with n > 1
+  // encodes images i .. i + n - 1 of one grid (a video's frame pairs, pixels[n]) in as few passes as the
+  // workspace allows. mm_embeds copies them out (tests).
   void mm_set(const int32_t* spans, int n);
-  void mm_encode(int i, const VisionPixels& pixels);
+  void mm_encode(int i, const VisionPixels* pixels, int n = 1);
   void mm_embeds(int i, bf16* out);
   void mm_put(int i, const bf16* in);  // replaces image i's embeddings (tests: another vision tower)
   bool has_vision() const { return opt_.vision != 0; }

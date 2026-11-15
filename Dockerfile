@@ -66,6 +66,10 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
 COPY --from=build /opt/q27/libq27.so /opt/q27/libq27.so
 WORKDIR /work
 COPY LICENSE ./
+# (the notices of the code compiled into libq27.so: libwebm's mkvparser, BSD; NVIDIA's NVDEC headers, MIT)
+COPY engine/src/third_party/libwebm/LICENSE.TXT licenses/libwebm-LICENSE.txt
+COPY engine/src/third_party/libwebm/PATENTS.TXT licenses/libwebm-PATENTS.txt
+COPY engine/src/third_party/nvcodec/LICENSE.txt licenses/nv-codec-headers-LICENSE.txt
 COPY bench/draft-vocab bench/draft-vocab
 COPY reference/qwen27b/__init__.py reference/qwen27b/paths.py reference/qwen27b/image_tokens.py reference/qwen27b/
 COPY engine/python engine/python

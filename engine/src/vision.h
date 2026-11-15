@@ -1,4 +1,4 @@
-// Vision tower of Qwen3.8-27B (P4-12): one image's patches -> one 5120-dim embedding per merged token.
+// Vision tower of Qwen3.8-27B (P4-12): images' patches -> one 5120-dim embedding per merged token.
 // Numerics as reference/qwen27b/vision.py: BF16 weights and GEMM operands, fp32 residual stream, LayerNorm
 // and softmax in fp32.
 #pragma once
@@ -60,9 +60,12 @@ void vision_quant_fp8(const bf16* w, int rows, int cols, uint8_t* q, float* scal
 // One image's pixels in host memory, either the image processor's pixel_values (patches: [gh * gw][1536] fp32,
 // 2x2 merge-block order) or the resized image itself (rgb: [gh * 16][gw * 16][3] uint8), which the device
 // normalizes as the processor does, (x - mean) / std in fp32 per channel, and arranges into the same patches.
+// An image fills both frames of the temporal patch with rgb; a video's pair of frames has the second in rgb2
+// (same size).
 struct VisionPixels {
   const float* patches = nullptr;
   const uint8_t* rgb = nullptr;
+  const uint8_t* rgb2 = nullptr;  // (nullptr: rgb again)
   float mean[3] = {}, std[3] = {};
 };
 
@@ -70,9 +73,11 @@ struct VisionPixels {
 // Synchronous with respect to the host memory of px.
 void vision_pixels(const VisionPixels& px, int gh, int gw, bf16* out, void* tmp, size_t tmp_bytes, cudaStream_t s);
 
-// Encodes one image: px of the gh x gw patch grid (both even). Writes [gh * gw / 4][5120] BF16 to out
-// (device memory or a UVA pointer to pinned host memory). Synchronous with respect to the host memory of px.
-void vision_encode(const VisionWeights& w, const VisionPixels& px, int gh, int gw, bf16* out, void* ws,
+// Encodes n images of the same gh x gw patch grid (both even) in one pass: px[0..n-1] (an image each, or a
+// video's frame pairs). Attention stays within each image, position embeddings and RoPE repeat per image.
+// Writes [n][gh * gw / 4][5120] BF16 to out (device memory or a UVA pointer to pinned host memory); the
+// workspace must hold n * gh * gw patches. Synchronous with respect to the host memory of px.
+void vision_encode(const VisionWeights& w, const VisionPixels* px, int n, int gh, int gw, bf16* out, void* ws,
                    size_t ws_bytes, cudaStream_t s);
 
 }  // namespace q27

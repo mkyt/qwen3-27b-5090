@@ -7,7 +7,7 @@ Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses (Codex), /v
 with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); POST /admin/engine/idle (the unload when idle); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
 /ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py). Streaming everywhere (SSE), reasoning (`<think>`, returned as
 `reasoning_content` / `reasoning`, or Anthropic thinking blocks), tool calls (qwen3_coder XML, streamed call by
-call), images (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
+call), images and videos (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
 
 The engine runs in its own process (worker.py, which schedules up to MAX_SEQS requests at once; how many run
 is decided while it runs: a target number, room in the KV pool, MIN_SEQ_TPS). If it
@@ -70,22 +70,59 @@ class ApiError(Exception):
 # ---------------------------------------------------------------- images
 
 
+def video_part(part):
+    """The URL of a content part that is a video (OpenAI-style {"type": "video_url", "video_url": {"url"}}, or
+    {"type": "video", "video": url}), else None."""
+    if not isinstance(part, dict) or not (part.get("type") in ("video", "video_url") or "video" in part
+                                          or "video_url" in part):
+        return None
+    src = part.get("video_url", part.get("video"))
+    return src.get("url") if isinstance(src, dict) else src
+
+
+def with_video_parts(messages):
+    """messages with each video part as {"type": "video", "video": url}, the form the chat template renders as a
+    video (it does not know "video_url")."""
+    out = []
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list) and any(video_part(p) is not None for p in content):
+            m = dict(m, content=[{"type": "video", "video": video_part(p)} if video_part(p) is not None else p
+                                 for p in content])
+        out.append(m)
+    return out
+
+
 class Images:
-    """Image inputs (P4-12): data URLs (or http(s) URLs) -> the image token ids and, for the engine process, the
-    encoded images with their resized size (it decodes only those it has to encode: imageproc.py)."""
+    """Image and video inputs (P4-12): data URLs (or http(s) URLs) -> the token ids and, for the engine process,
+    the encoded images with their resized size (it decodes only those it has to encode: imageproc.py), and the
+    encoded videos with their plan (videoproc.py: each pair of frames is an image to the language model and the
+    vision tower, after its time as text)."""
 
-    MAX_BYTES = 32 << 20
+    MAX_BYTES = {"image": 32 << 20, "video": 256 << 20}
 
-    def __init__(self, path, max_pixels):
+    def __init__(self, path, max_pixels, max_tokens=16384):
         from imageproc import ImageProcessor
 
+        self.path = path
         self.proc = ImageProcessor(path)
         self.max_pixels = max_pixels
+        self.max_tokens = max_tokens  # (IMAGE_TOKENS: the engine's embedding rows per request)
+        self._video = None
+
+    @property
+    def video(self):
+        if self._video is None:
+            from videoproc import VideoProcessor
+
+            self._video = VideoProcessor(self.path)
+        return self._video
 
     @staticmethod
     def collect(messages):
-        """The image URLs of the messages, in the order the chat template renders their pads."""
-        urls = []
+        """The (kind, URL) of the images and videos of the messages, in the order the chat template renders their
+        pads."""
+        out = []
         for m in messages:
             content = m.get("content")
             if not isinstance(content, list):
@@ -93,48 +130,91 @@ class Images:
             for part in content:
                 if not isinstance(part, dict):
                     continue
-                if part.get("type") in ("video", "video_url") or "video" in part or "video_url" in part:
-                    raise ApiError(400, "video input is not supported")
-                if "image_url" in part or "image" in part or part.get("type") == "image":
+                if (url := video_part(part)) is not None:
+                    out.append(("video", url))
+                elif "image_url" in part or "image" in part or part.get("type") == "image":
                     src = part.get("image_url", part.get("image"))
-                    urls.append(src.get("url") if isinstance(src, dict) else src)
-        return urls
+                    out.append(("image", src.get("url") if isinstance(src, dict) else src))
+        return out
 
-    def load(self, url):
+    def load(self, url, kind="image"):
+        """(encoded bytes, size): the image's (width, height), or the video's (frames, fps, width, height)."""
         import io
 
         from PIL import Image
 
+        limit = self.MAX_BYTES[kind]
         if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
             raw = base64.b64decode(url.split(";base64,", 1)[1])
         elif isinstance(url, str) and url.startswith(("http://", "https://")):
             try:
-                with urllib.request.urlopen(url, timeout=30) as r:
-                    raw = r.read(self.MAX_BYTES + 1)
+                with urllib.request.urlopen(url, timeout=30 if kind == "image" else 120) as r:
+                    raw = r.read(limit + 1)
             except Exception as e:  # noqa: BLE001 - any fetch error is the client's
-                raise ApiError(400, f"cannot fetch image {url}: {e}") from e
-            if len(raw) > self.MAX_BYTES:
-                raise ApiError(400, "image larger than 32 MiB")
+                raise ApiError(400, f"cannot fetch {kind} {url}: {e}") from e
         else:
-            raise ApiError(400, "images must be data URLs (data:image/...;base64,...) or http(s) URLs")
+            raise ApiError(400, f"{kind}s must be data URLs (data:{kind}/...;base64,...) or http(s) URLs")
+        if len(raw) > limit:
+            raise ApiError(400, f"{kind} larger than {limit >> 20} MiB")
         try:
+            if kind == "video":
+                from videoproc import probe
+
+                return raw, probe(raw)
             with Image.open(io.BytesIO(raw)) as img:  # (the header only)
-                size = img.size
+                return raw, img.size
         except Exception as e:  # noqa: BLE001 - any decoder error is the client's
-            raise ApiError(400, f"cannot decode image: {e}") from e
-        return raw, size
+            raise ApiError(400, f"cannot decode {kind}: {e}") from e
 
-    def prepare(self, ids, urls, pad_id):
-        """(ids with each image's pad expanded to its token ids, [(start, gh, gw)], [(encoded image, resized
-        (width, height), norm) per image] for imageproc.rgb and q27_mm_encode_rgb)."""
-        from qwen27b.image_tokens import expand_image_pads, image_token_ids
+    def prepare(self, ids, media, pads, encode):
+        """(ids with each image's and video's pad expanded, [(start, gh, gw)] per image and pair of video frames,
+        [source per span], [(encoded video, videoproc.Plan) per video]). The source of an image's span is
+        ("image", encoded image, resized (width, height), norm) for imageproc.rgb and q27_mm_encode_rgb, of a
+        video's pair ("video", video index, pair index, norm). pads: the ids of <|image_pad|>, <|video_pad|>,
+        <|vision_start|>, <|vision_end|>; encode(text) -> ids (the pairs' times)."""
+        import hashlib
 
-        raws, sizes = zip(*(self.load(u) for u in urls))
-        sizes = [self.proc.size(s, self.max_pixels) for s in sizes]
-        grids = [list(self.proc.grid(s)) for s in sizes]
-        keys = [raw + repr((g, self.max_pixels)).encode() for raw, g in zip(raws, grids)]
-        ids, spans = expand_image_pads(ids, grids, pad_id, fill=lambda i, n: image_token_ids(keys[i], n))
-        return ids, [(s.start, s.gh, s.gw) for s in spans], [(raw, s, self.proc.norm) for raw, s in zip(raws, sizes)]
+        from qwen27b.image_tokens import image_token_ids
+
+        image_pad, video_pad, vstart, vend = pads
+        loaded = [(kind, *self.load(u, kind)) for kind, u in media]
+        out, spans, srcs, videos, k = [], [], [], [], 0
+        for t in ids:
+            if t not in (image_pad, video_pad) or k >= len(loaded):
+                out.append(t)
+                continue
+            kind, raw, size = loaded[k]
+            if (kind == "video") != (t == video_pad):
+                raise ApiError(400, "the images and videos do not match the prompt's pads")
+            k += 1
+            if kind == "image":
+                rsize = self.proc.size(size, self.max_pixels)
+                _, gh, gw = self.proc.grid(rsize)
+                n = gh * gw // 4
+                spans.append((len(out), gh // 2, gw // 2))
+                srcs.append(("image", raw, rsize, self.proc.norm))
+                out.extend(image_token_ids(raw + repr(([1, gh, gw], self.max_pixels)).encode(), n))
+                continue
+            try:
+                plan = self.video.plan(*size, frame_pixels=self.max_pixels)
+            except ValueError as e:
+                raise ApiError(400, f"cannot use the video: {e}") from e
+            pairs, gh, gw = plan.grid
+            n = gh * gw // 4
+            digest = hashlib.sha256(raw).digest()
+            for g in range(pairs):
+                out.extend(encode(f"<{plan.times[g]:.1f} seconds>"))
+                out.append(vstart)
+                spans.append((len(out), gh // 2, gw // 2))
+                srcs.append(("video", len(videos), g, self.video.norm))
+                out.extend(image_token_ids(digest + repr((plan.grid, plan.size, g)).encode(), n))
+                out.append(vend)
+            videos.append((raw, plan))
+        if k != len(loaded):
+            raise ApiError(400, f"{len(loaded)} images and videos for {k} pads in the prompt")
+        if (rows := sum(gh * gw for _, gh, gw in spans)) > self.max_tokens:
+            raise ApiError(400, f"the images and videos take {rows} tokens, more than IMAGE_TOKENS ({self.max_tokens})")
+        return out, spans, srcs, videos
 
 
 # ---------------------------------------------------------------- the engine process
@@ -660,7 +740,7 @@ class Server:
         self._images = None
         self.max_tokens_conf = max_tokens
         self.thinking_default = thinking_default
-        self.pad_id = tok.token_id("<|image_pad|>")
+        self.pads = tuple(tok.token_id(t) for t in ("<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"))
 
     @property
     def vocab(self):
@@ -680,7 +760,8 @@ class Server:
             return None
         with self.images_lock:
             if self._images is None:
-                self._images = Images(cfg["model"], int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)))
+                self._images = Images(cfg["model"], int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)),
+                                      int(os.environ.get("IMAGE_TOKENS", 16384)))
             return self._images
 
     def encode(self, text):
@@ -700,20 +781,23 @@ class Server:
             self.tok = tok
 
     def render(self, messages, tools, kwargs):
-        """Prompt ids (images expanded) and the images, of chat messages. Special tokens' strings in what the client
-        wrote stay text (Tokenizer.prompt_ids): only the template opens and ends turns, and places images."""
+        """Prompt ids (images and videos expanded) and the images, of chat messages. Special tokens' strings in what
+        the client wrote stay text (Tokenizer.prompt_ids): only the template opens and ends turns, and places
+        images and videos."""
+        messages = with_video_parts(messages)
         try:
             with self.tok_lock:
                 ids = self.tok.prompt_ids(messages, tools=tools or None, **kwargs)
         except Exception as e:  # noqa: BLE001 - template errors (no user message, bad roles) are the client's
             raise ApiError(400, f"chat template: {e}") from e
-        urls, images = Images.collect(messages), None
-        if urls:
+        media, images = Images.collect(messages), None
+        if media:
             proc = self.images
             if proc is None:
-                raise ApiError(400, "this server does not take images (start the engine with VISION=host, fp8 or bf16)")
-            ids, spans, pixels = proc.prepare(ids, urls, self.pad_id)
-            images = (spans, pixels)
+                raise ApiError(400, "this server does not take images or videos (start the engine with VISION=host, "
+                                    "fp8 or bf16)")
+            ids, spans, srcs, videos = proc.prepare(ids, media, self.pads, self.encode)
+            images = (spans, srcs, videos)
         return ids, images
 
     def force(self, choice, thinking):

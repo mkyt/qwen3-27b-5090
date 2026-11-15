@@ -43,11 +43,15 @@ add_library(q27 SHARED
   src/draft.cu
   src/draft.cc
   src/vision.cu
+  src/video_mp4.cc
+  src/video_mkv.cc
+  src/third_party/libwebm/mkvparser/mkvparser.cc
+  src/video_nvdec.cu
   src/model.cc
   src/capi.cc
 )
-target_include_directories(q27 PRIVATE src)
-target_link_libraries(q27 PRIVATE CUDA::cudart)
+target_include_directories(q27 PRIVATE src src/third_party/libwebm)
+target_link_libraries(q27 PRIVATE CUDA::cudart ${CMAKE_DL_LIBS})
 if(MSVC)
   target_link_options(q27 PRIVATE "/NODEFAULTLIB:lib${Q27_UCRT}" "/DEFAULTLIB:${Q27_UCRT}")
 endif()

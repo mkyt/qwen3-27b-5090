@@ -368,6 +368,23 @@ gate without an explicit decision, recorded below with its numbers.
   `bf16` and `host` 67 (identical replies), `fp8` 68, vLLM 70; the differences are three close counting questions
   that the FP32 reference model also misses the same way.
 
+- **P4-16: videos** (`video_url`). A pair of frames is an image to both the language model (its span, after
+  its time as text) and the vision tower (two frames over the temporal patch), so the M-RoPE, the prefix cache and
+  the image path take videos unchanged; transformers' prompt ids and positions match
+  (`frontend/tests/test_videoproc.py`). The vision tower encodes the pairs of one grid in one pass (attention per
+  pair), bit-identical to one pair per call; one pass per pair would stream the weights 300 times for a 5-minute
+  video with `VISION=host`. The per-frame pixel cap of qwen-vl-utils (transformers' default from v5.22; without it a
+  10-second clip costs nearly the 12,288 tokens of a long video).
+- **Videos decoded by the engine on NVDEC, without FFmpeg.** PyAV (FFmpeg) took the serving image from 198 to
+  369 MB and, through FFmpeg's NVDEC path (one picture at a time), was slower than its CPU decoder: NVDEC was 19 to
+  46% busy. The engine feeds the driver's parser itself with up to four pictures in flight, maps only the sampled
+  frames, and decodes the parts of a long video on both NVDEC engines; it beats 24 CPU threads 3.3 to 3.4 times on 4K
+  AV1 / HEVC. The MP4 reader is our own (about 500 lines: one video track, the sample table, fragments, edit lists);
+  a library (minimp4) lacked fragmented files, `hev1` and edit lists. Matroska / WebM goes through libwebm's
+  `mkvparser` (vendored, BSD; continuously fuzzed upstream), whose EBML parsing is not worth writing again. No CPU fallback: codecs NVDEC does not
+  decode get HTTP 400. Each pixel takes its 2x2 block's chroma, as FFmpeg's default conversion: interpolating it
+  moved colorful frames 5 to 7 steps away from what the reference readers (transformers', qwen-vl-utils') give.
+
 ## Weights
 
 - **Quality gate for weight options** (before any default change), against NVIDIA's checkpoint: needle retrieval
