@@ -33,7 +33,8 @@ and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 
 - **Speculative decoding** with the [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) block drafter (blocks of up to
   16 tokens, the verify width adapting to the acceptance; [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) with
-  `SPEC=dflash2`), batched across concurrent requests; each request's tokens are bit-identical to running it alone.
+  `SPEC=dflash2`), batched across concurrent requests. Exact token agreement depends on the numerical policy
+  and execution path; see [Correctness and quality](#correctness-and-quality).
   DSpine is faster for one request (JSON 1.37x, code 1.08x). In a batch each DSpine request verifies 4 to 16 rows of
   its own, chosen from its recent acceptance; on long reasoning DFlash2 is still 3–6% faster with four or eight
   requests at once, so a server that mostly runs many such requests may prefer `SPEC=dflash2`.
@@ -335,6 +336,21 @@ docker compose --profile dev run --rm dev-cpu bash -c 'cd reference && python -m
 ```
 
 `golden engine` loads the weights on the GPU (about 20 GB): stop the `serve` service first.
+
+The golden recording above covers prefill (`--decode-tail N` also exercises single-token decode), not speculative
+verification. The default skinny GEMM chooses its split-K policy by row count, so decode, verify and changing
+batch widths can use different floating-point summation orders. Greedy token equality across these paths is
+not guaranteed by a check using `Q27_SKINNY_EXACT=1`. To compare the current runtime policy with that explicit
+diagnostic policy, run both checks with matching weights, KV type and draft:
+
+```bash
+docker compose --profile dev run --rm dev python scripts/bench_spec.py --check-greedy 512 --thinking --weights nvidia --kv-dtype nvfp4 --draft dspine
+docker compose --profile dev run --rm dev python scripts/bench_spec.py --check-greedy 512 --thinking --weights nvidia --kv-dtype nvfp4 --draft dspine --check-exact
+```
+
+The checks print the effective `Q27_*` settings and fail on the first token/length mismatch in any prompt.
+They compare one sequence at a time; they do not establish equivalence for warm prefix caches or concurrent
+requests. A differing output still needs investigation; selecting the exact policy is not a runtime fix.
 
 The recordings are about 8 MB each: the reference model with a BF16 KV cache (`ref-gpu`, what the engine is compared
 with), with an FP8 KV cache (`ref-gpu-kvfp8`, the noise floor), the BF16 original (`ref-gpu-bf16model`) and images
