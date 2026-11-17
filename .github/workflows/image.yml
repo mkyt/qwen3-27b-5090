@@ -1,6 +1,6 @@
 # Builds the serving image (Dockerfile) and publishes it as ghcr.io/<owner>/qwen3-27b-5090: `latest` and
-# `sha-<commit>` from main when the code in the image changes, `<version>` from a v* tag. No GPU is needed to
-# compile the engine.
+# `sha-<commit>` from main when the code in the image changes, `<version>`, `latest` and `sha-<commit>` from a v* tag
+# (a tagged commit's main push skips the build). No GPU is needed to compile the engine.
 name: image
 
 on:
@@ -25,7 +25,23 @@ permissions:
   artifact-metadata: write
 
 jobs:
+  # A release pushes main and its v* tag together: the tag's run builds that commit (and also tags it latest), so
+  # the run of the main push skips it instead of building the same thing twice.
+  tagged:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      found: ${{ steps.check.outputs.found }}
+    steps:
+      - id: check
+        run: |
+          if git ls-remote --tags "https://github.com/${{ github.repository }}" "refs/tags/v*" | grep -q "^${GITHUB_SHA}"; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${GITHUB_SHA} has a v* tag: its tag run builds it"
+          fi
   build:
+    needs: tagged
+    if: ${{ !cancelled() && needs.tagged.outputs.found != 'true' }}
     runs-on: ubuntu-24.04
     steps:
       # (No disk cleanup: the build stage's CUDA devel image is 3.6 GB to pull, about 10 GB unpacked, and the runner has
@@ -44,7 +60,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
             type=sha
             type=semver,pattern={{version}}
       - id: build

@@ -1,6 +1,6 @@
 # Builds the Windows package (scripts/windows/package.ps1): qwen3-27b-5090-<version>-windows-x64.zip (v0.3.0 on a tag,
 # v0.3.0-3-g6767c0c on main after it), a workflow artifact from main when the code in it changes, and an asset of the
-# GitHub Release of a v* tag (with its SHA-256). The runner has no GPU: the engine compiles, the GPU tests are run
+# GitHub Release of a v* tag (with its SHA-256; a tagged commit's main push skips the build). The runner has no GPU: the engine compiles, the GPU tests are run
 # before tagging.
 name: windows
 
@@ -30,7 +30,23 @@ env:
   CUDA_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3
 
 jobs:
+  # A release pushes main and its v* tag together: the tag's run builds that commit (and also tags it latest), so
+  # the run of the main push skips it instead of building the same thing twice.
+  tagged:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      found: ${{ steps.check.outputs.found }}
+    steps:
+      - id: check
+        run: |
+          if git ls-remote --tags "https://github.com/${{ github.repository }}" "refs/tags/v*" | grep -q "^${GITHUB_SHA}"; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${GITHUB_SHA} has a v* tag: its tag run builds it"
+          fi
   package:
+    needs: tagged
+    if: ${{ !cancelled() && needs.tagged.outputs.found != 'true' }}
     runs-on: windows-2025
     steps:
       # (all the history and tags: git describe names the version)
