@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from server import ApiError, sampling_of, token_controls_of  # noqa: E402
+from server import ApiError, sampling_of, token_controls_of, token_ids_of  # noqa: E402
 
 
 def test_defaults():
@@ -57,4 +57,15 @@ def test_seed():
 def test_bad_seed(seed):
     with pytest.raises(ApiError) as e:
         sampling_of({"seed": seed})
+    assert e.value.code == 400
+
+
+def test_token_ids():
+    assert token_ids_of([0, 5, 999], 1000, "prompt") == [0, 5, 999]
+
+
+@pytest.mark.parametrize("ids", [[-1], [1000], [2**40], [1.0], ["5"], [True], [[1]], "12"])
+def test_bad_token_ids(ids):
+    with pytest.raises(ApiError) as e:
+        token_ids_of(ids, 1000, "prompt")
     assert e.value.code == 400

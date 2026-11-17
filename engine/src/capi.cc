@@ -37,6 +37,12 @@ int guard(F&& f) {
 
 float g_last_us = 0.f;
 
+// Token ids from the caller index the embedding table, the penalty counts and the logit bias: each must be in
+// the vocabulary (image rows are set by the engine, Model::upload_ids).
+void check_ids(const int32_t* ids, int n) {
+  for (int i = 0; i < n; i++) Q27_CHECK(ids[i] >= 0 && ids[i] < dims::kVocab, "token id out of the vocabulary");
+}
+
 VisionPixels rgb_pixels(const uint8_t* rgb, const float* norm) {
   VisionPixels px;
   px.rgb = rgb;
@@ -194,6 +200,7 @@ int q27_max_tokens(void* m) { return static_cast<Model*>(m)->max_tokens(); }
 // Top-k next-token log-probs for every one of the n positions: out_ids / out_logp [n][k].
 int q27_forward_topk(void* m, const int32_t* ids, int n, int k, int32_t* out_ids, float* out_logp) {
   return guard([&] {
+    check_ids(ids, n);
     auto* model = static_cast<Model*>(m);
     int p0 = model->pos();
     model->forward_topk(ids, n, k, [&](int pos, const int32_t* ti, const float* tl) {
@@ -210,6 +217,7 @@ int q27_forward_sample(void* m, const int32_t* ids, int n, float temperature, in
                        float min_p, float presence, float frequency, int logprobs, int32_t* out, int masked,
                        int biased) {
   return guard([&] {
+    check_ids(ids, n);
     *out = static_cast<Model*>(m)->forward_sample(ids, n, temperature, top_k, top_p, uniform, min_p, presence,
                                                   frequency, logprobs, masked != 0, biased != 0);
   });
@@ -235,12 +243,18 @@ int q27_logprobs(void* m, int lane, int* top, float* lp, int32_t* top_id, float*
 
 // The running sequence's logit bias, n (token, value) pairs, and min_tokens' eos_before (Model::bias_set).
 int q27_bias_set(void* m, const int32_t* ids, const float* vals, int n, int eos_before) {
-  return guard([&] { static_cast<Model*>(m)->bias_set(ids, vals, n, eos_before); });
+  return guard([&] {
+    check_ids(ids, n);
+    static_cast<Model*>(m)->bias_set(ids, vals, n, eos_before);
+  });
 }
 
 // The running sequence's output so far as its penalty counts (Model::penalty_init).
 int q27_penalty_init(void* m, const int32_t* ids, int n) {
-  return guard([&] { static_cast<Model*>(m)->penalty_init(ids, n); });
+  return guard([&] {
+    check_ids(ids, n);
+    static_cast<Model*>(m)->penalty_init(ids, n);
+  });
 }
 
 // Speculative decoding: prompt + first token, then steps of 1..16 new tokens (out[16]; returns the count). masked: grammar
@@ -251,6 +265,7 @@ int q27_spec_begin(void* m, const int32_t* ids, int n, float temperature, int to
                    int32_t* out, int masked, int until, int biased, int ignore_eos) {
   return guard([&] {
     Q27_CHECK(logprobs <= kMaxTopLogprobs, "spec_begin: at most 20 top logprobs");
+    check_ids(ids, n);
     SpecSampling smp{temperature, top_k, top_p, 0};  // paths 0: Q27_SPEC_PATHS
     smp.min_p = min_p, smp.pen.presence = presence, smp.pen.frequency = frequency;
     smp.logprobs = logprobs < 0 ? -1 : logprobs;
@@ -291,7 +306,10 @@ int q27_spec_set_masked(void* m, int area) {
 
 // Prompt chunks before q27_forward_sample / q27_spec_begin (*done: tokens run, see Model::prefill).
 int q27_prefill(void* m, const int32_t* ids, int n, int budget, int spec, int* done) {
-  return guard([&] { *done = static_cast<Model*>(m)->prefill(ids, n, budget, spec != 0); });
+  return guard([&] {
+    check_ids(ids, n);
+    *done = static_cast<Model*>(m)->prefill(ids, n, budget, spec != 0);
+  });
 }
 
 // Several sequences (Phase 6, Model::seq_*). Return 0, -1 on an error, -2 when the KV pool is full.
@@ -347,7 +365,10 @@ int q27_spec_stats(void* m, int64_t* out) {
 // Prefix cache: resets the sequence, restores the deepest cached prefix of ids (*cached tokens) and plans
 // checkpoints at at[0..nat) for the prefill of the rest; spec: the rest goes through q27_spec_begin.
 int q27_prefix_begin(void* m, const int32_t* ids, int n, const int32_t* at, int nat, int spec, int* cached) {
-  return guard([&] { *cached = static_cast<Model*>(m)->prefix_begin(ids, n, at, nat, spec != 0); });
+  return guard([&] {
+    check_ids(ids, n);
+    *cached = static_cast<Model*>(m)->prefix_begin(ids, n, at, nat, spec != 0);
+  });
 }
 
 int q27_checkpoint(void* m) {

@@ -876,6 +876,18 @@ def seed_of(body):
     return seed
 
 
+def token_ids_of(ids, vocab, what):
+    """Client token ids (a prompt, /detokenize): a list of integers in 0..vocab-1."""
+    if not isinstance(ids, list):
+        raise ApiError(400, f"{what}: a list of token ids is required")
+    for t in ids:
+        if isinstance(t, bool) or not isinstance(t, int):
+            raise ApiError(400, f"{what}: {t!r:.40} is not a token id")
+        if not 0 <= t < vocab:
+            raise ApiError(400, f"{what}: token id {t} is out of the vocabulary (0..{vocab - 1})")
+    return ids
+
+
 MAX_BIAS = 300  # (OpenAI's limit, kMaxBias)
 
 
@@ -1261,7 +1273,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(prompt) != 1:
                 raise ApiError(400, "only one prompt per request is supported")
             prompt = prompt[0]
-        ids = prompt if isinstance(prompt, list) else self.srv.encode(prompt)
+        ids = token_ids_of(prompt, self.srv.vocab, "prompt") if isinstance(prompt, list) else self.srv.encode(prompt)
         if not ids:
             raise ApiError(400, "empty prompt")
         left = self.srv.limit(len(ids))
@@ -1588,7 +1600,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def detokenize(self, body):
         with self.srv.tok_lock:
-            text = self.srv.tok.decode(body.get("tokens") or [])
+            text = self.srv.tok.decode(token_ids_of(body.get("tokens") or [], self.srv.vocab, "tokens"))
         self._json(200, {"prompt": text})
 
 

@@ -57,6 +57,9 @@ class ImageError(Exception):
     """An image or video of the request cannot be decoded (the client's error: 400)."""
 
 
+VOCAB = 248320  # rows of the engine's embedding table (kVocab)
+
+
 def log(msg):
     print(f"[sched] {msg}", file=sys.stderr, flush=True)
 
@@ -208,6 +211,9 @@ class Scheduler:
         # (the server checks the request; a malformed one that gets past it fails alone, not the engine)
         try:
             s = Seq(rid, req, time.time())
+            array.array("i", s.prompt)  # (integers that fit int32)
+            if s.prompt and (min(s.prompt) < 0 or max(s.prompt) >= VOCAB):
+                raise ValueError(f"a prompt token id is out of the vocabulary (0..{VOCAB - 1})")
         except (TypeError, ValueError, KeyError, OverflowError) as e:
             self.send("error", rid, f"bad request: {e}", 400)
             return
