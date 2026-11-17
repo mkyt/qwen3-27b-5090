@@ -231,8 +231,8 @@ def frames(raw, plan, sessions=0):
     got = [i for i in want if i < shown]
     if not got:
         raise ValueError("no frames decoded")
-    data = buf.raw
-    slot = {i: data[k * frame:(k + 1) * frame] for k, i in enumerate(want) if i < shown}
+    data = memoryview(buf).cast("B")
+    slot = {i: bytes(data[k * frame:(k + 1) * frame]) for k, i in enumerate(want) if i < shown}
     last = slot[got[-1]]
     return [slot.get(i, last) for i in plan.indices]
 

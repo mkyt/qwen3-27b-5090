@@ -70,7 +70,7 @@ def rgb(raw, size):
 
 
 def resize(img, size):
-    """img.resize(size, BICUBIC), the same pixels, on RESIZE_STRIPS threads (PIL releases the GIL). PIL resizes
+    """img.resize(size, BICUBIC), the same pixels; large images use RESIZE_STRIPS threads (PIL releases the GIL). PIL resizes
     in two passes, horizontal then vertical, with a uint8 image in between: the horizontal pass runs here on bands
     of rows and the vertical one on bands of columns, each a resize along one axis whose length is the whole
     image's, so its filter coefficients are those of the single call. (Bands of output rows through resize's box
@@ -78,6 +78,8 @@ def resize(img, size):
     global _pool
     w, h = img.size
     rw, rh = size
+    if max(w * h, rw * rh) <= 262144:
+        return img.resize(size, Image.BICUBIC)
     if _pool is None:
         _pool = ThreadPoolExecutor(RESIZE_STRIPS, thread_name_prefix="resize")
     if rw != w:

@@ -58,6 +58,16 @@ Use `0.0.0.0` rather than the PC's own address: the tray app and `scripts/serve.
 change its settings through the admin API and the stats page. Do this only on a network you trust, and do not forward the
 port to the internet.
 
+The HTTP server rejects cross-origin browser requests and untrusted DNS names in `Host` to protect the local UI
+against cross-site requests and DNS rebinding. IP addresses and `localhost` work without configuration; for a
+trusted name such as `llm.example.internal`, add that exact name to `API_ALLOWED_HOSTS`. These checks do not authenticate
+API clients. If a service must be reachable outside a trusted network, put an authenticated reverse proxy in front
+of it, protect the admin/UI routes too, and prevent clients from reaching the backend port directly.
+
+All POST endpoints require `Content-Type: application/json` and a single `Content-Length`; chunked request bodies
+are not supported. Oversized bodies get 413; exhausted connection, body-memory or generation queues get 503.
+The body timeout is an overall deadline, so a client sending a few bytes at a time cannot hold a reader indefinitely.
+
 **Windows Firewall:** the first start of the Windows package with `0.0.0.0` asks whether to allow Python; allow it for
 private networks. If you closed that prompt, add a rule in an administrator PowerShell:
 
@@ -95,6 +105,13 @@ everywhere above.
 | --- | --- | --- |
 | `HOST` | `frontend/server.py` run directly: 0.0.0.0. Docker and the Windows package: 127.0.0.1 | Address to listen on. `0.0.0.0`: the network ([Using it from other machines](#using-it-from-other-machines)). With Docker, the address published on the host: the server in the container always listens on all its addresses |
 | `PORT` | 8000 | Port of the API and the web UI. With Docker, the port published on the host; in the container it stays 8000 |
+| `API_ALLOWED_HOSTS` | empty | Comma-separated trusted DNS names for the HTTP Host header, without scheme or port. IP literals and localhost are always accepted. This is not an API key or authentication |
+| `MEDIA_PRIVATE_HOSTS` | empty | Comma-separated exact media hostnames/IPs allowed to resolve to private addresses, e.g. `images.internal,127.0.0.1`. Other image/video URLs must resolve entirely to public addresses; every redirect is checked. Media fetches bypass environment proxies so destination checks cannot be bypassed by proxy DNS |
+| `MAX_REQUEST_BYTES` | 402653184 (384 MiB) | Maximum JSON request body, including base64 overhead. A request also has at most 32 media items and 256 MiB of encoded media in total |
+| `HTTP_BODY_BUDGET` | 536870912 (512 MiB) | Sum of the declared body sizes of unfinished POST requests. This is an admission budget, not a bound on total process RSS |
+| `HTTP_MAX_CONNECTIONS` | 32 | Maximum simultaneous HTTP connections, including idle keep-alive connections and UI event streams |
+| `HTTP_TIMEOUT_S` | 30 | Socket inactivity timeout, and separate overall deadlines for reading the request headers and POST body, in seconds |
+| `MAX_PENDING_REQUESTS` | 32 | Maximum running and queued generations together; admission above this returns 503 |
 | `SERVED_MODEL_NAME` | `qwen3.8-27b` | Name in `/v1/models` (requests may use any model name) |
 | `MAX_TOKENS` | 262144 | Context limit of one request. If the KV pool cannot hold it, `MAX_TOKENS_FIT` lowers it; the value in effect is in the startup log (`max_tokens ... lowered to`) and in `/v1/models` (`max_model_len`) |
 | `MAX_TOKENS_FIT` | 1 | 1: start with `MAX_TOKENS` lowered to what the KV pool holds (a multiple of 1,024). 0: fail to start instead (the service then restarts every 60 s). The engine library (`q27lib.Engine`) defaults to 0 |
@@ -475,6 +492,10 @@ path if the folder moved.
 - Any other variable: **Open settings.ini**. The window reads the file when it opens.
 
 ### Updating
+
+An online update stops if its matching SHA-256 cannot be retrieved or verified; it never installs an unchecked
+download. A checksum checks integrity against the release, not the publisher's identity; the signed build
+attestation can also be checked with `gh attestation verify <zip> --repo mkyt/qwen3-27b-5090`.
 
 From v0.3.1, run `update.cmd` in the package's folder. It downloads the latest release's zip (an interrupted download
 resumes when run again), checks its SHA-256, quits the tray app of this folder, replaces `python\`, `app\` and the

@@ -1,8 +1,9 @@
 #include "json.h"
 
 #include <cstring>
+#include <cmath>
 
-#include "common.h"
+#include "check.h"
 
 namespace q27 {
 namespace {
@@ -57,6 +58,7 @@ struct Parser {
         out += c;
         continue;
       }
+      if (i >= s.size()) error("unfinished escape");
       char e = s[i++];
       switch (e) {
         case 'n': out += '\n'; break;
@@ -71,7 +73,8 @@ struct Parser {
     return out;
   }
 
-  Json value() {
+  Json value(int depth = 0) {
+    if (depth > 128) error("nesting too deep");
     Json v;
     char c = peek();
     if (c == '{') {
@@ -84,7 +87,7 @@ struct Parser {
       while (true) {
         std::string k = string();
         expect(':');
-        v.obj.emplace(std::move(k), value());
+        if (!v.obj.emplace(std::move(k), value(depth + 1)).second) error("duplicate key");
         if (peek() == ',') {
           i++;
           continue;
@@ -101,7 +104,7 @@ struct Parser {
         return v;
       }
       while (true) {
-        v.arr.push_back(value());
+        v.arr.push_back(value(depth + 1));
         if (peek() == ',') {
           i++;
           continue;
@@ -143,7 +146,10 @@ const Json& null_json() {
 
 Json Json::parse(const std::string& text) {
   Parser p{text};
-  return p.value();
+  Json result = p.value();
+  p.ws();
+  if (p.i != text.size()) p.error("trailing data");
+  return result;
 }
 
 const Json& Json::operator[](const std::string& key) const {
@@ -159,7 +165,8 @@ const Json& Json::operator[](size_t idx) const {
 }
 
 int64_t Json::as_int() const {
-  if (kind != Number) fail("json: not a number");
+  if (kind != Number || !std::isfinite(num) || std::trunc(num) != num || num < -0x1p63 || num >= 0x1p63)
+    fail("json: not an int64");
   return int64_t(num);
 }
 

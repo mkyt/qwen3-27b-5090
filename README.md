@@ -348,6 +348,7 @@ dependency beyond the CUDA toolkit. Unit tests:
 
 ```bash
 docker compose --profile dev run --rm dev-cpu python -m pytest -q frontend/tests                # server: parsing, admission (seconds)
+docker compose --profile dev run --rm dev-cpu python -m pytest -q engine/tests_cpu              # malformed checkpoint readers, no GPU
 docker compose --profile dev run --rm dev-cpu bash -c 'cd reference && pytest -q'               # reference model on the CPU (seconds; -m slow: every layer, about 11 min and 10 GB of RAM)
 docker compose --profile dev run --rm dev bash -c 'cmake -S engine -B /build/engine -G Ninja && cmake --build /build/engine && cd engine/tests && python -m pytest -q'   # kernels against PyTorch (GPU, about 3 min)
 ```

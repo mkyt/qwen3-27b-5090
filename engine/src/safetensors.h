@@ -15,6 +15,7 @@ struct TensorInfo {
   int fd = -1;                  // shard file
   int64_t offset = 0;           // absolute byte offset in the shard file
   int64_t nbytes = 0;
+  int64_t file_size = 0;        // checked before a read; plans may use header-only files
 
   int64_t numel() const;
 };

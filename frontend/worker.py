@@ -195,7 +195,10 @@ class Scheduler:
         while self.conn.poll(0):
             msg = self.conn.recv()
             if msg[0] == "submit":
-                self.submit(msg[1], msg[2])
+                try:
+                    self.submit(msg[1], msg[2])
+                except (TypeError, ValueError, OverflowError) as e:
+                    self.send("error", msg[1], f"invalid request: {e}", 400)
             elif msg[0] == "cancel":
                 self.cancel(msg[1])
             elif msg[0] == "config":
@@ -218,9 +221,9 @@ class Scheduler:
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
         # prompt and tools) that no checkpoint holds yet: the later one waits until the earlier one has run
         # past it (with a checkpoint planned there) instead of computing it again.
-        p = array.array("i", s.prompt).tobytes()
+        p = s.ids_bytes()
         for o in list(self.alive) + list(self.waiting):
-            n = lcp_bytes(p, array.array("i", o.eng_ids).tobytes())
+            n = lcp_bytes(p, o.ids_bytes())
             n = min(n, len(s.prompt) - 1) // 64 * 64
             if n > max(s.reusable, s.share_len) + 256 and not (o.started and o.fed >= n):
                 s.share_with, s.share_len = o, n

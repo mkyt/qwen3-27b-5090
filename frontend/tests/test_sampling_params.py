@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from server import ApiError, sampling_of, token_controls_of  # noqa: E402
+from server import ApiError, checked_token_ids, sampling_of, token_controls_of  # noqa: E402
 
 
 def test_defaults():
@@ -46,3 +46,29 @@ def test_bad_token_controls(body):
     with pytest.raises(ApiError) as e:
         token_controls_of(body, 1000, 64)
     assert e.value.code == 400
+
+
+@pytest.mark.parametrize("body", [{"seed": {}}, {"seed": []}, {"seed": "1"}, {"seed": True}, {"seed": 1.5},
+                                  {"temperature": float("nan")}, {"temperature": float("inf")}, {"temperature": -1},
+                                  {"top_p": float("nan")}, {"top_p": 2}, {"top_k": 2**32}, {"top_k": 1.5}])
+def test_invalid_sampling_is_a_client_error(body):
+    with pytest.raises(ApiError) as e:
+        sampling_of(body)
+    assert e.value.code == 400
+
+
+def test_integer_seeds_and_unlimited_top_k():
+    for seed in (None, 0, -123, 2**63):
+        assert sampling_of({"seed": seed})["seed"] == seed
+    assert sampling_of({"top_k": -1})["top_k"] == 0
+
+
+@pytest.mark.parametrize("ids", [[-1], [248320], [2**31], [1.5], [True], [{}], [None], "hello"])
+def test_bad_prompt_tokens_are_rejected(ids):
+    with pytest.raises(ApiError) as e:
+        checked_token_ids(ids, 248320)
+    assert e.value.code == 400
+
+
+def test_prompt_tokens_in_vocabulary():
+    assert checked_token_ids([0, 248319], 248320) == [0, 248319]

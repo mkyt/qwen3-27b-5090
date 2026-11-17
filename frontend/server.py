@@ -19,7 +19,10 @@ Requests are cancelled when the client disconnects or a stop string matches.
 
 import argparse
 import base64
+import io
 import json
+import ipaddress
+import math
 import multiprocessing as mp
 import os
 import pathlib
@@ -31,7 +34,7 @@ import sys
 import threading
 import time
 import traceback
-import urllib.request
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -55,6 +58,11 @@ KEEPALIVE_S = 10.0
 DUMP_DIR = os.environ.get("API_DUMP_DIR")  # debug: write every POST body there
 UI_PAGE = ROOT / "frontend/ui/index.html"
 GENERATE = ("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages")
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", 384 << 20))  # a base64-encoded 256 MiB video fits
+HTTP_BODY_BUDGET = int(os.environ.get("HTTP_BODY_BUDGET", 512 << 20))
+HTTP_MAX_CONNECTIONS = int(os.environ.get("HTTP_MAX_CONNECTIONS", 32))
+HTTP_TIMEOUT_S = float(os.environ.get("HTTP_TIMEOUT_S", 30))
+MAX_PENDING_REQUESTS = int(os.environ.get("MAX_PENDING_REQUESTS", 32))
 
 
 def log(msg):
@@ -145,11 +153,15 @@ class Images:
 
         limit = self.MAX_BYTES[kind]
         if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
-            raw = base64.b64decode(url.split(";base64,", 1)[1])
+            encoded = url.split(";base64,", 1)[1]
+            if len(encoded) > 4 * ((limit + 2) // 3):
+                raise ApiError(400, f"{kind} larger than {limit >> 20} MiB")
+            raw = base64.b64decode(encoded, validate=True)
         elif isinstance(url, str) and url.startswith(("http://", "https://")):
+            from media import fetch
+
             try:
-                with urllib.request.urlopen(url, timeout=30 if kind == "image" else 120) as r:
-                    raw = r.read(limit + 1)
+                raw = fetch(url, limit, timeout=30 if kind == "image" else 120)
             except Exception as e:  # noqa: BLE001 - any fetch error is the client's
                 raise ApiError(400, f"cannot fetch {kind} {url}: {e}") from e
         else:
@@ -178,7 +190,15 @@ class Images:
         from qwen27b.image_tokens import image_token_ids
 
         image_pad, video_pad, vstart, vend = pads
-        loaded = [(kind, *self.load(u, kind)) for kind, u in media]
+        if len(media) > 32:
+            raise ApiError(400, "at most 32 images and videos per request")
+        loaded, total = [], 0
+        for kind, url in media:
+            raw, size = self.load(url, kind)
+            total += len(raw)
+            if total > self.MAX_BYTES["video"]:
+                raise ApiError(400, "images and videos together exceed 256 MiB")
+            loaded.append((kind, raw, size))
         out, spans, srcs, videos, k = [], [], [], [], 0
         for t in ids:
             if t not in (image_pad, video_pad) or k >= len(loaded):
@@ -440,6 +460,8 @@ class EngineClient:
                 self.last_active = time.monotonic()
                 on_demand = self.on_demand
                 if self.ready.is_set() and on_demand != "unloaded":
+                    if len(self.handles) >= MAX_PENDING_REQUESTS:
+                        raise ApiError(503, "too many pending requests", "overloaded_error")
                     self.handles[rid] = q
                     break
             if not on_demand:
@@ -853,6 +875,21 @@ def sampling_of(body, top_k_key="top_k"):
     temp = body.get("temperature")
     top_p = body.get("top_p")
     top_k = body.get(top_k_key)
+    seed = body.get("seed")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ApiError(400, "seed: an integer is required")
+    try:
+        temp = float(DEFAULTS["temperature"] if temp is None else temp)
+        top_p = float(DEFAULTS["top_p"] if top_p is None else top_p)
+        top_k = DEFAULTS["top_k"] if top_k is None else top_k
+        if isinstance(top_k, bool) or not isinstance(top_k, int):
+            raise ValueError()
+    except (TypeError, ValueError, OverflowError):
+        raise ApiError(400, "temperature and top_p must be numbers; top_k must be an integer") from None
+    if not math.isfinite(temp) or temp < 0 or not 0 <= top_p <= 1:
+        raise ApiError(400, "temperature must be finite and nonnegative; top_p must be in [0, 1]")
+    if top_k > 248320:
+        raise ApiError(400, "top_k exceeds the vocabulary")
     extra = {}
     for key, lo, hi in (("min_p", 0.0, 1.0), ("presence_penalty", -2.0, 2.0), ("frequency_penalty", -2.0, 2.0)):
         v = body.get(key)
@@ -863,9 +900,13 @@ def sampling_of(body, top_k_key="top_k"):
         if not lo <= v <= hi:
             raise ApiError(400, f"{key}: must be in [{lo:g}, {hi:g}], got {v:g}")
         extra[key] = v
-    return {"temperature": float(DEFAULTS["temperature"] if temp is None else temp),
-            "top_k": int(DEFAULTS["top_k"] if top_k is None else top_k) if (top_k is None or top_k >= 0) else 0,
-            "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": body.get("seed"), **extra}
+    return {"temperature": temp, "top_k": max(0, top_k), "top_p": top_p, "seed": seed, **extra}
+
+
+def checked_token_ids(ids, vocab):
+    if not isinstance(ids, list) or any(isinstance(t, bool) or not isinstance(t, int) or not 0 <= t < vocab for t in ids):
+        raise ApiError(400, f"tokens must be integers in [0, {vocab - 1}]")
+    return ids
 
 
 MAX_BIAS = 300  # (OpenAI's limit, kMaxBias)
@@ -967,15 +1008,114 @@ def stops_of(value):
     return [value] if isinstance(value, str) else [s for s in value if isinstance(s, str)]
 
 
+class DeadlineReader(io.RawIOBase):
+    """Apply an absolute deadline at every socket read, including reads inside a buffered header line."""
+
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline = sock, deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self.deadline() - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("HTTP read deadline exceeded")
+        self.sock.settimeout(remaining)
+        return self.sock.recv_into(buffer)
+
+
 class HTTPServer(ThreadingHTTPServer):
     # The default listen backlog of 5 refuses a burst of 6+ connections at once on Windows (llama-swap 502, issue #7).
     request_queue_size = 128
     daemon_threads = True
 
+    def __init__(self, *args, **kwargs):
+        self.slots = threading.BoundedSemaphore(max(1, HTTP_MAX_CONNECTIONS))
+        self.body_lock, self.body_bytes = threading.Lock(), 0
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        sock, address = super().get_request()
+        sock.settimeout(HTTP_TIMEOUT_S)
+        return sock, address
+
+    def reserve_body(self, n):
+        with self.body_lock:
+            if n > HTTP_BODY_BUDGET - self.body_bytes:
+                return False
+            self.body_bytes += n
+            return True
+
+    def release_body(self, n):
+        with self.body_lock:
+            self.body_bytes -= n
+
+    def process_request(self, request, address):
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.slots.release()
+
 
 class Handler(BaseHTTPRequestHandler):
     srv: Server = None
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        self.rfile.close()
+        self.read_deadline = time.monotonic() + HTTP_TIMEOUT_S
+        self.rfile = io.BufferedReader(DeadlineReader(self.connection, lambda: self.read_deadline))
+
+    def handle_one_request(self):
+        self.read_deadline = time.monotonic() + HTTP_TIMEOUT_S
+        super().handle_one_request()
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        # IP literals and localhost work out of the box. Other names must be explicitly trusted to stop DNS
+        # rebinding against a loopback-only server. This is not authentication for a server exposed to a network.
+        try:
+            hosts = self.headers.get_all("Host", [])
+            if len(hosts) != 1:
+                raise ValueError()
+            host = urllib.parse.urlsplit("//" + hosts[0])
+            if not host.hostname or host.username is not None or host.path or host.query or host.fragment:
+                raise ValueError()
+            name = host.hostname.lower().rstrip(".")
+            allowed = {h.strip().lower().rstrip(".") for h in os.environ.get("API_ALLOWED_HOSTS", "").split(",")}
+            if name != "localhost" and name not in allowed:
+                ipaddress.ip_address(name)
+            origin = self.headers.get("Origin")
+            if self.headers.get("Sec-Fetch-Site") == "cross-site":
+                raise ValueError()
+            if origin:
+                src = urllib.parse.urlsplit(origin)
+                if (src.scheme not in ("http", "https") or src.username is not None or src.path or src.query or src.fragment
+                        or src.hostname != host.hostname or
+                        (src.port or (443 if src.scheme == "https" else 80)) != (host.port or (443 if src.scheme == "https" else 80))):
+                    raise ValueError()
+        except ValueError:
+            self.close_connection = True
+            self._error(403, "untrusted Host or Origin (API_ALLOWED_HOSTS for a trusted server name)")
+            return False
+        return True
 
     def log_message(self, fmt, *args):
         if self.command == "GET" and self.path.split("?")[0] in ("/health", "/metrics", "/ui/state"):
@@ -1096,13 +1236,51 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        close = self.close_connection
+        self.close_connection = True  # errors before consuming a body must not leave it as another request
+        if self.headers.get_content_type() != "application/json":
+            return self._error(415, "send JSON (Content-Type: application/json)")
+        lengths = self.headers.get_all("Content-Length", [])
+        if (self.headers.get("Transfer-Encoding") or len(lengths) != 1 or
+                not lengths[0].isascii() or not lengths[0].isdecimal()):
+            return self._error(400, "one nonnegative Content-Length is required; chunked requests are not supported")
+        if len(lengths[0]) > 20:
+            return self._error(413, "request body is too large")
+        n = int(lengths[0])
+        if n > MAX_REQUEST_BYTES:
+            return self._error(413, "request body is too large")
+        if not self.server.reserve_body(n):
+            return self._error(503, "request body memory budget is busy", "overloaded_error")
         try:
-            n = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(n) or b"{}")
+            self._post_body(n, close)
+        except TimeoutError:
+            self._error(408, "request body or response timed out")
+        finally:
+            self.server.release_body(n)
+
+    def _post_body(self, n, close):
+        try:
+            self.read_deadline = deadline = time.monotonic() + HTTP_TIMEOUT_S
+            raw = bytearray()
+            while len(raw) < n:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError()
+                self.connection.settimeout(remaining)
+                chunk = self.rfile.read1(min(65536, n - len(raw)))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            if len(raw) != n:
+                raise ValueError("truncated request body")
+            body = json.loads(raw or b"{}")
+            del raw
             if not isinstance(body, dict):
                 raise ValueError("the request body must be a JSON object")
-        except (ValueError, json.JSONDecodeError) as e:
+        except (ValueError, RecursionError) as e:
             return self._error(400, f"bad JSON: {e}")
+        self.close_connection = close
+        self.connection.settimeout(HTTP_TIMEOUT_S)
         path = self.path.split("?")[0].rstrip("/")
         if DUMP_DIR:  # (debug: the requests as clients send them; a failed write does not fail the request)
             name = f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}{path.replace('/', '_')}.json"
@@ -1120,15 +1298,15 @@ class Handler(BaseHTTPRequestHandler):
         fn = routes.get(path)
         if fn is None:
             return self._error(404, "not found", "not_found")
-        HUB.local.meta = request_meta(path, self.headers, body) if path in GENERATE else None
         try:
+            HUB.local.meta = request_meta(path, self.headers, body) if path in GENERATE else None
             fn(body)
         except ApiError as e:
             HUB.http_error(path, e.code, str(e))
             self._error(e.code, str(e), e.kind)
         except (AnthropicError, ValueError, KeyError, TypeError) as e:
             self._error(400, f"{type(e).__name__}: {e}" if not isinstance(e, (AnthropicError, ValueError)) else str(e))
-        except (BrokenPipeError, ConnectionResetError, ClientGone):
+        except (BrokenPipeError, ConnectionResetError, ClientGone, TimeoutError):
             log(f"{path}: client disconnected")
             self.close_connection = True
         except Exception as e:  # noqa: BLE001 - report instead of dropping the connection
@@ -1253,7 +1431,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(prompt) != 1:
                 raise ApiError(400, "only one prompt per request is supported")
             prompt = prompt[0]
-        ids = prompt if isinstance(prompt, list) else self.srv.encode(prompt)
+        ids = checked_token_ids(prompt, self.srv.vocab) if isinstance(prompt, list) else self.srv.encode(prompt)
         if not ids:
             raise ApiError(400, "empty prompt")
         left = self.srv.limit(len(ids))
@@ -1579,8 +1757,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"tokens": ids, "count": len(ids), "max_model_len": self.srv.max_tokens})
 
     def detokenize(self, body):
+        ids = checked_token_ids(body.get("tokens") or [], self.srv.vocab)
         with self.srv.tok_lock:
-            text = self.srv.tok.decode(body.get("tokens") or [])
+            text = self.srv.tok.decode(ids)
         self._json(200, {"prompt": text})
 
 

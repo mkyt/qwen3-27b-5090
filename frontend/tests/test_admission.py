@@ -9,6 +9,34 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import worker  # noqa: E402
 
 
+def test_bad_submission_does_not_kill_other_requests():
+    s = object.__new__(worker.Scheduler)
+    s.returns, s.history, s.waiting = collections.deque(), collections.deque(), collections.deque()
+    s.alive, s.by_id, s.m = [], {}, collections.Counter()
+    s.im_start, s.user, s.breaks = 100, 101, frozenset()
+    req = dict(ids=[1, 2], max_new=1, temperature=1.0, top_k=20, top_p=0.95)
+    inbox = collections.deque([("submit", "bad-seed", dict(req, seed={})),
+                               ("submit", "good", req), ("submit", "bad-ids", dict(req, ids=[2**31]))])
+
+    class Pipe:
+        sent = []
+
+        def poll(self, timeout):
+            return bool(inbox)
+
+        def recv(self):
+            return inbox.popleft()
+
+        def send(self, msg):
+            self.sent.append(msg)
+
+    s.conn = Pipe()
+    s.poll(False)
+    assert list(s.by_id) == ["good"]
+    assert [r.rid for r in s.waiting] == ["good"]
+    assert [(m[0], m[1], m[-1]) for m in s.conn.sent] == [("error", "bad-seed", 400), ("error", "bad-ids", 400)]
+
+
 class FakeEngine:
     def __init__(self, free, ckpt_only=0, park=171):
         self.st = {"free_pages": free, "checkpoint_only_pages": ckpt_only, "park_pages": park, "checkpoints": 0,

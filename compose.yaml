@@ -64,6 +64,13 @@ services:
       Q27_LOAD_THREADS: ${Q27_LOAD_THREADS:-8}     # threads reading the weight files ahead of the uploads
       STATS_SAMPLE_S: ${STATS_SAMPLE_S:-1}         # seconds between the GPU samples of /ui (0: none)
       API_DUMP_DIR: ${API_DUMP_DIR:-}              # debugging: write every POST body to this directory in the container
+      API_ALLOWED_HOSTS: ${API_ALLOWED_HOSTS:-}    # trusted DNS names in Host / Origin (IP literals and localhost always work)
+      MEDIA_PRIVATE_HOSTS: ${MEDIA_PRIVATE_HOSTS:-}  # exact hosts allowed to serve media from private addresses
+      MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-402653184}  # 384 MiB, including base64 / JSON overhead
+      HTTP_BODY_BUDGET: ${HTTP_BODY_BUDGET:-536870912}     # 512 MiB across unfinished POST bodies
+      HTTP_MAX_CONNECTIONS: ${HTTP_MAX_CONNECTIONS:-32}
+      HTTP_TIMEOUT_S: ${HTTP_TIMEOUT_S:-30}
+      MAX_PENDING_REQUESTS: ${MAX_PENDING_REQUESTS:-32}   # running + queued generations; excess requests get 503
       ENGINE_IDLE_UNLOAD_S: ${ENGINE_IDLE_UNLOAD_S:-0}  # seconds without a request before the engine frees its VRAM (0: off)
       MAX_TOKENS: ${MAX_TOKENS:-262144}
       MAX_TOKENS_FIT: ${MAX_TOKENS_FIT:-1}         # 1: lower MAX_TOKENS to what the VRAM fits (since P7-13 MAX_SEQS=8 fits 262144)
