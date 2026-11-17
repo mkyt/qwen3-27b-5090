@@ -477,7 +477,8 @@ path if the folder moved.
 ### Updating
 
 From v0.3.1, run `update.cmd` in the package's folder. It downloads the latest release's zip (an interrupted download
-resumes when run again), checks its SHA-256, quits the tray app of this folder, replaces `python\`, `app\` and the
+resumes when run again), checks its SHA-256 (the `update.cmd` of v0.6.2 and later stops when it cannot get the
+SHA-256, instead of installing an unchecked zip), quits the tray app of this folder, replaces `python\`, `app\` and the
 files next to them, and starts the tray app again if it was running. `settings.ini`, the weights and the log stay. If a
 step fails, the old version is put back. A server started with `start.cmd` has to be closed by hand.
 
