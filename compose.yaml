@@ -64,6 +64,7 @@ services:
       Q27_LOAD_THREADS: ${Q27_LOAD_THREADS:-8}     # threads reading the weight files ahead of the uploads
       STATS_SAMPLE_S: ${STATS_SAMPLE_S:-1}         # seconds between the GPU samples of /ui (0: none)
       API_DUMP_DIR: ${API_DUMP_DIR:-}              # debugging: write every POST body to this directory in the container
+      TRUSTED_ORIGINS: ${TRUSTED_ORIGINS:-}        # web origins whose pages may POST from a browser (besides the server's own)
       ENGINE_IDLE_UNLOAD_S: ${ENGINE_IDLE_UNLOAD_S:-0}  # seconds without a request before the engine frees its VRAM (0: off)
       MAX_TOKENS: ${MAX_TOKENS:-262144}
       MAX_TOKENS_FIT: ${MAX_TOKENS_FIT:-1}         # 1: lower MAX_TOKENS to what the VRAM fits (since P7-13 MAX_SEQS=8 fits 262144)

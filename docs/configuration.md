@@ -55,8 +55,14 @@ your network, set `HOST` to `0.0.0.0`:
 Use `0.0.0.0` rather than the PC's own address: the tray app and `scripts/serve.sh` check the server on `127.0.0.1`.
 
 **Security:** there is no authentication. Anyone who can reach the port can use the model, and can stop the engine and
-change its settings through the admin API and the stats page. Do this only on a network you trust, and do not forward the
-port to the internet.
+change its settings through the admin API and the stats page. It can also make the server fetch image and video URLs
+from the server's network (including addresses only that machine can reach). Do this only on a network you trust, and
+do not forward the port to the internet.
+
+POST requests that a browser sends from a page of another site (an `Origin` header other than the server's own) get
+403, so a web page you visit cannot use the server through your browser, even when it listens only on `127.0.0.1`.
+API clients send no `Origin` and are not affected, nor is the built-in UI. Behind a reverse proxy, the proxy must pass
+`Host` or set `X-Forwarded-Host`. `TRUSTED_ORIGINS` allows other origins.
 
 **Windows Firewall:** the first start of the Windows package with `0.0.0.0` asks whether to allow Python; allow it for
 private networks. If you closed that prompt, add a rule in an administrator PowerShell:
@@ -95,6 +101,7 @@ everywhere above.
 | --- | --- | --- |
 | `HOST` | `frontend/server.py` run directly: 0.0.0.0. Docker and the Windows package: 127.0.0.1 | Address to listen on. `0.0.0.0`: the network ([Using it from other machines](#using-it-from-other-machines)). With Docker, the address published on the host: the server in the container always listens on all its addresses |
 | `PORT` | 8000 | Port of the API and the web UI. With Docker, the port published on the host; in the container it stays 8000 |
+| `TRUSTED_ORIGINS` | empty | Web origins (`scheme://host[:port]`, comma-separated; `*`: any) whose pages may send POST requests from a browser, besides the server's own. The server sends no CORS headers, so such a page can only send them, not read the answers ([Using it from other machines](#using-it-from-other-machines)) |
 | `SERVED_MODEL_NAME` | `qwen3.8-27b` | Name in `/v1/models` (requests may use any model name) |
 | `MAX_TOKENS` | 262144 | Context limit of one request. If the KV pool cannot hold it, `MAX_TOKENS_FIT` lowers it; the value in effect is in the startup log (`max_tokens ... lowered to`) and in `/v1/models` (`max_model_len`) |
 | `MAX_TOKENS_FIT` | 1 | 1: start with `MAX_TOKENS` lowered to what the KV pool holds (a multiple of 1,024). 0: fail to start instead (the service then restarts every 60 s). The engine library (`q27lib.Engine`) defaults to 0 |

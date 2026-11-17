@@ -1001,6 +1001,28 @@ def stops_of(value):
     return [value] if isinstance(value, str) else [s for s in value if isinstance(s, str)]
 
 
+def origin_allowed(headers):
+    """Whether a POST may run: browsers send Origin with every cross-origin POST, and a form or text/plain POST of
+    another site's page is sent without a CORS preflight, so it would run (stop the engine, change settings, start
+    generations) although the page cannot read the answer. API clients (SDKs, curl, agents) send no Origin. Allowed:
+    no Origin, the server's own (the built-in UI; Host, or X-Forwarded-Host behind a reverse proxy) and those in
+    TRUSTED_ORIGINS (comma-separated, e.g. https://chat.example.internal; *: any)."""
+    origin = headers.get("Origin")
+    if origin is None:
+        return True
+    trusted = {o.strip().rstrip("/").lower() for o in os.environ.get("TRUSTED_ORIGINS", "").split(",") if o.strip()}
+    origin = origin.strip().rstrip("/").lower()
+    if "*" in trusted or origin in trusted:
+        return True
+    scheme, sep, hostport = origin.partition("://")
+    if not sep or scheme not in ("http", "https") or not hostport:
+        return False  # ("null": a sandboxed frame or a file)
+    default = ":443" if scheme == "https" else ":80"
+    own = {h.split(",")[0].strip().lower() for h in (headers.get("Host"), headers.get("X-Forwarded-Host")) if h}
+    norm = lambda h: h if ":" in h.rsplit("]", 1)[-1] else h + default  # noqa: E731 (an IPv6 host is in [])
+    return norm(hostport) in {norm(h) for h in own}
+
+
 class HTTPServer(ThreadingHTTPServer):
     # The default listen backlog of 5 refuses a burst of 6+ connections at once on Windows (llama-swap 502, issue #7).
     request_queue_size = 128
@@ -1130,6 +1152,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if not origin_allowed(self.headers):
+            self.close_connection = True  # (the body is not read)
+            return self._error(403, "cross-origin request: a web page of another site cannot use this server "
+                                    "(TRUSTED_ORIGINS lists origins to allow)", "permission_error")
         try:
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or b"{}")
