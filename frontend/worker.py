@@ -212,7 +212,8 @@ class Scheduler:
         try:
             s = Seq(rid, req, time.time())
             array.array("i", s.prompt)  # (integers that fit int32)
-            if s.prompt and (min(s.prompt) < 0 or max(s.prompt) >= VOCAB):
+            # (an image's positions hold ids above the vocabulary: image_tokens.image_token_ids)
+            if s.prompt and (min(s.prompt) < 0 or (max(s.prompt) >= VOCAB and not s.images)):
                 raise ValueError(f"a prompt token id is out of the vocabulary (0..{VOCAB - 1})")
         except (TypeError, ValueError, KeyError, OverflowError) as e:
             self.send("error", rid, f"bad request: {e}", 400)

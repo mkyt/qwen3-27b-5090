@@ -1185,8 +1185,11 @@ void Model::mm_put(int i, const bf16* in) {
 }
 
 void Model::upload_ids(const int32_t* ids, int T) {
+  // The embedding lookup reads row id: outside an image's rows (which are set here), a caller's id must be a token of
+  // the vocabulary. (Image positions hold out-of-vocabulary ids derived from the image: the prefix cache's keys.)
   mpos_on_ = false;
   if (mm_spans_.empty()) {
+    for (int t = 0; t < T; t++) Q27_CHECK(ids[t] >= 0 && ids[t] < kVocab, "token id out of the vocabulary");
     Q27_CUDA(cudaMemcpyAsync(ids_, ids, size_t(T) * 4, cudaMemcpyHostToDevice, s_));
     return;
   }
@@ -1209,8 +1212,9 @@ void Model::upload_ids(const int32_t* ids, int T) {
       const int r = p - sp.start, base = sp.start + delta;
       tr[t] = kVocab + sp.row + r;
       if (mpos_on_) mp[3 * t] = base, mp[3 * t + 1] = base + r / sp.gw, mp[3 * t + 2] = base + r % sp.gw;
-    } else if (mpos_on_) {
-      mp[3 * t] = mp[3 * t + 1] = mp[3 * t + 2] = p + delta;
+    } else {
+      Q27_CHECK(tr[t] >= 0 && tr[t] < kVocab, "token id out of the vocabulary");
+      if (mpos_on_) mp[3 * t] = mp[3 * t + 1] = mp[3 * t + 2] = p + delta;
     }
   }
   Q27_CUDA(cudaMemcpyAsync(ids_, tr.data(), size_t(T) * 4, cudaMemcpyHostToDevice, s_));
