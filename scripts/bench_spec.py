@@ -108,7 +108,7 @@ def main():
     ap.add_argument("--kv-fp8", action="store_true", help="FP8 KV cache")
     ap.add_argument("--kv-dtype", choices=["bf16", "fp8", "nvfp4"], default=None,
                     help="KV cache dtype; overrides --kv-fp8 when supplied")
-    ap.add_argument("--weights", default="nvidia", help="weight profile (Phase Q): nvidia | quasar | a model directory")
+    ap.add_argument("--weights", default="nvidia", help="weight/tokenizer profile: nvidia | gdnfp4 | quasar | a model directory")
     ap.add_argument("--draft", default="dflash2", help="draft model: dflash2 | dspine | a directory")
     args = ap.parse_args()
     if args.check_exact and args.check_greedy <= 0:
@@ -120,7 +120,7 @@ def main():
     from transformers import AutoTokenizer
 
     from q27lib import Engine
-    from qwen27b.weights import DFLASH2, DSPINE, TARGET, engine_target, snapshot
+    from qwen27b.weights import DFLASH2, DSPINE, engine_target, snapshot
 
     def draft_dir(d):
         return snapshot(*{"dflash2": DFLASH2, "dspine": DSPINE}[d]) if d in ("dflash2", "dspine") else d
@@ -136,9 +136,10 @@ def main():
         settings.update({k: v for k, v in os.environ.items() if k.startswith("Q27_")})
         mode = "exact policy" if args.check_exact else "runtime settings"
         print(f"greedy check ({mode}): {json.dumps(settings, sort_keys=True)}", flush=True)
-    tok = AutoTokenizer.from_pretrained(snapshot(*TARGET))
+    model = engine_target(args.weights)
+    tok = AutoTokenizer.from_pretrained(model)
     t0 = time.perf_counter()
-    eng = Engine(engine_target(args.weights), max_tokens=8192,
+    eng = Engine(model, max_tokens=8192,
                  kv_dtype=args.kv_dtype or ("fp8" if args.kv_fp8 else "bf16"), draft=draft_dir(args.draft))
     print(f"load {time.perf_counter() - t0:.1f} s", flush=True)
     names = args.prompts.split(",")

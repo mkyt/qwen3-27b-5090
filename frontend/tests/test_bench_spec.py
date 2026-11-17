@@ -14,12 +14,14 @@ bench = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bench)
 
 
-def run_check(monkeypatch, args=(), plain=(1, 2), drafted=(1, 2)):
+def run_check(monkeypatch, args=(), plain=(1, 2), drafted=(1, 2), model_paths=None, loads=None):
     seen = []
 
     class Engine:
         def __init__(self, *a, **kw):
             seen.append({k: v for k, v in os.environ.items() if k.startswith("Q27_")})
+            if loads is not None:
+                loads.append(("engine", a[0]))
 
         def reset(self):
             pass
@@ -31,11 +33,31 @@ def run_check(monkeypatch, args=(), plain=(1, 2), drafted=(1, 2)):
             return {"lookup_steps": 0, "steps": 1}
 
     tok = SimpleNamespace(decode=lambda ids: str(ids))
-    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=lambda p: tok)))
+
+    def tokenizer(path):
+        if loads is not None:
+            loads.append(("tokenizer", path))
+        if model_paths is not None and path not in model_paths.values():
+            raise FileNotFoundError("only the selected model's tokenizer is installed")
+        return tok
+
+    def model_dir(profile):
+        if loads is not None:
+            loads.append(("resolve", profile))
+        return model_paths[profile] if model_paths is not None else profile
+
+    def snapshot(repo, rev):
+        if model_paths is not None and repo == "target":
+            if "nvidia" not in model_paths:
+                raise FileNotFoundError("the NVIDIA checkpoint is not installed")
+            return model_paths["nvidia"]
+        return "unused"
+
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=tokenizer)))
     monkeypatch.setitem(sys.modules, "q27lib", SimpleNamespace(Engine=Engine))
     monkeypatch.setitem(sys.modules, "qwen27b.weights", SimpleNamespace(
         DFLASH2=("draft", "rev"), DSPINE=("dspine", "rev"), TARGET=("target", "rev"),
-        engine_target=lambda p: p, snapshot=lambda *a: "unused"))
+        engine_target=model_dir, snapshot=snapshot))
     monkeypatch.setattr(bench, "chat_ids", lambda *a: [1])
     monkeypatch.setattr(bench, "run_plain", lambda *a: list(plain))
     monkeypatch.setattr(bench, "run_spec", lambda *a: (list(drafted), 1, 0.0, 0.0))
@@ -97,3 +119,15 @@ def test_chat_template_uses_the_requested_reasoning_mode(thinking):
         return {"input_ids": [1, 2]}
 
     assert bench.chat_ids(SimpleNamespace(apply_chat_template=template), "explain", thinking) == [1, 2]
+
+
+@pytest.mark.parametrize("args, profile, directory", [
+    ([], "nvidia", "/cache/nvidia"),
+    (["--weights", "gdnfp4", "--draft", "dspine"], "gdnfp4", "/cache/gdnfp4"),
+    (["--weights", "/models/custom template"], "/models/custom template", "/models/custom template"),
+])
+def test_tokenizer_and_engine_share_the_selected_model_directory(monkeypatch, args, profile, directory):
+    loads = []
+    status, _ = run_check(monkeypatch, args, model_paths={profile: directory}, loads=loads)
+    assert status == 0
+    assert sorted(loads) == sorted([("resolve", profile), ("tokenizer", directory), ("engine", directory)])
