@@ -3,6 +3,9 @@
 import json
 import pathlib
 import sys
+import warnings
+
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -52,6 +55,26 @@ def test_normalize_messages_parses_arguments():
 
 from chat import (OutputParser, _convert, anthropic_messages, anthropic_template_kwargs,  # noqa: E402
                   parse_output, template_kwargs)
+
+
+@pytest.mark.parametrize("value", [r"grep a\|b", r"'grep a\|b'", r"'grep a\[b'", r"'grep a\.b'", "True", "None", "['x']"])
+def test_untyped_arguments_do_not_parse_python_literals_or_warn(value):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert _convert(value, {}) == value
+    assert not caught
+
+
+@pytest.mark.parametrize("value, expected", [("true", True), ("null", None), ("123", 123), ("[1, 2]", [1, 2])])
+def test_untyped_json_arguments_keep_existing_conversion(value, expected):
+    assert _convert(value, {}) == expected
+
+
+def test_typed_python_literals_still_parse_without_syntax_warnings():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert _convert(r"['grep a\|b', True, None]", {"type": "array"}) == [r"grep a\|b", True, None]
+    assert not caught
 
 OUT = ("Let me check the file first.\nThen answer.\n</think>\n\nI'll read it.\n\n<tool_call>\n<function=read_file>\n"
        "<parameter=path>\nsrc/main.py\n</parameter>\n<parameter=limit>\n20\n</parameter>\n</function>\n</tool_call>\n"

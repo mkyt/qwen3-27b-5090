@@ -12,6 +12,7 @@ import base64
 import json
 import re
 import uuid
+import warnings
 
 THINK_END = "</think>"
 TOOL_START, TOOL_END = "<tool_call>", "</tool_call>"
@@ -60,20 +61,26 @@ def _types(schema):
 
 def _convert(value, schema):
     """A parameter's text by its JSON schema: strings stay as they are, other types are parsed (JSON, then
-    Python literals such as True / None, as vLLM's qwen3_coder parser does); unparsable text stays a string."""
+    Python literals such as True / None). Without a type, only JSON is parsed; other text stays a string."""
     types = _types(schema)
     if types == {"string"}:
         return value
     v = value.strip()
     if "boolean" in types and v.lower() in ("true", "false"):
         return v.lower() == "true"
-    if v.lower() in ("null", "none") and ("null" in types or not types):
+    if v.lower() in ("null", "none") and "null" in types:
         return None
     try:
         out = json.loads(v)
     except (json.JSONDecodeError, ValueError):
+        if not types:
+            return value
         try:
-            out = ast.literal_eval(v)
+            # Model-generated literals can contain shell/regex escapes that Python warns about. Keep the
+            # typed fallback compatible without emitting compiler diagnostics into the server log.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                out = ast.literal_eval(v)
         except (ValueError, SyntaxError, MemoryError, RecursionError):
             return value
     if "string" in types and not isinstance(out, (dict, list, bool, int, float)) and out is not None:
