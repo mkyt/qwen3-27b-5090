@@ -89,6 +89,16 @@ def test_prefix_bytes_follow_growth():
     assert s.ids_bytes() == seq(2, 0, ids=[1, 2, 3, 4]).ids_bytes()
 
 
+def test_restart_refreshes_prefix_bytes_even_when_token_count_is_unchanged():
+    sch = scheduler(FakeEngine(free=10000))
+    sch.cur = None
+    s = seq(1, 0, ids=[1, 2, 3])
+    s.ids_bytes()
+    s.prompt = [4, 5, 6]
+    sch.restart(s)
+    assert s.ids_bytes() == seq(2, 0, ids=[4, 5, 6]).ids_bytes()
+
+
 def test_reassigned_ids_do_not_share_a_stale_prefix():
     sch = scheduler(FakeEngine(free=10000))
     sch.history, sch.by_id = collections.deque(), {}
