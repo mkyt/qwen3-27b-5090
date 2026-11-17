@@ -71,6 +71,41 @@ def seq(rid, n, max_new=10_000, ids=None, started=False, fed=0, area=None, out=0
     return s
 
 
+def test_prefix_bytes_follow_same_length_replacement_and_stay_cached():
+    s = seq(1, 0, ids=[1, 2, 3])
+    old = s.ids_bytes()
+    assert s.ids_bytes() is old
+    s.eng_ids = [4, 5, 6]
+    expected = seq(2, 0, ids=[4, 5, 6]).ids_bytes()
+    assert s.ids_bytes() == expected
+    assert s.ids_bytes() != old
+    assert s.ids_bytes() is s.ids_bytes()
+
+
+def test_prefix_bytes_follow_growth():
+    s = seq(1, 0, ids=[1, 2, 3])
+    s.ids_bytes()
+    s.eng_ids.append(4)
+    assert s.ids_bytes() == seq(2, 0, ids=[1, 2, 3, 4]).ids_bytes()
+
+
+def test_reassigned_ids_do_not_share_a_stale_prefix():
+    sch = scheduler(FakeEngine(free=10000))
+    sch.history, sch.by_id = collections.deque(), {}
+    sch.im_start, sch.user, sch.breaks = 100, 101, frozenset()
+    earlier = seq(1, 0, ids=[1] * 512)
+    earlier.ids_bytes()
+    earlier.eng_ids = [2] * 512
+    sch.waiting.append(earlier)
+    req = dict(ids=[1] * 512, max_new=1, temperature=1.0, top_k=20, top_p=0.95)
+    sch.submit("old-prefix", req)
+    assert sch.by_id["old-prefix"].share_with is None
+    assert sch.by_id["old-prefix"].share_len == 0
+    sch.submit("new-prefix", dict(req, ids=[2] * 512))
+    assert sch.by_id["new-prefix"].share_with is earlier
+    assert sch.by_id["new-prefix"].share_len == 448
+
+
 def test_first_request_always_starts():
     sch = scheduler(FakeEngine(free=0))
     assert sch.admit(seq(1, 300_000))
