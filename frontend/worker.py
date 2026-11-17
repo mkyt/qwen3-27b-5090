@@ -205,7 +205,12 @@ class Scheduler:
                 raise SystemExit(0)
 
     def submit(self, rid, req):
-        s = Seq(rid, req, time.time())
+        # (the server checks the request; a malformed one that gets past it fails alone, not the engine)
+        try:
+            s = Seq(rid, req, time.time())
+        except (TypeError, ValueError, KeyError, OverflowError) as e:
+            self.send("error", rid, f"bad request: {e}", 400)
+            return
         if s.grammar is not None:
             try:
                 s.matcher = self.matcher(s.grammar)

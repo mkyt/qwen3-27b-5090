@@ -865,7 +865,15 @@ def sampling_of(body, top_k_key="top_k"):
         extra[key] = v
     return {"temperature": float(DEFAULTS["temperature"] if temp is None else temp),
             "top_k": int(DEFAULTS["top_k"] if top_k is None else top_k) if (top_k is None or top_k >= 0) else 0,
-            "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": body.get("seed"), **extra}
+            "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": seed_of(body), **extra}
+
+
+def seed_of(body):
+    """The request's seed: an integer or null (random.Random takes other types, or raises on them)."""
+    seed = body.get("seed")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ApiError(400, f"seed: an integer or null is required, got {seed!r:.40}")
+    return seed
 
 
 MAX_BIAS = 300  # (OpenAI's limit, kMaxBias)

@@ -46,3 +46,15 @@ def test_bad_token_controls(body):
     with pytest.raises(ApiError) as e:
         token_controls_of(body, 1000, 64)
     assert e.value.code == 400
+
+
+def test_seed():
+    assert sampling_of({})["seed"] is None
+    assert sampling_of({"seed": 7})["seed"] == 7
+
+
+@pytest.mark.parametrize("seed", [[1], {"a": 1}, "7", 1.5, True])
+def test_bad_seed(seed):
+    with pytest.raises(ApiError) as e:
+        sampling_of({"seed": seed})
+    assert e.value.code == 400
