@@ -27,16 +27,23 @@ function Must-Fail($release) {
   throw "unverifiable checksum was accepted"
 }
 try {
+  Write-Host "Checking a named checksum"
   $fixtures["sum"] = "$hash  $zip"
   if ((Expected-Hash (Release "$zip.sha256") $zip) -ne $hash) { throw "named checksum rejected" }
+  Write-Host "Checking a dedicated bare checksum"
   $fixtures["sum"] = $hash
   if ((Expected-Hash (Release "$zip.sha256") $zip) -ne $hash) { throw "dedicated bare checksum rejected" }
+  Write-Host "Checking rejection of ambiguous, mismatched and unavailable checksums"
   Must-Fail (Release "SHA256SUMS")  # a bare hash in a general manifest cannot name the zip
   $fixtures["sum"] = "$hash  unrelated.zip"
   Must-Fail (Release "SHA256SUMS")  # even a single-line manifest must match the filename
   Must-Fail (Release "$zip.sha256" "offline")
   Must-Fail @{ assets = @() }
-  $fixtures["sum"] = @(("b" * 64) + "  unrelated.zip", "$hash  $zip")
+  Write-Host "Checking a multi-file manifest"
+  $fixtures["sum"] = @(
+    (("b" * 64) + "  unrelated.zip")
+    "$hash  $zip"
+  )
   if ((Expected-Hash (Release "SHA256SUMS") $zip) -ne $hash) { throw "manifest checksum rejected" }
   Write-Host "7 updater checksum checks passed"
 } finally {
