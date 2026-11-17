@@ -503,7 +503,8 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_PROFILE=1` | GPU time per operation, also inside CUDA graphs (`Engine.profile_dump()`) |
 | `Q27_NO_GRAPH=1` / `Q27_NO_PDL=1` / `Q27_NO_SKINNY=1` | Disable CUDA graphs / programmatic dependent launch / the skinny GEMMs |
 | `Q27_SKINNY_CHECK=1` | Compare the skinny GEMMs with the prefill GEMMs and log the difference |
-| `Q27_SKINNY_EXACT=1` | Make a row's skinny-GEMM result independent of M (tests of tree verification and preemption) |
+| `Q27_SKINNY_EXACT=1` | Split K for every row count as decode did before v0.6.2 (2 waves rounded up; a row's result stays independent of M) |
+| `Q27_SKINNY_M1_UP=1` | The pre-v0.6.2 default: one-row calls (plain decode) split K into 2 waves rounded up, wider calls rounded down. Plain decode about 1% faster, but a token's result then depends on M, and greedy speculative decoding no longer reproduces `SPEC=none` exactly |
 | `Q27_SKINNY_EXT_REDUCE_M` | Rows from which the skinny GEMM's split-K reduction runs as a separate kernel (default 1: M >= 2; at M = 1 the last CTA reduces; same result; P7-4) |
 | `Q27_DRAFT_ATTN_TC=0` | The draft's attention on CUDA cores (default: tensor cores; P7-4) |
 | `Q27_SKIP=norm,silu,gdn,attn,gemm,gemm4,gemm8,draft,dctx` | Skip a kind of kernel to measure its share of the time (`gemm4` / `gemm8`: FP4 / FP8 GEMMs only; `draft` / `dctx`: the draft model / its context update in a speculative step; the output is garbage) |

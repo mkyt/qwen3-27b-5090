@@ -176,7 +176,9 @@ request decodes at 96.6 tok/s at a short context.
   a cp.async ring of 3 stages per warp with `ldmatrix`, and split-K so that 170 SMs stay busy. At 1 to 8 rows the
   loads of the activations are 4-byte, at 16 to 32 rows 16-byte with a transpose in registers (P6-11), and at
   64 rows the activations are staged once per CTA in shared memory (P7-4). When the outputs are split along K,
-  a separate kernel sums the partials (P7-4) from two rows up. CUTLASS's 128 x 128 tiles reached 0.08 to
+  a separate kernel sums the partials (P7-4) from two rows up. The split does not depend on the number of rows,
+  so a token's row is bit-identical whether it is computed alone (decode) or among verify or batched rows
+  (before v0.6.2 one-row calls split more finely, and plain decode differed from verify). CUTLASS's 128 x 128 tiles reached 0.08 to
   0.9 TB/s on these shapes; the skinny GEMMs reach 1.3 to 1.67 TB/s.
 - **One CUDA graph per step, chained with PDL.** Every kernel triggers its dependents first and then waits for its
   predecessor (`griddepcontrol`), so the next GEMM is resident and prefetches its weights into L2 while the
@@ -236,7 +238,8 @@ from an anchor and verifies all 8 rows in one forward of the target.
 - **Lossless sampling.** Acceptance is rejection sampling against the target's distribution with the request's
   own temperature, top-k, min-p and top-p, so the output has the target's distribution exactly (checked with
   chi-square tests in `scripts/spec_sampling_test.py`). With greedy decoding, speculative and plain decoding give
-  identical tokens (`scripts/bench_spec.py --check-greedy`).
+  identical tokens (`scripts/bench_spec.py --check-greedy`), with the default settings since v0.6.2 (the skinny
+  GEMMs' split above).
 - **Penalties on the device.** Presence and frequency penalties count each sequence's output tokens in a
   vocabulary-sized array on the device (1 MiB per sequence), updated by the accept step itself, so pipelined
   steps need no host round trip. A verify row also counts the draft tokens on its own path, so every row sees the

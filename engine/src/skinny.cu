@@ -485,15 +485,18 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
   p.M = M, p.N = N, p.kbytes = kbytes, p.steps = kbytes / 32;
   const int tiles = N / kRowsPerCta;
   Q27_CHECK(p.steps % kChunkSteps == 0, "skinny gemm: K must be a multiple of 4 k-steps");
-  // Split K so that there are about `waves` CTAs per SM, with at least 2 chunks per split. The split
-  // partials grow with M, so wider calls split less (in-pipeline A/B, 2026-10-05: M = 1 is best at
-  // 2 waves rounded up, M = 8 and M = 15 at 2 waves rounded down; one wave left qkvz at 128 CTAs). A
-  // token's result then depends on M through the summation order; Q27_SKINNY_EXACT=1 uses the M = 1
-  // policy for every M, which makes speculative verify rows bit-identical to decode (the greedy test).
+  // Split K so that there are about `waves` CTAs per SM, with at least 2 chunks per split. Every M uses the
+  // same split (2 waves rounded down: best for the verify and batched rows, M = 8 and M = 15 in the in-pipeline
+  // A/B of 2026-10-05), so a token's result does not depend on M: verify rows are bit-identical to decode rows
+  // and greedy speculative decoding gives the tokens of plain decoding. Plain decode alone (M = 1) was a little
+  // faster with 2 waves rounded up (Q27_SKINNY_M1_UP=1: M = 1 then sums in another order than M > 1).
+  // Q27_SKINNY_EXACT=1: the rounded-up split for every M (also M-independent).
   // (Tunables are read at every launch, see pdl_enabled.)
   const char* e_exact = getenv("Q27_SKINNY_EXACT");
   const bool exact = e_exact && *e_exact && *e_exact != '0';
-  const int mclass = exact || M == 1 ? 0 : 1;
+  const char* e_m1 = getenv("Q27_SKINNY_M1_UP");
+  const bool m1_up = e_m1 && *e_m1 && *e_m1 != '0';
+  const int mclass = exact || (M == 1 && m1_up) ? 0 : 1;
   const char* e_waves = getenv("Q27_SKINNY_WAVES");
   const int waves = e_waves ? atoi(e_waves) : 2;
   const int chunks = p.steps / kChunkSteps;

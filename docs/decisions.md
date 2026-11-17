@@ -151,6 +151,16 @@ gate without an explicit decision, recorded below with its numbers.
 - **DFlash2 with an 8-row chain** (Phase 3). The chain verify was built first, with every verify row
   bit-identical to the decode of the same token, so greedy speculative decoding must reproduce plain decoding
   exactly (a strict test). Short-context decode came out 1.36 to 1.62 times SGLang's DFlash2 on the same GPU.
+- **One split-K for every row count** (2026-11, v0.6.2, issue #9). From 2026-10-05 the skinny GEMMs split K more
+  finely for one row (plain decode) than for verify and batched rows, and the strict test above kept passing only
+  because it set `Q27_SKINNY_EXACT=1`. With the default settings the different summation order flipped FP4
+  roundings of the activations, and greedy output of `SPEC=none` and of a drafter parted within 5 to 82 tokens
+  (NVIDIA's weights, NVFP4 KV, DSpine): both were exact samples of slightly different logits, but "lossless" did
+  not hold against plain decoding. Making every M use the split that a single row now shares with the wider calls
+  costs the verify and batched steps nothing (13.26 ms per greedy DSpine step either way; using the one-row
+  split for every M instead made eight batched requests 4.6% slower), and costs plain decode about 1% (11.50 to
+  11.62 ms per step). Resuming after the last generated token (one row) now also matches a run that computed
+  that token among the verify rows.
 - **GDN verify writes no state; the next step replays the accepted tokens** (Phase 3). Engines that keep one state
   per verified position need 8 state copies per request with DFlash2 (0.9 GiB per request; at most 5 concurrent
   requests in one measurement). Replay needs one state per request and no separate commit pass. A race was found

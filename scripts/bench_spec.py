@@ -6,9 +6,8 @@ Decode tok/s counts like bench_agentic.py: (tokens - 1) / (time of the last toke
 The acceptance length is the generated tokens per verify step (the first token comes from the prompt).
 
 --check-greedy N: greedy, N tokens per prompt, speculative vs plain decoding; the token sequences must
-be identical (the verify rows are bit-identical to decode steps; the run sets Q27_SKINNY_EXACT=1, the
-split-K policy that does not depend on the number of rows, and with Q27_SPEC_PATHS > 1 Q27_ATTN_TC=0: the
-tree's attention runs on CUDA cores).
+be identical with the default settings (the verify rows are bit-identical to decode steps; with
+Q27_SPEC_PATHS > 1 the run sets Q27_ATTN_TC=0: the tree's attention runs on CUDA cores).
 
 --ab CFG [CFG ...]: A/B of runtime switches in one process (like ab_decode.py): each config ("-" or
 KEY=VALUE,...) runs greedy speculative decoding of the prompts in turn for --rounds rounds; greedy makes
@@ -123,7 +122,6 @@ def main():
 
     if args.check_greedy:
         import os
-        os.environ["Q27_SKINNY_EXACT"] = "1"
         # Tree verification (Q27_SPEC_PATHS > 1) runs its attention on CUDA cores, decode and chains on tensor cores: a
         # different summation order, which W4A4 carries to visibly different distributions. Both on CUDA cores here.
         if int(os.environ.get("Q27_SPEC_PATHS", "1")) > 1:
