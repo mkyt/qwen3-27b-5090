@@ -69,3 +69,19 @@ def test_bad_token_ids(ids):
     with pytest.raises(ApiError) as e:
         token_ids_of(ids, 1000, "prompt")
     assert e.value.code == 400
+
+
+def test_temperature_top_p_top_k():
+    s = sampling_of({"temperature": 0, "top_p": 1, "top_k": 40.0})
+    assert (s["temperature"], s["top_p"], s["top_k"]) == (0.0, 1.0, 40)
+    assert sampling_of({"top_k": -1})["top_k"] == 0 and sampling_of({"top_k": 2**40})["top_k"] == 0
+    assert sampling_of({"top_k": 5}, top_k_key="k")["top_k"] == 20  # (another key: the default)
+
+
+@pytest.mark.parametrize("body", [{"temperature": -0.1}, {"temperature": float("nan")}, {"temperature": float("inf")},
+                                  {"temperature": "hot"}, {"temperature": [1]}, {"top_p": 1.5}, {"top_p": -0.1},
+                                  {"top_p": float("nan")}, {"top_k": 1.5}, {"top_k": "20"}, {"top_k": True}])
+def test_bad_temperature_top_p_top_k(body):
+    with pytest.raises(ApiError) as e:
+        sampling_of(body)
+    assert e.value.code == 400

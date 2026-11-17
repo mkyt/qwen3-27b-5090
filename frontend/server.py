@@ -20,6 +20,7 @@ Requests are cancelled when the client disconnects or a stop string matches.
 import argparse
 import base64
 import json
+import math
 import multiprocessing as mp
 import os
 import pathlib
@@ -853,6 +854,19 @@ def sampling_of(body, top_k_key="top_k"):
     temp = body.get("temperature")
     top_p = body.get("top_p")
     top_k = body.get(top_k_key)
+    try:
+        temp = float(DEFAULTS["temperature"] if temp is None else temp)
+        top_p = float(DEFAULTS["top_p"] if top_p is None else top_p)
+        top_k = DEFAULTS["top_k"] if top_k is None else top_k
+        if isinstance(top_k, bool) or not isinstance(top_k, (int, float)) or top_k != int(top_k):
+            raise ValueError
+        top_k = int(top_k)
+    except (TypeError, ValueError, OverflowError):
+        raise ApiError(400, f"temperature and top_p: numbers are required; {top_k_key}: an integer") from None
+    if not math.isfinite(temp) or temp < 0:
+        raise ApiError(400, f"temperature: must be a finite number >= 0, got {temp:g}")
+    if not 0 <= top_p <= 1:  # (also NaN)
+        raise ApiError(400, f"top_p: must be in [0, 1], got {top_p:g}")
     extra = {}
     for key, lo, hi in (("min_p", 0.0, 1.0), ("presence_penalty", -2.0, 2.0), ("frequency_penalty", -2.0, 2.0)):
         v = body.get(key)
@@ -863,9 +877,9 @@ def sampling_of(body, top_k_key="top_k"):
         if not lo <= v <= hi:
             raise ApiError(400, f"{key}: must be in [{lo:g}, {hi:g}], got {v:g}")
         extra[key] = v
-    return {"temperature": float(DEFAULTS["temperature"] if temp is None else temp),
-            "top_k": int(DEFAULTS["top_k"] if top_k is None else top_k) if (top_k is None or top_k >= 0) else 0,
-            "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": seed_of(body), **extra}
+    # (top_k < 0, or one that does not fit the engine's int: no top-k limit, as 0; the engine caps it at 64)
+    return {"temperature": temp, "top_k": top_k if 0 <= top_k < 1 << 30 else 0, "top_p": top_p,
+            "seed": seed_of(body), **extra}
 
 
 def seed_of(body):
