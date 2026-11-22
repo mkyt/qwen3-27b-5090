@@ -382,6 +382,10 @@ void Model::configure() {
   decode_memcpy_ = getenv("Q27_DECODE_MEMCPY") != nullptr;
   skinny_ = !getenv("Q27_NO_SKINNY");
   skinny_check_ = skinny_ && getenv("Q27_SKINNY_CHECK");
+  {
+    const char* x2 = getenv("Q27_LM_HEAD_A4X2");
+    head_a4x2_ = x2 && atoi(x2) != 0;
+  }
   auto env_int = [](const char* name, int dflt) {
     const char* e = getenv(name);
     return e && *e ? atoi(e) : dflt;
@@ -1233,6 +1237,21 @@ void Model::logits(const float* x_rows, int rows) {
   if (w_.lm_head8.w) {  // (an FP8 lm_head: lm_head is the draft model's NVFP4 copy)
     rmsnorm_quant(x_rows, w_.final_norm, rows, kEps, nullptr, q8row(), s_);
     gemm_q("lm_head", w_.lm_head8, rows, logits_, false);
+    return;
+  }
+  if (head_a4x2_) {
+    // W4A4x2: in slices of the skinny kernel's 64 rows (aq_ holds both terms and their scales of that many whatever
+    // the prefill chunk; a row does not depend on the slicing).
+    const auto& lm = w_.lm_head;
+    uint8_t* sf = aq_ + size_t(2 * kMaxBatchRows) * (kHidden / 2);
+    for (int r0 = 0; r0 < rows; r0 += kMaxBatchRows) {
+      const int M = std::min(kMaxBatchRows, rows - r0);
+      mark("norm+quant");
+      quant_fp4x2(x_rows + size_t(r0) * kHidden, w_.final_norm, M, kHidden, kEps, lm.in_scale, aq_, sf, s_);
+      mark("lm_head");
+      if (skip("gemm") || skip("gemm4")) continue;
+      skinny_fp4_a4x2(M, kVocab, kHidden, aq_, sf, lm.w, lm.sf, lm.alpha.alpha[0], logits_ + size_t(r0) * kVocab, s_);
+    }
     return;
   }
   rmsnorm_quant(x_rows, w_.final_norm, rows, kEps, nullptr, q4(w_.lm_head.in_scale), s_);

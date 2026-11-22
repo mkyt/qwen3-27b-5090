@@ -9,6 +9,8 @@ import torch
 from q27lib import call, lib
 from test_gemm import fp4_operand, rel_err
 
+from qwen27b.quant import quant_act_nvfp4, unpack_e2m1
+
 dev = "cuda"
 WS = 32 << 20
 
@@ -200,3 +202,82 @@ def test_skinny_fp8_scaled(M, N, K):
     many = torch.empty_like(d)
     call("q27t_gemm_fp8_scaled", M, N, K, a8, asc, b8, wsc, None, 0.0, many)
     assert rel_err(d.cpu().double(), many.cpu().double()) < 5e-6  # (fp32 sums in another order)
+
+
+def x2_operand(M, K):
+    """Two random NVFP4 terms per token (row 2 tok + term; scales row-major) and the value they add up to."""
+    q, sf, deq = fp4_operand(2 * M, K, 1.0)
+    return q.to(dev), sf.view(torch.uint8).to(dev).contiguous(), (deq[0::2].double() + deq[1::2].double()).to(dev)
+
+
+@pytest.mark.parametrize("M", [1, 3, 8, 13, 16, 29, 32, 33, 57, 64])
+@pytest.mark.parametrize("N,K", [(128, 5120), (5120, 5120), (32768, 5120), (1024, 2560)])
+def test_skinny_fp4_a4x2(M, N, K):
+    """W4A4x2: against the fp64 product of the two terms' sum and the dequantized weights."""
+    q, qsf, x = x2_operand(M, K)
+    w, wsf, wdq = fp4_operand(N, K, 1.0)
+    d = torch.empty(M, N, device=dev)
+    call("q27t_skinny_fp4_a4x2", M, N, K, q, qsf, w.to(dev), swizzled(wsf, N, K // 16), 0.37, d)
+    assert rel_err(d.double(), 0.37 * (x @ wdq.to(dev).double().T)) < 1e-5
+
+
+@pytest.mark.parametrize("M", [1, 8, 16, 24, 32, 40, 48, 56, 64])
+def test_skinny_fp4_a4x2_first_term_is_w4a4(M):
+    """With a zero second term: bit for bit skinny_fp4 on the first (the lm_head's shape: no split-K there)."""
+    N, K = 248320, 5120
+    q1, sf1, _ = fp4_operand(M, K, 1.0)
+    w, wsf, _ = fp4_operand(N, K, 1.0)
+    w, wsw = w.to(dev), swizzled(wsf, N, K // 16)
+    q = torch.zeros(2 * M, K // 2, dtype=torch.uint8, device=dev)
+    qsf = torch.full((2 * M, K // 16), 0x38, dtype=torch.uint8, device=dev)
+    q[0::2], qsf[0::2] = q1.to(dev), sf1.view(torch.uint8).to(dev)
+    ws = torch.zeros(WS, dtype=torch.uint8, device=dev)
+    a, b = torch.empty(M, N, device=dev), torch.empty(M, N, device=dev)
+    call("q27t_skinny_fp4_a4x2", M, N, K, q, qsf, w, wsw, 0.37, a)
+    call("q27t_skinny_fp4", M, N, K, q1.to(dev), swizzled(sf1, M, K // 16), w, wsw, 0.37, None, 0.0, b, ws, WS)
+    assert torch.equal(a, b)
+
+
+def test_skinny_fp4_a4x2_rows_independent_of_m():
+    N, K = 248320, 5120
+    q, qsf, _ = x2_operand(64, K)
+    w, wsf, _ = fp4_operand(N, K, 1.0)
+    w, wsw = w.to(dev), swizzled(wsf, N, K // 16)
+    full = torch.empty(64, N, device=dev)
+    call("q27t_skinny_fp4_a4x2", 64, N, K, q, qsf, w, wsw, 0.013, full)
+    for M in (1, 2, 5, 8, 9, 16, 17, 31, 32, 33, 41, 63):
+        d = torch.full((M + 1, N), 7.0, device=dev)
+        call("q27t_skinny_fp4_a4x2", M, N, K, q, qsf, w, wsw, 0.013, d)
+        assert torch.equal(d[:M], full[:M]), f"M={M}"
+        assert bool((d[M] == 7.0).all()), f"M={M}: wrote past its rows"
+
+
+@pytest.mark.parametrize("normed", [False, True])
+@pytest.mark.parametrize("scale", [0.0, 0.05, 1.0, 4.0])
+def test_quant_fp4x2(normed, scale):
+    """The first term is rmsnorm_quant's / quant_fp4's bit for bit, the second the quantization of what it left."""
+    T, K, ins = 64, 5120, 0.021
+    kb = K // 16
+    x = torch.randn(T, K, device=dev) * scale
+    w = (torch.randn(K, device=dev) * 0.1).to(torch.bfloat16)
+    q = torch.empty(2 * T, K // 2, dtype=torch.uint8, device=dev)
+    sf = torch.empty(2 * T, kb, dtype=torch.uint8, device=dev)
+    call("q27t_quant_fp4x2", x, w if normed else None, T, K, 1e-6, ins, q, sf)
+    q1 = torch.empty(T, K // 2, dtype=torch.uint8, device=dev)
+    sf1 = torch.zeros(lib().q27t_sf_bytes(T, kb), dtype=torch.uint8, device=dev)
+    if normed:
+        v = torch.empty(T, K, device=dev)
+        call("q27t_rmsnorm_quant", x, w, T, 1e-6, v, 2, ins, q1, sf1)
+    else:
+        v = x
+        call("q27t_quant_fp4", x, T, K, ins, q1, sf1)
+    assert torch.equal(q[0::2], q1)
+    assert torch.equal(swizzled(sf[0::2].contiguous().view(torch.float8_e4m3fn), T, kb)[: sf1.numel()], sf1)
+    s = sf.view(torch.float8_e4m3fn).float().repeat_interleave(16, -1)
+    terms = unpack_e2m1(q) * s * ins
+    left = v - terms[0::2]
+    want = quant_act_nvfp4(left, torch.tensor(ins, device=dev))
+    # (fp32 rounding can move a tie of the second term: a few elements in 100,000, by one step)
+    assert float((terms[1::2] - want).abs().gt(1e-5 + 1e-5 * want.abs()).float().mean()) < 1e-3
+    if scale:
+        assert rel_err(terms[0::2] + terms[1::2], v) < 0.02

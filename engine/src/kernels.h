@@ -258,6 +258,16 @@ void skinny_fp4_scaled(int M, int N, int K, const uint8_t* a, const uint8_t* a_s
 void skinny_bf16(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,
                  void* ws, size_t ws_bytes, cudaStream_t s);
 
+// W4A4x2 for the lm_head (skinny_a4x2.cu): d = alpha * (x0 + x1) . W^T with the two NVFP4 terms of quant_fp4x2
+// (q [2 M][K / 2], q_sf [2 M][K / 16] row-major; row 2 tok + term) x NVFP4 weights [N][K] (skinny_fp4's layout);
+// alpha = input_scale * the weight's global scale; M = 1..64, N a multiple of 128, K of 256.
+void skinny_fp4_a4x2(int M, int N, int K, const uint8_t* q, const uint8_t* q_sf, const uint8_t* w,
+                     const uint8_t* w_sf, float alpha, float* d, cudaStream_t s);
+// Those two terms: x0 = the NVFP4 quantization of x, x1 = that of x - x0, with one global scale. With w, RMSNorm
+// first (rmsnorm_quant's arithmetic, so x0 is bit for bit its activation).
+void quant_fp4x2(const float* x, const bf16* w, int M, int K, float eps, float input_scale, uint8_t* q, uint8_t* sf,
+                 cudaStream_t s);
+
 // ---------------------------------------------------------------- GDN (gdn.cu)
 
 // Causal depthwise conv (kernel 4) over [conv_state | qkv] + SiLU, l2norm of q and k per key head,

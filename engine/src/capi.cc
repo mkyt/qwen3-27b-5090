@@ -686,6 +686,14 @@ int q27t_attention_decode(const float* q, const float* qg, int T, int pos0, void
 int q27t_skinny_bf16(int M, int N, int K, const bf16* a, const bf16* w, float* d, void* ws, size_t ws_bytes) {
   return kernel([&] { skinny_bf16(M, N, K, a, w, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts()); });
 }
+int q27t_skinny_fp4_a4x2(int M, int N, int K, const uint8_t* q, const uint8_t* q_sf, const uint8_t* w,
+                         const uint8_t* w_sf, float alpha, float* d) {
+  return kernel([&] { skinny_fp4_a4x2(M, N, K, q, q_sf, w, w_sf, alpha, d, ts()); });
+}
+int q27t_quant_fp4x2(const float* x, const bf16* w, int M, int K, float eps, float input_scale, uint8_t* q,
+                     uint8_t* sf) {
+  return kernel([&] { quant_fp4x2(x, w, M, K, eps, input_scale, q, sf, ts()); });
+}
 int q27t_gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float* d) {
   return kernel([&] { gemm_bf16(M, N, K, a, w, 1.f, nullptr, 0.f, d, ts()); });
 }
