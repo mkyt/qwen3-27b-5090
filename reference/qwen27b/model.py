@@ -5,7 +5,9 @@ checkpoint on each forward (the dequantized model does not fit in RAM or VRAM), 
 for short prompts and on the GPU for long ones.
 
 Numerics follow the checkpoint: NVFP4 W4A4 (MLP, lm_head) and FP8 W8A8 (GDN / attention projections)
-with activation quantization emulated (`act_quant=True`), BF16 for the rest. Turning `act_quant` off
+with activation quantization emulated (`act_quant=True`), BF16 for the rest. The NVFP4 lm_head takes its
+activations in two terms, as the engine does by default (W4A4x2; `head_terms=1`: W4A4, the checkpoint's own
+numerics and Q27_LM_HEAD_A4X2=0). Turning `act_quant` off
 gives the weight-only-dequantized model, which is what transformers computes.
 """
 
@@ -161,11 +163,12 @@ class SeqState:
 
 class Qwen38Reference:
     def __init__(self, ckpt: Checkpoint, device="cpu", dtype=torch.float32, act_quant=True,
-                 kv_dtype="bf16", state_dtype=torch.float32, gdn="chunked"):
+                 kv_dtype="bf16", state_dtype=torch.float32, gdn="chunked", head_terms=2):
         self.ckpt = ckpt
         self.cfg = TextConfig.from_hf(ckpt.config)
         self.device, self.dtype = torch.device(device), dtype
         self.act_quant = act_quant
+        self.head_terms = head_terms
         self.kv_dtype = kv_dtype  # "bf16" | "fp8" (e4m3, scale 1.0, as stored by the engines) | "fp32"
         self.state_dtype = state_dtype  # storage precision of the GDN state between calls
         self.gdn = gdn  # "chunked" | "recurrent"
@@ -264,7 +267,9 @@ class Qwen38Reference:
         return self._embed[ids.to(self.device)].float()
 
     def lm_head(self):
-        return self._linear("lm_head")
+        head = self._linear("lm_head")
+        head.act_terms = self.head_terms
+        return head
 
     def forward(self, ids: torch.Tensor, st: SeqState, all_logits=False, hidden_layers=(), return_hidden=False,
                 mm_rows=None, mm_embeds=None, pos3=None):

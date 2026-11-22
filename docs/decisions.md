@@ -436,6 +436,21 @@ gate without an explicit decision, recorded below with its numbers.
   quantizes them with a common one; in vLLM it decodes 7 to 15% faster than NVIDIA's checkpoint with the same
   GSM8K and BFCL.
 - **Other public NVFP4 checkpoints** keep their projections in FP8 and are no faster than NVIDIA's.
+- **PQ-21: two-term activations for the NVFP4 lm_head (W4A4x2, default since 2026-11-23).** Judged against the
+  BF16 original, the one-term head was a cheap place to win accuracy back
+  ([results](results/20261123-pq21-lm-head.json)):
+  - Gain: KL to the original 0.0467 -> 0.0426 (top-1 87.1 -> 87.9%); perplexity on the golden texts 3.91 -> 3.20%
+    above the original's. That is the level of NVIDIA's checkpoint as shipped (3.16%) in perplexity, not in KL
+    (0.0383). NVIDIA's checkpoint gains from the two terms too (2.65%, KL 0.0343) and stays ahead of `gdnfp4`.
+  - Cost: none in weights or KV pool (601,856 tokens). Steps at a fixed number of rows -0.35 to +0.33%, with the
+    adaptive width up to +0.31% (code +1.9%, where it picks more rows). Accepted tokens per step +0.11%
+    [-1.14, +1.32].
+  - Gate, paired on one build: GSM8K 94.7 -> 95.0%; BFCL 89.4 -> 89.0%; Japanese passes; needles the same
+    (16 of 16, 58 of 64); no reasoning loops in 200 either way. BFCL is 4 fewer of 1,000, short of "no fewer right":
+    8 questions right only before and 4 only after (p = 0.39), which was accepted as no measurable difference.
+  - Rejected, an FP8 lm_head: perplexity 3.10% above the original's and KL a little lower, but 4.8% less KV pool
+    and steps 1.9 to 3.4% longer. Rejected, BF16 activations on the NVFP4 weights (W4A16, unpacked in the kernel):
+    the same quality as two terms, slower at every row count (eight requests +2.6%).
 
 ## Serving and concurrency
 

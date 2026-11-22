@@ -382,10 +382,6 @@ void Model::configure() {
   decode_memcpy_ = getenv("Q27_DECODE_MEMCPY") != nullptr;
   skinny_ = !getenv("Q27_NO_SKINNY");
   skinny_check_ = skinny_ && getenv("Q27_SKINNY_CHECK");
-  {
-    const char* x2 = getenv("Q27_LM_HEAD_A4X2");
-    head_a4x2_ = x2 && atoi(x2) != 0;
-  }
   auto env_int = [](const char* name, int dflt) {
     const char* e = getenv(name);
     return e && *e ? atoi(e) : dflt;
@@ -416,6 +412,7 @@ void Model::configure() {
   spec_pipeline_ = env_int("Q27_SPEC_PIPELINE", 1) != 0;
   mlp_bf16_ = env_int("Q27_MLP_BF16", 1) != 0;
   mlp_fused_ = env_int("Q27_MLP_FUSED", 1) != 0;
+  head_a4x2_ = env_int("Q27_LM_HEAD_A4X2", 1) != 0;
   const char* prof = getenv("Q27_PROFILE");
   prof_.on = prof && *prof && *prof != '0';
   graphs_ = !getenv("Q27_NO_GRAPH") && !skinny_check_;

@@ -322,7 +322,7 @@ is the fine-tune's own: it is not compared with a reference here.
 
 [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) is a quantization of the model itself
 with its own chat template. On the golden prompts its KL to the BF16 model is
-0.0258 (top-1 agreement 90.95%), against 0.0381 for NVIDIA's checkpoint and 0.0454 for gdnfp4, at 21.65 GB of
+0.0259 (top-1 agreement 90.86%), against 0.0343 for NVIDIA's checkpoint and 0.0426 for gdnfp4, at 21.65 GB of
 weights (KV pool 393,920 tokens) and 289–291 / 1,299–1,310 tok/s (one / eight requests; gdnfp4 322 / 1,383–1,396 on
 the same build).
 
@@ -330,22 +330,25 @@ the same build).
 
 The engine is checked against a PyTorch reference implementation of the model (`reference/`): the next-token
 distributions over 35,328 positions of Japanese and English prose and code (the "golden" set, `bench/golden/`) agree
-with the reference as closely as the reference agrees with itself under a different KV cache type (KL 0.036).
-Against the BF16 original the default configuration is at KL 0.047; GSM8K, BFCL v3, long-context needle retrieval and
+with the reference at least as closely as the reference agrees with itself under a different KV cache type (KL 0.036).
+Against the BF16 original the default configuration is at KL 0.043; GSM8K, BFCL v3, long-context needle retrieval and
 a Japanese set are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ```bash
 scripts/download-weights.sh --dev           # also NVIDIA's checkpoint, used by the reference model and the tests
 scripts/download-golden.sh                  # the reference recordings (GitHub Releases)
-docker compose --profile dev run --rm dev bash -c 'cd reference && python -m golden engine --prompts ../bench/golden/prompts.jsonl --out ../cache/engine.jsonl.gz'
+docker compose --profile dev run --rm dev bash -c 'cd reference && Q27_LM_HEAD_A4X2=0 python -m golden engine --prompts ../bench/golden/prompts.jsonl --out ../cache/engine.jsonl.gz'
 docker compose --profile dev run --rm dev-cpu bash -c 'cd reference && python -m golden compare ../cache/engine.jsonl.gz ../bench/golden/ref-gpu.jsonl.gz'
 ```
 
-`golden engine` loads the weights on the GPU (about 20 GB): stop the `serve` service first.
+`golden engine` loads the weights on the GPU (about 20 GB): stop the `serve` service first. It runs with
+`Q27_LM_HEAD_A4X2=0` here because the published recordings of NVIDIA's checkpoint have one-term lm_head activations
+(expect a KL of about 0.037); the engine's default is two terms, to be compared with a reference recorded the same
+way (`python -m golden ref --device cuda --prompts ../bench/golden/prompts.jsonl --out ...`, KL about 0.028).
 
 The recordings are about 8 MB each: the reference model with a BF16 KV cache (`ref-gpu`, what the engine is compared
 with), with an FP8 KV cache (`ref-gpu-kvfp8`, the noise floor), the BF16 original (`ref-gpu-bf16model`) and images
-(`vision-ref`). `reference/golden.py ref` records them again from the checkpoints in minutes (`ref-gpu-bf16model` needs the 55.6 GB BF16 original).
+(`vision-ref`, one term as well). `reference/golden.py ref --lm-head-terms 1` records the first three again from the checkpoints in minutes (`ref-gpu-bf16model` needs the 55.6 GB BF16 original).
 
 ## Tests
 

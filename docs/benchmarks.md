@@ -7,7 +7,9 @@ each number. The JSON files of the speed numbers are in [results/](results/).
 The speed through the server was measured again when each request of a batched step got its own verify rows
 (2026-11-14), together with DFlash2 (`SPEC=dflash2`) on the same day; the prefill table's DSpine column was measured
 again on 2026-11-14 after the GDN prefill changes (P5-14 to P5-17), its DFlash2 column is from 2026-10-11. The in-process table by context length runs without speculative decoding and is from
-2026-10-11; the comparison with other engines and the power limit section keep their own dates.
+2026-10-11; the comparison with other engines and the power limit section keep their own dates. All of these speed
+numbers predate the two-term lm_head (2026-11-23), which changes a step of a given number of rows by under 0.4%
+([decisions.md](decisions.md#weights)).
 
 ## Conditions
 
@@ -245,21 +247,29 @@ The runs are [results/](results/) `20261027-*-pl575-*.json` and `20261027-*-pl40
 
 Teacher forcing over 13 prompts, 35,328 positions (Japanese and English prose, Python and C++; `bench/golden/`).
 Each recording keeps the top-20 next-token distribution at every position; two recordings are compared by top-1
-agreement and KL divergence ([results/20261011-pr2-golden-v2.json](results/20261011-pr2-golden-v2.json)).
+agreement and KL divergence. The NVFP4 lm_head takes its activations in two terms since 2026-11-23 (W4A4x2; one
+term before, still `Q27_LM_HEAD_A4X2=0`): [results/20261123-pq21-lm-head.json](results/20261123-pq21-lm-head.json).
 
-| Compared | Top-1 agreement | KL |
-| --- | ---: | ---: |
-| Reference model, KV bf16 vs KV fp8 (the noise floor of W4A4 rounding) | 89.1% | 0.0359 |
-| Engine vs reference model (NVIDIA's checkpoint, KV bf16) | 89.3% | 0.0363 |
-| NVIDIA's checkpoint vs the BF16 original (reference model) | 88.7% | 0.0361 |
-| Engine, default (`gdnfp4`, KV nvfp4) vs the BF16 original | 87.4% | 0.0470 |
-| Engine, `gdnfp4`, KV fp8 vs the BF16 original | 87.6% | 0.0445 |
-| Engine, `nvidia`, KV fp8 vs the BF16 original | 88.7% | 0.0362 |
-| Engine, `quasar`, KV fp8 vs the BF16 original | 87.2% | 0.0475 |
+| Compared | Top-1, two terms (default) | KL | Top-1, one term | KL |
+| --- | ---: | ---: | ---: | ---: |
+| Engine vs reference model (NVIDIA's checkpoint, KV bf16) | 90.8% | 0.0278 | 89.2% | 0.0366 |
+| NVIDIA's checkpoint vs the BF16 original (reference model) | 89.8% | 0.0322 | 88.7% | 0.0361 |
+| Engine, default (`gdnfp4`, KV nvfp4) vs the BF16 original | 87.9% | 0.0426 | 87.1% | 0.0467 |
+| Engine, `nvidia`, KV nvfp4 vs the BF16 original | 89.4% | 0.0343 | 88.2% | 0.0383 |
+| Engine, `quasar`, KV nvfp4 vs the BF16 original | 87.7% | 0.0462 | 86.8% | 0.0500 |
 
-The engine is as far from the reference model as the reference model is from itself with another KV cache type, so
-the kernels compute the model correctly; what remains against the BF16 original is the quantization of the weights
-and the KV cache.
+The noise floor of W4A4 rounding, the reference model with a BF16 against an FP8 KV cache, is 89.1% / 0.0359 (one
+term). With the FP8 KV cache, measured on 2026-10-11 with one term
+([results/20261011-pr2-golden-v2.json](results/20261011-pr2-golden-v2.json)): `gdnfp4` 87.6% / 0.0445, `nvidia`
+88.7% / 0.0362 and `quasar` 87.2% / 0.0475 against the BF16 original.
+
+The engine is no further from the reference model than the reference model is from itself with another KV cache
+type, so the kernels compute the model correctly; what remains against the BF16 original is the quantization of the
+weights, the activations and the KV cache.
+
+**code-cpp overlaps `gdnfp4`'s calibration text** (83.7% of code-cpp-4096 in runs of 32 tokens), which flatters
+`gdnfp4` against the other checkpoints. Without code-cpp (30,592 positions) the default is at 87.1% / 0.0445 and
+`nvidia` at 88.8% / 0.0351.
 
 ### Tasks
 
@@ -267,21 +277,24 @@ The default configuration through the server (thinking off, greedy unless noted)
 
 | Task | Result | Script |
 | --- | --- | --- |
-| GSM8K (300 fixed questions) | 95.3% | `quality_gsm8k.py` |
-| BFCL v3 non-live AST (simple, multiple, parallel, parallel_multiple; 1,000 questions) | 88.9% | `quality_tools.py` |
+| GSM8K (300 fixed questions) | 95.0% | `quality_gsm8k.py` |
+| BFCL v3 non-live AST (simple, multiple, parallel, parallel_multiple; 1,000 questions) | 89.0% | `quality_tools.py` |
 | Needle retrieval, 16 facts at 190K tokens | 16 / 16 | `needle_test.py --tokens 190000 --needles 16` |
-| Needle retrieval, 16 facts at 256K tokens, seeds 0–3 | 56 / 64 | `needle_test.py --tokens 256000 --needles 16 --seed N` |
-| Japanese: reading (JSQuAD), translation both ways (FLORES-200), summarization (XL-Sum), LLM-judged | same as KV fp8 within the confidence intervals | `quality_ja.py` |
+| Needle retrieval, 16 facts at 256K tokens, seeds 0–3 | 58 / 64 | `needle_test.py --tokens 256000 --needles 16 --seed N` |
+| Japanese: reading (JSQuAD), translation both ways (FLORES-200), summarization (XL-Sum), LLM-judged | 100 / 96.8 / 92.0 / 100 of 100, none worse than with the one-term lm_head | `quality_ja.py` |
 | Synthetic image questions (70, exact answers) | 67 / 70 (vLLM 70) | `vision_quality.py` |
 
 Notes:
 
+- GSM8K, BFCL, needle retrieval and the Japanese set are from 2026-11-23, with the two-term lm_head; the one-term
+  one on the same build got 94.7%, 89.4%, the same needles and 100 / 96.5 / 91.0 / 98.8
+  ([results/20261123-pq21-lm-head.json](results/20261123-pq21-lm-head.json), [decisions.md](decisions.md#weights)).
 - The NVFP4 KV cache costs parallel tool calls on short prompts: over BFCL's parallel categories (400 questions,
   temperature 0.7, three seeds) it gets 11 fewer right than the FP8 KV cache, nearly all by stopping a parallel
   call list early. After an agent's 32K- or 96K-token history (`quality_tools.py --context`) the difference is gone
   (-4 and +2 questions), which is how agents use the server. `KV_DTYPE=fp8` trades 42% of the KV capacity for it.
-- The image questions were measured with NVIDIA's weights; the three misses are close counting questions that the
-  reference model gets wrong the same way.
+- The image questions were measured with NVIDIA's weights and the one-term lm_head; the three misses are close
+  counting questions that the reference model gets wrong the same way.
 - The evaluation data is downloaded on first use into `bench/quality-data/` (pinned revisions). XL-Sum is
   CC BY-NC-SA 4.0 and is not redistributed here.
 

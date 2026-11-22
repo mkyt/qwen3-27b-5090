@@ -11,6 +11,10 @@ later the custom engine.
     python -m golden engine  --prompts ... --out bench/golden/engine.jsonl.gz   # the custom engine (libq27.so)
     python -m golden engine  ... --decode-tail 128 ; python -m golden compare --tail 128 ...  # decode path
     python -m golden compare bench/golden/sglang.jsonl.gz bench/golden/ref-cpu.jsonl.gz
+
+The lm_head's NVFP4 activations: two terms in the engine and the reference (W4A4x2, the default). The published
+recordings (golden-v2) and other engines have one: compare with those under Q27_LM_HEAD_A4X2=0 (engine) or
+--lm-head-terms 1 (ref).
 """
 
 import argparse
@@ -67,7 +71,7 @@ def cmd_ref(args):
     else:
         ckpt = Checkpoint(snapshot(*(BF16 if args.model == "bf16" else TARGET)))
     ref = Qwen38Reference(ckpt, device=args.device, act_quant=not args.no_act_quant,
-                          kv_dtype=args.kv_dtype)
+                          kv_dtype=args.kv_dtype, head_terms=args.lm_head_terms)
     head = ref.lm_head()
     with open_text(args.out, "w") as f:
         for p in read_jsonl(args.prompts):
@@ -188,6 +192,8 @@ def main():
     p.add_argument("--model", default="nvidia", choices=["nvidia", "quasar", "bf16"],
                    help="checkpoint (quasar: allfp4 candidate, bf16: the original)")
     p.add_argument("--no-act-quant", action="store_true")
+    p.add_argument("--lm-head-terms", type=int, default=2, choices=[1, 2],
+                   help="terms of an NVFP4 lm_head's activations (2: the engine's default, 1: W4A4)")
     p = sub.add_parser("engine")
     p.add_argument("--prompts", default="bench/golden/prompts.jsonl")
     p.add_argument("--out", required=True)

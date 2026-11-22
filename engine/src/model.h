@@ -468,7 +468,7 @@ class Model {
   bool skinny_check_ = false;
   std::string skip_;  // Q27_SKIP (debug timing)
   bool skip(const char* kind) const;
-  bool head_a4x2_ = false;  // Q27_LM_HEAD_A4X2: two-term NVFP4 activations into the NVFP4 lm_head (logits)
+  bool head_a4x2_ = true;  // Q27_LM_HEAD_A4X2: two-term NVFP4 activations into the NVFP4 lm_head (logits)
   // Decode step as a CUDA graph (Q27_NO_GRAPH=1: eager). Not used while profiling.
   bool graphs_ = true, graph_warm_ = false;
   struct GraphKey {

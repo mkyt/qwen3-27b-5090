@@ -103,7 +103,7 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 | MLP (gate, up, down) | NVFP4, W4A4 (16-element blocks, FP8 block scales) | 8.96 | yes |
 | GDN projections (qkv, z, out; a and b) | NVFP4, W4A4 (a and b: BF16) | 2.94 | yes |
 | Attention projections (q, k, v, o) | FP8, W8A8 (per-tensor scales) | 1.56 | yes |
-| lm_head | NVFP4 | 0.67 | yes |
+| lm_head | NVFP4, W4A4x2 (the activations in two NVFP4 terms) | 0.67 | yes |
 | Embedding | BF16, in pinned host memory | 0 | one row per token |
 | Vision tower | BF16, in pinned host memory (`VISION=host`) | 0 | only for images |
 | Draft (DSpine; DFlash2) | NVFP4, quantized at load time (DSpine's code bridge BF16, its codebook in pinned host memory) | about 1.2 | yes |
@@ -113,6 +113,11 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
   the GPU into the kernels' layouts; there is no converted copy on disk. The attention projections stay FP8
   because quantizing them costs parallel tool calls; [decisions.md](decisions.md#weights) has the measurements.
   `scripts/build-gdnfp4.sh` rebuilds it (it needs the BF16 original and a few hours).
+- **The lm_head's activations take two terms** (`engine/src/skinny_a4x2.cu`): q0 is the usual NVFP4 quantization of
+  the normalized activations x, q1 that of x - q0 with the same global scale. The kernel reads the weights once and
+  runs an FP4 MMA on each term: the input's error drops from 9.3% to 0.9% and the logits are as good as with BF16
+  activations, at the one-term kernel's speed, since reading the weights bounds the step. An FP8 lm_head is not
+  affected. `Q27_LM_HEAD_A4X2=0` gives one term.
 - **Fused projections.** GDN's `qkv | z`, attention's `q (+gate) | k | v` and the MLP's `gate | up` each run as one
   GEMM. Their activation scales are equal in every layer of the checkpoint, so fusing does not change the
   activation quantization.
@@ -495,6 +500,9 @@ and computes plainly.
   instead of a BF16 KV cache, differs from itself by a mean KL of 0.036 and 89% top-1 agreement over the golden
   positions. The engine is accepted when its distance to the reference is of the same size: mean KL <= 0.05, top-1
   >= 88%, positions with KL > 0.5 <= 1% (`reference/golden.py`, [benchmarks.md](benchmarks.md)).
+  Engine and reference must run the same number of lm_head terms: both take two by default (KL 0.028 between them),
+  while the published recordings of NVIDIA's checkpoint have one, as do the floor and the limits above
+  (`Q27_LM_HEAD_A4X2=0`, `golden ref --lm-head-terms 1`).
 - **Invariants that are tested bit for bit** (they keep the tests simple and catch logic errors that the noise
   above would hide):
   - a verify row equals the decode of the same token (speculative and plain greedy decoding agree),
