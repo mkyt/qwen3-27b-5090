@@ -5,7 +5,8 @@ Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses (Codex), /v
 /v1/messages/count_tokens, /tokenize, /detokenize; GET /v1/models, /health, /metrics; GET / POST
 /admin/concurrency (the admission settings, P7-14); GET / POST /admin/engine (stop, start or restart the engine,
 with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); POST /admin/engine/idle (the unload when idle); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
-/ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py). Streaming everywhere (SSE), reasoning (`<think>`, returned as
+/ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py); GET /chat (a simple chat page on
+/v1/chat/completions). Streaming everywhere (SSE), reasoning (`<think>`, returned as
 `reasoning_content` / `reasoning`, or Anthropic thinking blocks), tool calls (qwen3_coder XML, streamed call by
 call), images and videos (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
 
@@ -55,6 +56,7 @@ SPEC_MARGIN = 16  # a verify block writes up to 16 positions past the committed 
 KEEPALIVE_S = 10.0
 DUMP_DIR = os.environ.get("API_DUMP_DIR")  # debug: write every POST body there
 UI_PAGE = ROOT / "frontend/ui/index.html"
+CHAT_PAGE = ROOT / "frontend/ui/chat.html"  # (the built-in chat page: GET /chat)
 GENERATE = ("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages")
 
 
@@ -1110,8 +1112,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, self.engine_settings())
         elif path == "/version":
             self._json(200, {"version": "q27-phase6"})
-        elif path == "/ui":
-            body = UI_PAGE.read_bytes()
+        elif path in ("/ui", "/chat"):
+            body = (UI_PAGE if path == "/ui" else CHAT_PAGE).read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))

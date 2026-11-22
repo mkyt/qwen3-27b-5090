@@ -218,6 +218,13 @@ restarts it with other settings (weights, KV cache type, speculative decoding, v
 context limit, VRAM budget), showing for every choice the context it leaves before anything is loaded
 ([docs/configuration.md](docs/configuration.md#start-settings)).
 
+### Chat page
+
+http://127.0.0.1:8000/chat is a simple chat page to try the model without installing a client: streaming, the
+reasoning folded away, Markdown and code, images and videos (attach, paste or drop), thinking off or at a chosen
+effort, and each reply's speed. Conversations stay in the browser. For more, use a full client such as Open WebUI
+([docs/configuration.md](docs/configuration.md#chat-page)).
+
 ## Clients
 
 - **OpenAI-compatible** (chat completions, completions, Responses): base URL `http://127.0.0.1:8000/v1`, any API key,

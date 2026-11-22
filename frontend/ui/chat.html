@@ -1,0 +1,778 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qwen3-27b-5090 chat</title>
+<!-- The built-in chat page (GET /chat): one file, no external resources. It calls /v1/chat/completions of the same
+     server, so it needs no CORS. Conversations are kept in this browser's localStorage. For more (several models,
+     accounts, RAG, tools), use a full client such as Open WebUI. -->
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+  --border: rgba(11,11,11,0.10); --wash: rgba(11,11,11,0.04); --wash2: rgba(11,11,11,0.07);
+  --accent: #2a78d6; --accent-ink: #ffffff; --user: #eef3fb; --code: #f1f0ec;
+  --good: #0ca30c; --warning: #fab219; --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+    --border: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05); --wash2: rgba(255,255,255,0.09);
+    --accent: #3987e5; --accent-ink: #ffffff; --user: #1d2633; --code: #141413;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+  --border: rgba(255,255,255,0.10); --wash: rgba(255,255,255,0.05); --wash2: rgba(255,255,255,0.09);
+  --accent: #3987e5; --accent-ink: #ffffff; --user: #1d2633; --code: #141413;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--page); color: var(--ink);
+  font: 14px/1.55 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif; }
+button, input, textarea, select { font: inherit; color: inherit; }
+.app { display: grid; grid-template-columns: 260px minmax(0, 1fr); height: 100vh; height: 100dvh; }
+aside { border-right: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; min-height: 0; }
+aside .top { padding: 12px; display: flex; gap: 8px; }
+aside nav { overflow-y: auto; padding: 0 8px 12px; flex: 1; }
+.conv { display: flex; align-items: center; gap: 4px; border-radius: 6px; padding: 6px 8px; cursor: pointer; color: var(--ink2); }
+.conv:hover { background: var(--wash); }
+.conv[aria-current="true"] { background: var(--wash2); color: var(--ink); }
+.conv .t { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv .x { visibility: hidden; border: none; background: none; color: var(--muted); cursor: pointer; padding: 0 4px; }
+.conv:hover .x, .conv[aria-current="true"] .x { visibility: visible; }
+aside .foot { padding: 10px 12px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); display: grid; gap: 4px; }
+.mainc { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+header { display: flex; align-items: center; gap: 8px 12px; padding: 8px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+.badge { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--border); font-size: 12px; color: var(--ink2); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; background: var(--muted); }
+header a { color: var(--ink2); font-size: 13px; }
+.sp { flex: 1; }
+.btn { border: 1px solid var(--border); background: var(--surface); border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 13px; }
+.btn:hover:not(:disabled) { background: var(--wash); }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.btn.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+#menu { display: none; }
+#log { flex: 1; overflow-y: auto; padding: 16px; }
+.thread { max-width: 860px; margin: 0 auto; display: grid; gap: 18px; }
+.empty { color: var(--muted); text-align: center; margin-top: 18vh; }
+.msg { min-width: 0; }
+.msg.user { justify-self: end; max-width: 85%; }
+.msg.user .body { background: var(--user); border-radius: 12px; padding: 8px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg .media { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; justify-content: flex-end; }
+.msg .media img, .msg .media video { max-width: 220px; max-height: 180px; border-radius: 8px; border: 1px solid var(--border); display: block; }
+.gone { font-size: 12px; color: var(--muted); border: 1px dashed var(--border); border-radius: 8px; padding: 6px 10px; }
+.meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 4px; font-size: 12px; color: var(--muted); }
+.msg.user .meta { justify-content: flex-end; }
+.meta button { border: none; background: none; color: var(--muted); cursor: pointer; padding: 0; font-size: 12px; }
+.meta button:hover { color: var(--ink); text-decoration: underline; }
+.err { color: var(--critical); }
+details.think { border-left: 2px solid var(--border); padding-left: 10px; margin-bottom: 8px; color: var(--ink2); }
+details.think summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
+details.think .tb { white-space: pre-wrap; font-size: 13px; overflow-wrap: anywhere; margin-top: 4px; }
+.md { overflow-wrap: anywhere; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md pre, .md blockquote, .md table { margin: 0 0 10px; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 16px 0 8px; line-height: 1.3; }
+.md h1 { font-size: 1.4em; } .md h2 { font-size: 1.25em; } .md h3 { font-size: 1.1em; } .md h4, .md h5, .md h6 { font-size: 1em; }
+.md ul, .md ol { padding-left: 1.6em; }
+.md li > ul, .md li > ol { margin: 2px 0; }
+.md li > p { margin: 0 0 4px; }
+.md blockquote { border-left: 3px solid var(--border); padding-left: 10px; color: var(--ink2); }
+.md code { font: 0.92em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code); border-radius: 4px; padding: 1px 4px; }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+.md a { color: var(--accent); }
+.md .tw { overflow-x: auto; margin: 0 0 10px; }
+.md table { border-collapse: collapse; font-size: 13px; margin: 0; }
+.md th, .md td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }
+.md th { background: var(--wash); }
+.cb { position: relative; margin: 0 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--code); }
+.cb .ch { display: flex; justify-content: space-between; align-items: center; padding: 2px 8px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); }
+.cb .ch button { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 12px; }
+.cb .ch button:hover { color: var(--ink); }
+.cb pre { margin: 0; padding: 8px 10px; overflow-x: auto; }
+.cb pre code { background: none; padding: 0; font-size: 12.5px; white-space: pre; }
+.cursor::after { content: "▍"; color: var(--muted); animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.composer { border-top: 1px solid var(--border); padding: 10px 16px 14px; }
+.cbox { max-width: 860px; margin: 0 auto; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 8px 10px; }
+.cbox.drag { outline: 2px dashed var(--accent); }
+.cbox textarea { width: 100%; border: none; outline: none; background: transparent; resize: none; max-height: 40vh; min-height: 24px; padding: 2px 0; }
+.att { display: flex; flex-wrap: wrap; gap: 6px; }
+.att:empty { display: none; }
+.att .a { position: relative; }
+.att img, .att video { height: 56px; border-radius: 6px; border: 1px solid var(--border); display: block; }
+.att .a button { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border);
+  background: var(--surface); cursor: pointer; font-size: 11px; line-height: 14px; padding: 0; }
+.crow { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.crow label { font-size: 12px; color: var(--ink2); display: inline-flex; align-items: center; gap: 4px; }
+.crow select { font-size: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); padding: 1px 4px; }
+.hint { font-size: 12px; color: var(--muted); }
+#settings { max-width: 860px; margin: 0 auto 8px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 10px 12px; display: grid; gap: 8px; }
+#settings[hidden] { display: none; }
+#settings textarea { width: 100%; min-height: 60px; border: 1px solid var(--border); border-radius: 6px; background: var(--page); padding: 6px; resize: vertical; }
+#settings .g { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+#settings label { font-size: 12px; color: var(--ink2); display: inline-flex; align-items: center; gap: 6px; }
+#settings input[type=number] { width: 90px; border: 1px solid var(--border); border-radius: 6px; background: var(--page); padding: 2px 6px; }
+@media (max-width: 760px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  aside { position: fixed; z-index: 20; inset: 0 auto 0 0; width: 280px; transform: translateX(-100%); transition: transform .15s; box-shadow: 0 0 24px rgba(0,0,0,.25); }
+  .app.nav aside { transform: none; }
+  #menu { display: inline-block; }
+  header { flex-wrap: nowrap; padding-left: 16px; padding-right: 16px; }
+  header h1, .badge { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge > span:last-child { overflow: hidden; text-overflow: ellipsis; }
+  header h1 { flex: 0 100 auto; }  /* (the title gives way before the server state) */
+  header a { flex: none; }
+  .msg.user { max-width: 92%; }
+  #log, .composer { padding-left: 16px; padding-right: 16px; }
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <aside aria-label="Conversations">
+    <div class="top"><button class="btn" id="new" style="flex:1">New chat</button></div>
+    <nav id="convs"></nav>
+    <div class="foot">
+      <span>Kept in this browser only (localStorage).</span>
+      <button class="btn" id="clear" style="justify-self:start;font-size:12px">Delete all</button>
+    </div>
+  </aside>
+  <div class="mainc">
+    <header>
+      <button class="btn" id="menu" aria-label="Conversations">☰</button>
+      <h1>qwen3-27b-5090</h1>
+      <span class="badge" id="state"><span class="dot"></span><span>connecting</span></span>
+      <span class="sp"></span>
+      <button class="btn" id="opts" aria-expanded="false" aria-controls="settings">Settings</button>
+      <a href="/ui" id="stats">Stats</a>
+    </header>
+    <div id="log"><div class="thread" id="thread"></div></div>
+    <div class="composer">
+      <div id="settings" hidden>
+        <label style="display:block">System prompt (all chats)<textarea id="sys" placeholder="None"></textarea></label>
+        <div class="g">
+          <label>Temperature <input type="number" id="temp" min="0" max="2" step="0.05" placeholder="model"></label>
+          <label>Top-p <input type="number" id="topp" min="0" max="1" step="0.05" placeholder="model"></label>
+          <label>Max tokens <input type="number" id="maxt" min="1" step="1" placeholder="context"></label>
+        </div>
+        <div class="hint">Empty fields use the server's defaults (the model card's sampling, the context that is left).</div>
+      </div>
+      <div class="cbox" id="cbox">
+        <div class="att" id="att"></div>
+        <textarea id="input" rows="1" placeholder="Message (Enter to send, Shift+Enter for a new line; paste or drop images)"></textarea>
+        <div class="crow">
+          <button class="btn" id="attach" title="Attach images or videos">Attach</button>
+          <input type="file" id="file" accept="image/*,video/*" multiple hidden>
+          <label>Thinking <select id="think" title="Off, or the reasoning effort. A change applies from the next reply; it may make the server read the conversation again."><option value="off">off</option><option value="low">low</option><option value="medium">medium</option><option value="xhigh">xhigh</option></select></label>
+          <span class="sp"></span>
+          <span class="hint" id="ctx"></span>
+          <button class="btn primary" id="send">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const KEY = "q27chat.v1", PREF = "q27chat.prefs";
+const CONV = KEY + ".c.", CURRENT = KEY + ".current";
+const MODEL_FALLBACK = "qwen3.8-27b";
+let model = MODEL_FALLBACK;
+// The server's root, also behind a reverse proxy that serves it under a prefix (/chat or /chat/ -> /).
+const BASE = location.pathname.replace(/chat\/?$/, "");
+
+// ------------------------------------------------------------ storage
+
+function load(key, dflt) {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : dflt; } catch (e) { return dflt; }
+}
+const prefs = Object.assign({ sys: "", temp: "", topp: "", maxt: "", think: "xhigh" }, load(PREF, {}));
+// The template's reasoning efforts, or off. (Anything else stored, e.g. "" for plain on: the template's default.)
+if (!["off", "low", "medium", "xhigh"].includes(prefs.think)) prefs.think = "xhigh";
+
+function strip(conv, kinds) {  // drop media of these kinds ("video", "image") from a conversation's messages
+  let n = 0;
+  for (const m of conv.messages) for (const a of m.media || []) if (kinds.includes(a.kind) && a.url) { a.url = null; n++; }
+  return n;
+}
+// Tabs share the storage. Each conversation has a key of its own, so saving one cannot undo another tab's save or
+// delete of another one, also when they happen at the same moment (one key for all would lose one of the two).
+// conv.rev is the stored version this tab's copy comes from (none: not stored yet).
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const newestFirst = (a, b) => b.updated - a.updated;
+function setItem(key, value) {
+  try { localStorage.setItem(key, value); return true; } catch (e) { return false; }  // (over the quota, or no storage)
+}
+function removeItem(key) { try { localStorage.removeItem(key); } catch (e) { /* (no storage) */ } }
+function storedConvs() {
+  let keys = [];
+  try { keys = Object.keys(localStorage).filter((k) => k.startsWith(CONV)); } catch (e) { /* (no storage) */ }
+  return keys.map((k) => load(k, null)).filter((c) => c && Array.isArray(c.messages)).sort(newestFirst);
+}
+function write(conv) {
+  // Videos are never kept (too large for localStorage). When the quota is reached, the images of the oldest
+  // conversations go first, then this one's. (A conversation that only loses images keeps its rev.)
+  const out = JSON.parse(JSON.stringify(conv, (k, v) => (k.startsWith("_") ? undefined : v)));
+  out.rev = uid();
+  strip(out, ["video"]);
+  const put = () => setItem(CONV + conv.id, JSON.stringify(out));
+  let ok = put();
+  if (!ok) {
+    for (const c of storedConvs().reverse()) {
+      if (c.id === conv.id || !strip(c, ["image"])) continue;
+      if (setItem(CONV + c.id, JSON.stringify(c)) && (ok = put())) break;
+    }
+    if (!ok && strip(out, ["image"])) ok = put();
+  }
+  if (ok) conv.rev = out.rev;
+}
+function setCurrent(id) {
+  store.current = id;
+  if (id) setItem(CURRENT, JSON.stringify(id)); else removeItem(CURRENT);
+}
+function save(conv) {
+  if (!store.convs.includes(conv)) return;  // (deleted meanwhile)
+  if (conv.rev) {
+    const stored = load(CONV + conv.id, null);
+    if (!stored) {  // deleted in another tab
+      store.convs = store.convs.filter((c) => c !== conv);
+      if (store.current === conv.id) store.current = null;
+      return;
+    }
+    if (stored.rev !== conv.rev) {  // changed in another tab meanwhile: keep both
+      const shown = store.current === conv.id;
+      conv.id = uid(); conv.title += " (copy)";
+      if (shown) store.current = conv.id;
+      store.convs.push(stored);
+    }
+  }
+  write(conv);
+  store.convs.sort(newestFirst);
+  if (store.current === conv.id) setCurrent(conv.id);
+}
+function sync() {  // another tab saved or deleted
+  const before = cur(), stored = new Map(storedConvs().map((c) => [c.id, c])), next = [];
+  for (const c of store.convs) {
+    const s = stored.get(c.id), live = busy && busy.conv === c;
+    stored.delete(c.id);
+    if (!s && c.rev) { if (live) busy.ctrl.abort(); continue; }
+    // (the same rev: this tab's object, which still has the videos. A live one: save() compares when it ends)
+    next.push(!s || s.rev === c.rev || live ? c : s);
+  }
+  store.convs = next.concat([...stored.values()]).sort(newestFirst);
+  const after = cur();
+  if (after === before) { renderConvs(); return; }
+  if (!after) store.current = null;  // (deleted: the next message starts a conversation, not continues another)
+  const stick = nearBottom();
+  render(); ctxHint();
+  if (stick) toBottom();
+}
+function openStore() {
+  const old = load(KEY, null);  // (one key for all conversations: the page's earlier format)
+  if (old && Array.isArray(old.convs)) {
+    removeItem(KEY);  // (first: the quota has no room for both)
+    for (const c of old.convs.slice().sort(newestFirst).reverse()) if (!load(CONV + c.id, null)) write(c);
+    if (old.current) setItem(CURRENT, JSON.stringify(old.current));
+  }
+  const convs = storedConvs(), id = load(CURRENT, null);
+  return { convs, current: convs.some((c) => c.id === id) ? id : convs.length ? convs[0].id : null };
+}
+let store = openStore();
+function savePrefs(key) {  // (only what changed here: another tab may have changed the others)
+  setItem(PREF, JSON.stringify(Object.assign(load(PREF, {}) || {}, { [key]: prefs[key] })));
+}
+
+const cur = () => store.convs.find((c) => c.id === store.current) || null;
+function newConv() {
+  const c = { id: uid(), title: "New chat",
+              created: Date.now(), updated: Date.now(), messages: [] };
+  store.convs.unshift(c);
+  store.current = c.id;
+  return c;
+}
+
+// ------------------------------------------------------------ Markdown (a subset; all text is escaped first)
+
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+function emph(s) {
+  s = s.replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, "<strong>$1</strong>").replace(/__(?=\S)([\s\S]*?\S)__(?!\w)/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^*\w])\*(?=\S)([^*\n]*?\S)\*(?!\*)/g, "$1<em>$2</em>").replace(/(^|[^_\w])_(?=\S)([^_\n]*?\S)_(?!\w)/g, "$1<em>$2</em>");
+  return s.replace(/~~(?=\S)([\s\S]*?\S)~~/g, "<del>$1</del>");
+}
+
+// Finished HTML waits in keep[] behind a \u0000N\u0000 placeholder. Placeholders nest (code in a link's text) and only
+// ever stand for element content: the text cannot hold one (markdown() replaces NULs), and neither can a URL (its
+// patterns exclude NUL), so no HTML can get into an attribute.
+function inline(s) {
+  const keep = [];
+  const hold = (h) => "\u0000" + (keep.push(h) - 1) + "\u0000";
+  s = s.replace(/(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/g, (_, t, c) => hold("<code>" + esc(c.trim() || c) + "</code>"));
+  s = esc(s);
+  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g, (_, t, u) => hold(`<a href="${u}" target="_blank" rel="noopener noreferrer">${emph(t)}</a>`));
+  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)\u0000]+[^\s<).,;:!?'\u0000])/g, (_, p, u) => p + hold(`<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`));
+  s = emph(s);
+  s = s.replace(/(?: {2,}|\\)?\n/g, "<br>");  // (every newline breaks the line, as chat UIs do: models write lists that way)
+  const restore = (t) => t.replace(/\u0000(\d+)\u0000/g, (_, i) => restore(keep[+i]));  // (only earlier entries: it ends)
+  return restore(s);
+}
+
+function cells(row) {
+  row = row.trim().replace(/^\|/, "").replace(/\|$/, "");
+  const out = []; let c = "", code = false;
+  for (let i = 0; i < row.length; i++) {
+    const ch = row[i];
+    if (ch === "\\" && row[i + 1] === "|") { c += "|"; i++; continue; }
+    if (ch === "`") code = !code;
+    if (ch === "|" && !code) { out.push(c.trim()); c = ""; } else c += ch;
+  }
+  out.push(c.trim());
+  return out;
+}
+
+const LIST = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+
+function blocks(lines) {
+  let html = "", i = 0;
+  const para = [];
+  const flush = () => { if (para.length) { html += "<p>" + inline(para.join("\n")) + "</p>"; para.length = 0; } };
+  while (i < lines.length) {
+    const ln = lines[i];
+    let m;
+    if (!ln.trim()) { flush(); i++; continue; }
+    if ((m = ln.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/))) { flush(); html += `<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`; i++; continue; }
+    if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(ln)) { flush(); html += "<hr>"; i++; continue; }
+    if (/^\s{0,3}>/.test(ln)) {
+      flush(); const q = [];
+      while (i < lines.length && /^\s{0,3}>/.test(lines[i])) q.push(lines[i++].replace(/^\s{0,3}>\s?/, ""));
+      html += "<blockquote>" + blocks(q) + "</blockquote>"; continue;
+    }
+    if (ln.includes("|") && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(lines[i + 1])) {
+      flush();
+      const head = cells(ln), al = cells(lines[i + 1]).map((c) => (/^:-+:$/.test(c) ? "center" : /-:$/.test(c) ? "right" : ""));
+      const st = (j) => (al[j] ? ` style="text-align:${al[j]}"` : "");
+      let t = "<div class=\"tw\"><table><thead><tr>" + head.map((c, j) => `<th${st(j)}>${inline(c)}</th>`).join("") + "</tr></thead><tbody>";
+      i += 2;
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
+        const r = cells(lines[i++]);
+        t += "<tr>" + head.map((_, j) => `<td${st(j)}>${inline(r[j] || "")}</td>`).join("") + "</tr>";
+      }
+      html += t + "</tbody></table></div>"; continue;
+    }
+    if ((m = ln.match(LIST)) && (para.length === 0 || m[1].length === 0)) {
+      flush();
+      const base = m[1].length, ordered = /\d/.test(m[2]);
+      const start = ordered ? parseInt(m[2], 10) : 1;
+      let out = ordered ? `<ol${start !== 1 ? ` start="${start}"` : ""}>` : "<ul>";
+      while (i < lines.length) {
+        if (!lines[i].trim() && (lines[i + 1] || "").match(LIST) && lines[i + 1].match(LIST)[1].length === base) i++;  // (a loose list)
+        const im = lines[i].match(LIST);
+        if (!im || im[1].length !== base || /\d/.test(im[2]) !== ordered) break;
+        const body = [im[3]]; i++;
+        while (i < lines.length) {
+          const nx = lines[i], nm = nx.match(LIST);
+          if (nm && nm[1].length <= base) break;
+          if (!nx.trim()) {
+            const after = lines[i + 1];
+            if (after === undefined || !(/^\s/.test(after) && after.trim())) break;
+          }
+          if (!nm && nx.trim() && !/^\s/.test(nx) && /^(#|>|\s{0,3}([-*_])(\s*\2){2,}\s*$)/.test(nx)) break;
+          body.push(nx.replace(new RegExp("^ {0," + (base + 4) + "}"), "").replace(/^\t/, "")); i++;
+        }
+        const inner = blocks(body);
+        out += "<li>" + (body.length === 1 || !body.slice(1).some((x) => x.trim()) ? inner.replace(/^<p>([\s\S]*)<\/p>$/, "$1") : inner) + "</li>";
+      }
+      html += out + (ordered ? "</ol>" : "</ul>"); continue;
+    }
+    para.push(ln.trim()); i++;
+  }
+  flush();
+  return html;
+}
+
+function markdown(src) {
+  // Fenced code first (an unclosed fence runs to the end, as while streaming), the rest by blocks().
+  const lines = src.replace(/\u0000/g, "\uFFFD").replace(/\r\n?/g, "\n").split("\n");
+  let html = "", buf = [], i = 0;
+  while (i < lines.length) {
+    const f = lines[i].match(/^(\s{0,3})(`{3,}|~{3,})\s*([^`\s]*)[^`]*$/);
+    if (!f) { buf.push(lines[i++]); continue; }
+    html += blocks(buf); buf = [];
+    const fence = f[2], lang = f[3], code = [];
+    i++;
+    let closed = false;
+    while (i < lines.length) {
+      if (new RegExp("^\\s{0,3}" + fence[0] + "{" + fence.length + ",}\\s*$").test(lines[i])) { closed = true; i++; break; }
+      code.push(lines[i++]);
+    }
+    html += `<div class="cb"><div class="ch"><span>${esc(lang || "")}</span><button data-copy>Copy</button></div><pre><code>${esc(code.join("\n"))}</code></pre></div>`;
+  }
+  return html + blocks(buf);
+}
+
+// ------------------------------------------------------------ rendering
+
+const thread = $("thread"), logEl = $("log");
+let busy = null;  // {ctrl, conv, msg} while a reply streams
+
+function nearBottom() { return logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 80; }
+function toBottom() { logEl.scrollTop = logEl.scrollHeight; }
+
+function fmtStats(m) {
+  const t = m.timings, u = m.usage, parts = [];
+  if (t && t.predicted_n) parts.push(`${t.predicted_n} tokens` + (t.predicted_per_second ? ` · ${t.predicted_per_second.toFixed(1)} tok/s` : ""));
+  else if (u && u.completion_tokens) parts.push(`${u.completion_tokens} tokens`);
+  if (t) {
+    const prompt = (t.prompt_n || 0) + (t.cache_n || 0);
+    parts.push(`prompt ${prompt}` + (t.cache_n ? ` (${t.cache_n} cached)` : "") + (t.prompt_ms ? ` · ${(t.prompt_ms / 1000).toFixed(2)} s` : ""));
+    if (t.draft_n) parts.push(`${(100 * t.draft_n_accepted / t.draft_n).toFixed(0)}% drafts accepted`);
+  }
+  if (m.ttft != null) parts.push(`first token ${m.ttft.toFixed(2)} s`);
+  if (m.finish && m.finish !== "stop") parts.push(m.finish === "length" ? "stopped: max tokens" : m.finish);
+  return parts.join(" · ");
+}
+
+function mediaEl(a) {
+  if (!a.url) { const d = document.createElement("div"); d.className = "gone"; d.textContent = `${a.kind} not kept: ${a.name || ""}`; return d; }
+  const el = document.createElement(a.kind === "video" ? "video" : "img");
+  el.src = a.url;
+  if (a.kind === "video") { el.controls = true; el.muted = true; } else el.alt = a.name || "image";
+  return el;
+}
+
+function renderMsg(m, idx, conv) {
+  const live = busy && busy.msg === m;
+  const div = document.createElement("div");
+  div.className = "msg " + m.role;
+  if (m.role === "user") {
+    if (m.media && m.media.length) { const md = document.createElement("div"); md.className = "media"; m.media.forEach((a) => md.appendChild(mediaEl(a))); div.appendChild(md); }
+    if (m.content) { const b = document.createElement("div"); b.className = "body"; b.textContent = m.content; div.appendChild(b); }
+  } else {
+    if (m.reasoning) {
+      const d = document.createElement("details");
+      d.className = "think";
+      const thinking = live && !m.content;
+      d.open = m._open != null ? m._open : thinking;
+      const s = document.createElement("summary");
+      s.addEventListener("click", () => { m._open = !d.open; });  // (only the user's toggles: open is set below too)
+      s.textContent = thinking ? "Thinking…" : `Thought${m.thinkS ? ` for ${m.thinkS.toFixed(1)} s` : ""}`;
+      const tb = document.createElement("div"); tb.className = "tb"; tb.textContent = m.reasoning.replace(/^\s+/, "");
+      d.append(s, tb);
+      div.appendChild(d);
+    }
+    const b = document.createElement("div");
+    b.className = "md" + (live ? " cursor" : "");
+    b.innerHTML = markdown(m.content || "");
+    div.appendChild(b);
+  }
+  if (m.error) { const e = document.createElement("div"); e.className = "err"; e.textContent = m.error; div.appendChild(e); }
+  if (!live) {
+    const meta = document.createElement("div"); meta.className = "meta";
+    const act = (label, fn) => { const x = document.createElement("button"); x.textContent = label; x.onclick = fn; meta.appendChild(x); };
+    if (m.role === "assistant") {
+      const st = fmtStats(m); if (st) { const s = document.createElement("span"); s.textContent = st; meta.appendChild(s); }
+      act("Copy", () => copy(m.content || ""));
+      if (idx === conv.messages.length - 1) act("Regenerate", () => { if (busy) return; conv.messages.pop(); run(conv); });
+    } else {
+      act("Copy", () => copy(m.content || ""));
+      act("Edit", () => edit(conv, idx));
+    }
+    div.appendChild(meta);
+  }
+  return div;
+}
+
+function render() {
+  const conv = cur();
+  thread.textContent = "";
+  if (!conv || !conv.messages.length) {
+    const e = document.createElement("div"); e.className = "empty";
+    e.textContent = "Start a conversation. Replies stream from this server's /v1/chat/completions.";
+    thread.appendChild(e);
+  } else conv.messages.forEach((m, i) => thread.appendChild(renderMsg(m, i, conv)));
+  renderConvs();
+  updateButtons();
+}
+
+let pending = false;
+function rerenderLast() {  // (at most once a frame while streaming)
+  if (pending) return;
+  pending = true;
+  requestAnimationFrame(() => {
+    pending = false;
+    if (!busy || busy.conv !== cur()) return;
+    const stick = nearBottom();
+    const conv = busy.conv, idx = conv.messages.length - 1;
+    const old = thread.lastElementChild;
+    const el = renderMsg(conv.messages[idx], idx, conv);
+    if (old && old.classList.contains("assistant")) thread.replaceChild(el, old); else thread.appendChild(el);
+    if (stick) toBottom();
+  });
+}
+
+function renderConvs() {
+  const nav = $("convs");
+  nav.textContent = "";
+  for (const c of store.convs) {
+    const d = document.createElement("div");
+    d.className = "conv"; d.setAttribute("aria-current", String(c.id === store.current));
+    const t = document.createElement("span"); t.className = "t"; t.textContent = c.title; t.title = c.title;
+    const x = document.createElement("button"); x.className = "x"; x.textContent = "✕"; x.title = "Delete";
+    x.onclick = (e) => { e.stopPropagation(); removeConv(c.id); };
+    d.onclick = () => { setCurrent(c.id); $("app").classList.remove("nav"); render(); toBottom(); };
+    d.append(t, x);
+    nav.appendChild(d);
+  }
+}
+
+function removeConv(id) {
+  if (busy && busy.conv.id === id) busy.ctrl.abort();
+  store.convs = store.convs.filter((c) => c.id !== id);
+  removeItem(CONV + id);
+  if (store.current === id) setCurrent(store.convs.length ? store.convs[0].id : null);
+  render();
+}
+
+function copy(text) {
+  if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(text).catch(() => fallbackCopy(text)); return; }
+  fallbackCopy(text);  // (plain http on another machine is not a secure context: no clipboard API)
+}
+function fallbackCopy(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); } catch (e) { /* (nothing more to try) */ }
+  ta.remove();
+}
+thread.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-copy]");
+  if (!b) return;
+  copy(b.closest(".cb").querySelector("code").textContent);
+  b.textContent = "Copied"; setTimeout(() => { b.textContent = "Copy"; }, 1200);
+});
+
+// ------------------------------------------------------------ composer
+
+const input = $("input");
+let attach = [];  // [{kind, name, url}]
+
+function autosize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, innerHeight * 0.4) + "px"; }
+input.addEventListener("input", autosize);
+
+function renderAtt() {
+  const box = $("att"); box.textContent = "";
+  attach.forEach((a, i) => {
+    const d = document.createElement("div"); d.className = "a";
+    const el = mediaEl(a); if (a.kind === "video") el.controls = false;
+    const x = document.createElement("button"); x.textContent = "✕"; x.title = "Remove";
+    x.onclick = () => { attach.splice(i, 1); renderAtt(); };
+    d.append(el, x); box.appendChild(d);
+  });
+}
+function addFiles(files) {
+  for (const f of files) {
+    const kind = f.type.startsWith("image/") ? "image" : f.type.startsWith("video/") ? "video" : null;
+    if (!kind) continue;
+    const r = new FileReader();
+    r.onload = () => { attach.push({ kind, name: f.name || kind, url: r.result }); renderAtt(); };
+    r.readAsDataURL(f);
+  }
+}
+$("attach").onclick = () => $("file").click();
+$("file").onchange = (e) => { addFiles(e.target.files); e.target.value = ""; };
+input.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData && e.clipboardData.files || [])];
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+const cbox = $("cbox");
+cbox.addEventListener("dragover", (e) => { e.preventDefault(); cbox.classList.add("drag"); });
+cbox.addEventListener("dragleave", () => cbox.classList.remove("drag"));
+cbox.addEventListener("drop", (e) => { e.preventDefault(); cbox.classList.remove("drag"); addFiles(e.dataTransfer.files); });
+
+input.addEventListener("keydown", (e) => {
+  // (isComposing / 229: Enter that confirms an IME conversion, e.g. Japanese input, does not send)
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); send(); }
+});
+$("send").onclick = () => (busy ? busy.ctrl.abort() : send());
+$("new").onclick = () => { if (!cur() || cur().messages.length) newConv(); save(cur()); render(); $("app").classList.remove("nav"); input.focus(); };
+$("clear").onclick = () => {
+  if (!confirm("Delete all conversations kept in this browser?")) return;
+  if (busy) busy.ctrl.abort();
+  for (const c of storedConvs()) removeItem(CONV + c.id);
+  store.convs = []; setCurrent(null); render();
+};
+$("menu").onclick = () => $("app").classList.toggle("nav");
+$("opts").onclick = () => { const s = $("settings"); s.hidden = !s.hidden; $("opts").setAttribute("aria-expanded", String(!s.hidden)); };
+
+for (const [id, k] of [["sys", "sys"], ["temp", "temp"], ["topp", "topp"], ["maxt", "maxt"], ["think", "think"]]) {
+  $(id).value = prefs[k];
+  $(id).addEventListener("change", () => { prefs[k] = $(id).value; savePrefs(k); });
+  $(id).addEventListener("input", () => { prefs[k] = $(id).value; savePrefs(k); });
+}
+
+function updateButtons() {
+  $("send").textContent = busy ? "Stop" : "Send";
+}
+
+function edit(conv, idx) {
+  if (busy) return;
+  const m = conv.messages[idx];
+  input.value = m.content || "";
+  attach = (m.media || []).filter((a) => a.url).map((a) => Object.assign({}, a));
+  conv.messages.splice(idx);
+  save(conv); render(); renderAtt(); autosize(); input.focus();
+}
+
+function send() {
+  if (busy) return;
+  const text = input.value;
+  if (!text.trim() && !attach.length) return;
+  const conv = cur() || newConv();
+  conv.messages.push({ role: "user", content: text, media: attach });
+  if (conv.title === "New chat") conv.title = (text.trim() || attach.map((a) => a.name).join(", ")).replace(/\s+/g, " ").slice(0, 60);
+  input.value = ""; attach = []; renderAtt(); autosize();
+  if (!conv.rev) save(conv);  // (a new one: stored now, so that other tabs can see and delete it)
+  run(conv);
+}
+
+// ------------------------------------------------------------ the request
+
+function apiMessages(conv) {
+  const out = [];
+  if (prefs.sys.trim()) out.push({ role: "system", content: prefs.sys });
+  for (const m of conv.messages) {
+    if (m.role === "assistant") {
+      if (m.error && !m.content) continue;  // (a failed request: nothing to send back)
+      const a = { role: "assistant", content: m.content || "" };
+      if (m.reasoning) a.reasoning_content = m.reasoning;  // (the template renders it: the model's context, and the cached prefix)
+      out.push(a); continue;
+    }
+    const media = (m.media || []).filter((a) => a.url);
+    if (!media.length) { out.push({ role: "user", content: m.content }); continue; }
+    const parts = media.map((a) => (a.kind === "video" ? { type: "video_url", video_url: { url: a.url } } : { type: "image_url", image_url: { url: a.url } }));
+    if (m.content) parts.push({ type: "text", text: m.content });
+    out.push({ role: "user", content: parts });
+  }
+  return out;
+}
+
+async function run(conv) {
+  const msg = { role: "assistant", content: "", reasoning: "" };
+  conv.messages.push(msg);
+  conv.updated = Date.now();
+  store.convs.sort((a, b) => b.updated - a.updated);
+  const ctrl = new AbortController();
+  busy = { ctrl, conv, msg };
+  render(); toBottom();
+  const body = { model, messages: apiMessages(conv).slice(0, -1), stream: true, stream_options: { include_usage: true } };
+  body.chat_template_kwargs = prefs.think === "off" ? { enable_thinking: false }
+    : { enable_thinking: true, reasoning_effort: prefs.think };
+  const num = (v) => (v === "" || v == null || isNaN(+v) ? null : +v);
+  if (num(prefs.temp) != null) body.temperature = num(prefs.temp);
+  if (num(prefs.topp) != null) body.top_p = num(prefs.topp);
+  if (num(prefs.maxt) != null) body.max_tokens = Math.max(1, Math.round(num(prefs.maxt)));
+  const t0 = performance.now();
+  let tThink = null;
+  try {
+    const r = await fetch(BASE + "v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                    body: JSON.stringify(body), signal: ctrl.signal });
+    if (!r.ok) {
+      let detail = `${r.status} ${r.statusText}`;
+      try { const j = await r.json(); detail = (j.error && j.error.message) || j.message || detail; } catch (e) { /* (not JSON) */ }
+      throw new Error(detail);
+    }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let k;
+      while ((k = buf.indexOf("\n\n")) >= 0) {
+        const ev = buf.slice(0, k); buf = buf.slice(k + 2);
+        for (const line of ev.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") continue;
+          const j = JSON.parse(data);
+          if (j.error) throw new Error(j.error.message || "error");
+          const ch = j.choices && j.choices[0];
+          if (ch && ch.delta) {
+            const d = ch.delta;
+            const rs = d.reasoning_content != null ? d.reasoning_content : d.reasoning;
+            if (rs) { if (msg.ttft == null) msg.ttft = (performance.now() - t0) / 1000; if (tThink == null) tThink = performance.now(); msg.reasoning += rs; }
+            if (d.content) {
+              if (msg.ttft == null) msg.ttft = (performance.now() - t0) / 1000;
+              if (tThink != null && msg.thinkS == null) msg.thinkS = (performance.now() - tThink) / 1000;
+              msg.content += d.content;
+            }
+            if (ch.finish_reason) msg.finish = ch.finish_reason;
+          }
+          if (j.timings) msg.timings = j.timings;
+          if (j.usage) msg.usage = j.usage;
+          rerenderLast();
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === "AbortError") msg.finish = "stopped";
+    else msg.error = String(e.message || e);
+  }
+  if (tThink != null && msg.thinkS == null) msg.thinkS = (performance.now() - tThink) / 1000;
+  if (!msg.reasoning) delete msg.reasoning;
+  delete msg._open;
+  busy = null;
+  conv.updated = Date.now();
+  const shown = conv === cur();  // (before save: it forgets a conversation deleted in another tab)
+  save(conv);
+  if (shown) { const stick = nearBottom(); render(); if (stick) toBottom(); } else renderConvs();
+  updateButtons();
+  ctxHint();
+}
+
+// ------------------------------------------------------------ server state
+
+async function poll() {
+  const st = $("state"), dot = st.firstElementChild, txt = st.lastElementChild;
+  try {
+    const r = await fetch(BASE + "health", { cache: "no-store" });
+    const j = await r.json().catch(() => ({}));
+    const s = j.status || (r.ok ? "ok" : "unavailable");
+    const map = { ok: ["var(--good)", "ready"], unloaded: ["var(--warning)", "unloaded (the first request loads it)"],
+                  loading: ["var(--warning)", "loading"], stopped: ["var(--critical)", "engine stopped (start it on Stats)"] };
+    const [c, t] = map[s] || [r.ok ? "var(--good)" : "var(--warning)", s];
+    dot.style.background = c; txt.textContent = t;
+  } catch (e) { dot.style.background = "var(--critical)"; txt.textContent = "server unreachable"; }
+}
+let maxLen = null;
+async function models() {
+  try {
+    const j = await (await fetch(BASE + "v1/models", { cache: "no-store" })).json();
+    if (j.data && j.data[0]) { model = j.data[0].id; maxLen = j.data[0].max_model_len; }
+  } catch (e) { /* (keep the fallback) */ }
+  ctxHint();
+}
+function ctxHint() {
+  const conv = cur(), last = conv && [...conv.messages].reverse().find((m) => m.timings);
+  if (!last || !maxLen) { $("ctx").textContent = ""; return; }
+  const used = (last.timings.prompt_n || 0) + (last.timings.cache_n || 0) + (last.timings.predicted_n || 0);
+  $("ctx").textContent = `context ${used.toLocaleString()} / ${maxLen.toLocaleString()}`;
+}
+
+$("stats").href = BASE + "ui";
+render(); toBottom(); renderAtt(); autosize(); models(); poll();
+setInterval(poll, 5000);
+window.addEventListener("storage", (e) => { if (e.key === null || e.key.startsWith(CONV)) sync(); });
+input.focus();
+</script>
+</body>
+</html>

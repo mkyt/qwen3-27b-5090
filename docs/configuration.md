@@ -92,8 +92,8 @@ the port opens without a firewall rule and those tools' rules do not close it. T
   ```
 
 **On the other machine,** use the PC's address in place of `127.0.0.1`: the API at `http://<address>:8000/v1` (Anthropic
-clients: `http://<address>:8000`) and the stats page at `http://<address>:8000/ui`. With another `PORT`, change the port
-everywhere above.
+clients: `http://<address>:8000`), the stats page at `http://<address>:8000/ui` and the chat page at
+`http://<address>:8000/chat`. With another `PORT`, change the port everywhere above.
 
 ## Serving
 
@@ -359,6 +359,33 @@ The same from a script:
   next load**) they only stay for the next load, while the engine is stopped or unloaded (409 otherwise): it does not
   load, and whether they fit is decided when it does. Example:
   `curl -s -X POST localhost:8000/admin/engine -H 'Content-Type: application/json' -d '{"action": "restart", "settings": {"kv_dtype": "fp8", "max_seqs": 4}}'`.
+
+## Chat page
+
+`http://localhost:8000/chat` is a simple chat page, to try the model in a browser without installing a client (like
+llama.cpp's `llama-server`). It is one file with no external resources, served by the server itself, and calls
+`/v1/chat/completions` from the same origin, so it needs no CORS or `TRUSTED_ORIGINS`.
+
+- Streaming, the reasoning folded away (open while the model thinks), Markdown with tables and code blocks (with a
+  copy button), and each reply's tokens, decode rate, prompt and cached tokens and accepted drafts (from `timings`).
+- Images and videos: the attach button, paste or drop. They are sent as data URLs.
+- Thinking: off (`chat_template_kwargs.enable_thinking: false`) or the reasoning effort, `low`, `medium` or `xhigh`
+  (the default; `chat_template_kwargs.reasoning_effort`). It is one setting for all chats and can change within a
+  conversation, from the next reply. The chat template puts the effort's instruction at the head of the prompt (none
+  for `medium` and off, which therefore share a head), so a change to another head reads the conversation again
+  unless the prefix cache still holds it from an earlier use of that setting.
+- A system prompt, temperature, top-p and max tokens (empty: the server's defaults).
+- The earlier replies' reasoning is sent back (`reasoning_content`), as the chat template expects, so it stays in the
+  model's context and counts toward it.
+- Stop (closing the stream cancels the request), regenerate the last reply, edit a message (the conversation is cut
+  there).
+- Conversations are kept in the browser's `localStorage`, on that browser only. Videos are not kept, and when the
+  storage is full the images of the oldest conversations are dropped first; the text stays.
+- The browser's tabs share the conversations: a save or a delete shows in the others. When two tabs change the same
+  conversation at the same time, the one that finishes later is kept as a copy ("(copy)" after the title).
+
+It is meant for trying the server and light use. For more (accounts, several models, documents, tools, conversations
+on the server), use a full client such as Open WebUI with `http://<address>:8000/v1` as an OpenAI connection.
 
 ## Prefix cache
 

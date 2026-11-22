@@ -469,6 +469,8 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
   (`q27_memory_report`); the server adds NVML samples and a log of requests and engine events, and streams them to
   the page as server-sent events. The page (and `POST /admin/engine`) also stops, starts and restarts the engine
   process: it holds all the VRAM, the server none.
+- `/chat` is a chat page (`frontend/ui/chat.html`, one file with no external resources) that calls
+  `/v1/chat/completions` from the same origin and keeps conversations in the browser's `localStorage`.
 - Start settings (`frontend/launch.py`): an engine can start with other weights, KV type, draft, vision tower,
   `MAX_SEQS`, `MAX_TOKENS` or VRAM budget. What each leaves for the context comes from the engine's own memory
   planner: `q27_plan` runs the constructor's planning (the pools, `MAX_TOKENS_FIT`, the KV pool) for a given free
