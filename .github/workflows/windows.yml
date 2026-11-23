@@ -28,6 +28,9 @@ permissions:
 env:
   CUDA_VERSION: 13.3.1
   CUDA_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3
+  # MSVC toolset for nvcc: CUDA 13.3's cudafe++ crashes (0xC0000005) on MSVC 14.52 (the runner image of 2026-11-16),
+  # even on CMake's compiler-id test. Used when the runner has it; otherwise the default toolset.
+  MSVC_TOOLSET: "14.51"
 
 jobs:
   # A release pushes main and its v* tag together: the tag's run builds that commit (and also tags it latest), so
@@ -80,12 +83,16 @@ jobs:
           $p = Start-Process $exe -Wait -PassThru -ArgumentList "-s", "nvcc_$v", "nvvm_$v", "cudart_$v", "crt_$v", "thrust_$v"
           if ($p.ExitCode) { throw "CUDA installer exit code $($p.ExitCode)" }
           & "$env:CUDA_DIR\bin\nvcc.exe" --version
-      # MSVC from the runner's Visual Studio (vcvars64.bat), CMake and Ninja from its PATH.
+      # MSVC from the runner's Visual Studio (vcvars64.bat, toolset MSVC_TOOLSET), CMake and Ninja from its PATH.
       - name: Build the package
         shell: cmd
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
-          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          echo MSVC toolsets: & dir /b "%VS%\VC\Tools\MSVC"
+          set "VCVER="
+          if exist "%VS%\VC\Tools\MSVC\%MSVC_TOOLSET%.*" set "VCVER=-vcvars_ver=%MSVC_TOOLSET%"
+          if not defined VCVER echo MSVC %MSVC_TOOLSET% not installed, using the default toolset
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" %VCVER% || exit /b 1
           set "CUDA_PATH=%CUDA_DIR%"
           set "CUDACXX=%CUDA_DIR%\bin\nvcc.exe"
           set "PATH=%CUDA_DIR%\bin;%PATH%"
