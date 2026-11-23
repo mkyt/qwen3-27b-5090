@@ -389,7 +389,11 @@ images.
   fp32 patches, and the 0.3 s that numpy took for those on the CPU is gone.
 - Image tokens enter the prompt as out-of-vocabulary ids derived from the image's content. The prefix cache, which
   compares token ids, therefore distinguishes images without any change and skips encoding images that are already
-  in a cached prefix. The embeddings are written to a pinned host table that the embedding gather reads.
+  in a cached prefix. The embeddings are written to a pinned host table (`IMAGE_TOKENS` rows of 10 KiB) that the
+  embedding gather reads. The table holds only the images near the prefill call about to run: before each call the
+  engine process encodes the images and video pairs it may reach (under two prefill chunks) into rows of images the
+  prompt has already passed, so a request may hold any number of images, as an agent's history of screenshots
+  grows. An image the prompt runs again (its cached prefix was evicted) is encoded again.
 - M-RoPE: rows of an image get (t, h, w) positions; after the last image, positions continue as position + delta
   (one device integer), so decode and the speculative graphs are unchanged, and text-only requests are
   bit-identical to the text path.
@@ -404,9 +408,10 @@ takes it unchanged. In the vision tower a pair differs from an image only in tha
 over the temporal patch instead of one image twice; attention, position embeddings and RoPE stay within the pair.
 
 - The vision tower encodes many pairs of one grid in one pass (attention over each pair's patches: the third
-  grid dimension of the attention kernel), as many as `IMAGE_MAX_PIXELS` holds, so a 5-minute video's 300 pairs
-  take 0.25 s instead of 300 weight streams (about 20 ms each with `VISION=host`). The result is bit-identical to
-  one pair per call.
+  grid dimension of the attention kernel): the pairs one prefill call reaches, as many as `IMAGE_MAX_PIXELS`
+  holds, so a 5-minute video's 300 pairs take a few weight streams (about 20 ms each with `VISION=host`) instead of
+  300. The result is bit-identical to one pair per call. The frames are decoded once and kept until the prompt
+  has passed the video.
 - The engine library reads the container itself (`engine/src/video_mp4.cc`: MP4 / MOV, fragmented files and edit
   lists included; every offset and count checked against the file; `engine/src/video_mkv.cc`: Matroska / WebM on
   libwebm's `mkvparser`, the frame rate from `DefaultDuration` as libavformat rounds it, else from the frames'
@@ -478,7 +483,7 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
 - The server marks message boundaries for the prefix cache and reports, per request, how many tokens came from it.
 - OpenAI chat completions and completions also return llama.cpp's `timings` object (`cache_n`, `prompt_n`, `prompt_ms`,
   `predicted_n`, `predicted_ms` and the rates), on the response or the last streamed chunk, which front-ends such as
-  llama-swap read. With a draft, `draft_n` is 7 per verify step and `draft_n_accepted` the step's tokens minus the
+  llama-swap read (`prompt_ms` includes the vision tower for the images it encodes). With a draft, `draft_n` is 7 per verify step and `draft_n_accepted` the step's tokens minus the
   bonus token, as llama.cpp counts them; they are left out without a draft and with `Q27_SPEC_PATHS` above 1.
 - `/metrics` exposes Prometheus metrics; `/admin/concurrency` reads and sets the admission settings. There is no
   authentication: the server is meant to listen on 127.0.0.1 for one user.

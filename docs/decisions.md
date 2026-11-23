@@ -395,6 +395,13 @@ gate without an explicit decision, recorded below with its numbers.
   pair), bit-identical to one pair per call; one pass per pair would stream the weights 300 times for a 5-minute
   video with `VISION=host`. The per-frame pixel cap of qwen-vl-utils (transformers' default from v5.22; without it a
   10-second clip costs nearly the 12,288 tokens of a long video).
+- **P4-21: any number of images in a request.** The image table held every image of a request, so an agent
+  checking screenshots failed with HTTP 400 once its history passed `IMAGE_TOKENS` (16,384 tokens: 4 to 20
+  screenshots by their size), although the images in the cached prefix were not even encoded. The table now holds the images near
+  one prefill call, encoded just before it into rows of images already passed; an image whose prefix is no longer
+  cached is encoded again. A growing table instead would pin host memory for the whole context (2.5 GiB at 262K).
+  The outputs are bit-identical to a table holding every image (30 screenshots in 8,192 rows against 65,536; a
+  385-pair video), and the time to the first token is unchanged.
 - **P4-18: the checkpoint's video bounds by default, more on request.** A video takes at most 12,288 tokens and 768
   frames by default, as the checkpoint's processor (and vLLM / transformers) does it; `VIDEO_MAX_TOKENS` /
   `VIDEO_MAX_FRAMES` raise them for the server and `mm_processor_kwargs.size.longest_edge` for a request

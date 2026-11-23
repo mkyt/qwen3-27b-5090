@@ -203,8 +203,11 @@ class Model {
   // the vision tower on image i (its pixels in host memory: VisionPixels, 2 gh x 2 gw patches) into its
   // embedding rows; images whose positions the restored prefix covers need no encoding. mm_encode with n > 1
   // encodes images i .. i + n - 1 of one grid (a video's frame pairs, pixels[n]) in as few passes as the
-  // workspace allows. mm_embeds copies them out (tests).
+  // workspace allows. mm_embeds copies them out (tests). The embeddings live in IMAGE_TOKENS rows of mm_: mm_set gives
+  // the images rows in order while they fit, mm_place gives images other rows (a request with more image tokens
+  // than that places and encodes the images of each prompt chunk before running it, reusing rows).
   void mm_set(const int32_t* spans, int n);
+  void mm_place(int i, int n, int row);
   void mm_encode(int i, const VisionPixels* pixels, int n = 1);
   void mm_embeds(int i, bf16* out);
   void mm_put(int i, const bf16* in);  // replaces image i's embeddings (tests: another vision tower)
@@ -352,7 +355,7 @@ class Model {
 
   // Images of the running request (P4-12).
   struct MmSpan {
-    int start, gh, gw, row;  // positions start .. start + gh * gw - 1, rows of mm_ from row
+    int start, gh, gw, row;  // positions start .. start + gh * gw - 1, rows of mm_ from row (-1: none yet)
     int len() const { return gh * gw; }
   };
   std::vector<MmSpan> mm_spans_;

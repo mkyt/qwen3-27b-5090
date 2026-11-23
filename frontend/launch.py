@@ -39,20 +39,32 @@ ENV_NAMES = {"weights": "WEIGHTS", "kv_dtype": "KV_DTYPE", "spec": "SPEC", "visi
              "max_tokens": "MAX_TOKENS", "vram_budget_gib": "VRAM_BUDGET_GIB", "act_a4x2": "Q27_ACT_A4X2"}
 
 
-IMAGE_TOKENS = 16384  # (the engine's image and video tokens per request without IMAGE_TOKENS or VIDEO_MAX_TOKENS)
+IMAGE_TOKENS = 16384  # (the engine's image table without IMAGE_TOKENS, unless the images need more: set_engine_env)
+
+
+def image_rows(env):
+    """Rows of the image table a request needs at the least: the images near one prefill call, which runs under two
+    prefill chunks, the largest image (or pair of video frames: 768 tokens) at each end of it (worker.py mm_ready)."""
+    def num(k, default):
+        v = env.get(k) or ""
+        return int(v) if v.isdigit() and int(v) > 0 else default
+
+    largest = max(num("IMAGE_MAX_PIXELS", 4194304) // 1024, 768)  # (1,024 pixels per token)
+    return 2 * num("PREFILL_CHUNK", 2048) + 2 * largest
 
 
 def set_engine_env(root):
     """The environment an engine of the server starts with, besides the settings (`root`: the checkout or package).
-    IMAGE_TOKENS unset or empty: 16,384, or VIDEO_MAX_TOKENS when that is more (one video of that many tokens, its
-    time stamps aside). Raises ValueError for a VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES that is not a positive integer."""
+    IMAGE_TOKENS unset or empty: 16,384, or more when the prefill chunk and IMAGE_MAX_PIXELS need it (image_rows; a
+    request may hold any number of images and videos: the table holds those near one prefill call). Raises
+    ValueError for a VIDEO_MAX_TOKENS / VIDEO_MAX_FRAMES that is not a positive integer."""
     for k, v in ENGINE_ENV_DEFAULTS.items():
         os.environ.setdefault(k, v)
     for k in ("VIDEO_MAX_TOKENS", "VIDEO_MAX_FRAMES"):
         if (v := os.environ.get(k)) and not (v.isdigit() and int(v) > 0):
             raise ValueError(f"{k} must be a positive integer, got {v!r}")
     if not os.environ.get("IMAGE_TOKENS"):
-        os.environ["IMAGE_TOKENS"] = str(max(IMAGE_TOKENS, int(os.environ.get("VIDEO_MAX_TOKENS") or 0)))
+        os.environ["IMAGE_TOKENS"] = str(max(IMAGE_TOKENS, image_rows(os.environ)))
     vocab = root / "bench/draft-vocab/vocab-128k.txt"
     if "Q27_DRAFT_VOCAB" not in os.environ and vocab.exists():
         os.environ["Q27_DRAFT_VOCAB"] = str(vocab)

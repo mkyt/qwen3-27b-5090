@@ -51,6 +51,7 @@ SIGNATURES = {
     "q27_device_memory": ([P, P], I),
     "q27_has_vision": ([P], I),
     "q27_mm_set": ([P, P, I], I),
+    "q27_mm_place": ([P, I, I, I], I),
     "q27_mm_encode": ([P, I, P], I),
     "q27_mm_encode_rgb": ([P, I, P, P], I),
     "q27_mm_encode_frames": ([P, I, I, P, P], I),
@@ -494,6 +495,12 @@ class Engine:
         """Images of this request (after reset / prefix_begin): spans [(start, gh, gw)] with the merged grid."""
         flat = array.array("i", [v for sp in spans for v in sp] or [0])
         self._check(lib().q27_mm_set(self.h, flat.buffer_info()[0], len(spans)), "q27_mm_set")
+
+    def mm_place(self, i, n, row):
+        """Rows of the image table for images i .. i + n - 1 from `row` on, in order (mm_set places the images in
+        order while they fit; more image tokens than IMAGE_TOKENS: the caller places each prompt chunk's images,
+        reusing the rows of earlier ones, and encodes them before running the chunk)."""
+        self._check(lib().q27_mm_place(self.h, i, n, row), "q27_mm_place")
 
     def mm_encode(self, i, pixel_values):
         """Runs the vision tower on image i: pixel_values [4 * gh * gw, 1536] (float32, numpy or CPU torch)."""

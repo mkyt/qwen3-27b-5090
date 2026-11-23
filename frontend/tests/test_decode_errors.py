@@ -33,6 +33,9 @@ class FakeEngine:
     def mm_set(self, spans):
         pass
 
+    def mm_place(self, i, n, row):
+        pass
+
     def kv_unlend(self, loan):
         self._cuda("kv_unlend")
 
@@ -53,6 +56,7 @@ def run_turn(error, lost, prefetched, loan):
     e.lost = lost
     s = object.__new__(worker.Scheduler)
     s.engine, s.conn, s.spec, s.cur, s.KvFull = e, Conn(), False, None, type("KvFull", (Exception,), {})
+    s.chunk, s.image_tokens = 2048, 16384
     s.returns, s.alive, s.waiting = collections.deque(), [], collections.deque()
     s.by_id, s.m = {}, collections.Counter()
     r = worker.Seq("r", {"ids": list(range(8)), "max_new": 8, "temperature": 1.0, "top_k": 20, "top_p": 0.95,

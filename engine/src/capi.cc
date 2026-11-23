@@ -408,6 +408,11 @@ int q27_has_vision(void* m) { return static_cast<Model*>(m)->has_vision() ? 1 : 
 int q27_mm_set(void* m, const int32_t* spans, int n) {
   return guard([&] { static_cast<Model*>(m)->mm_set(spans, n); });
 }
+// Rows of mm_ for images i .. i + n - 1 from `row` on (in order): a request with more image tokens than
+// IMAGE_TOKENS places and encodes the images of each prompt chunk before running it.
+int q27_mm_place(void* m, int i, int n, int row) {
+  return guard([&] { static_cast<Model*>(m)->mm_place(i, n, row); });
+}
 int q27_mm_encode(void* m, int i, const float* pixels) {
   return guard([&] {
     VisionPixels px;

@@ -110,7 +110,7 @@ class Images:
         self.path = path
         self.proc = ImageProcessor(path)
         self.max_pixels = max_pixels
-        self.max_tokens = max_tokens  # (IMAGE_TOKENS: the engine's embedding rows per request)
+        self.max_tokens = max_tokens  # (IMAGE_TOKENS: the engine's embedding rows, reused within a request)
         self._video = None
 
     @property
@@ -218,8 +218,9 @@ class Images:
             videos.append((raw, plan))
         if k != len(loaded):
             raise ApiError(400, f"{len(loaded)} images and videos for {k} pads in the prompt")
-        if (rows := sum(gh * gw for _, gh, gw in spans)) > self.max_tokens:
-            raise ApiError(400, f"the images and videos take {rows} tokens, more than IMAGE_TOKENS ({self.max_tokens}; "
+        # (any number of them: the engine's table holds the images near one prefill chunk at a time, worker.py mm_ready)
+        if (rows := max((gh * gw for _, gh, gw in spans), default=0)) > self.max_tokens:
+            raise ApiError(400, f"an image takes {rows} tokens, more than IMAGE_TOKENS ({self.max_tokens}; "
                                 "the server's setting)")
         return out, spans, srcs, videos
 

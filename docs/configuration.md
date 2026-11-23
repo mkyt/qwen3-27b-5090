@@ -132,7 +132,7 @@ clients: `http://<address>:8000`), the stats page at `http://<address>:8000/ui` 
 | `CHECKPOINT_INTERVAL` | 8192 | Distance between checkpoints inside a long prompt (a multiple of 64) |
 | `VISION` | `host` | Image input. `host`: the vision tower's BF16 weights (0.86 GiB) stay in pinned host memory and are streamed to the GPU one layer ahead of the computation; the KV pool loses 192 tokens, small images take +13 ms (the copy is about 20 ms), 1024x1024 and larger +1–4 ms; output identical to `bf16`. `fp8`: E4M3 weights with per-row scales on the GPU, widened per layer (0.43 GiB; embedding error about 3x that of `bf16`, answers can change). `bf16`: BF16 weights on the GPU (fastest, 0.86 GiB). `off`: requests with images get HTTP 400 (the engine library's default). Activations and the weight staging (90 MiB) share the prefill's buffers |
 | `IMAGE_MAX_PIXELS` | 4194304 | Images are resized to at most this many pixels (2048x2048 = 4,096 tokens, 370 ms in the vision tower) |
-| `IMAGE_TOKENS` | 16384 | Image and video tokens per request (embeddings in pinned host memory, 10 KiB per token: 160 MiB). More: HTTP 400. Unset or empty: 16,384, or `VIDEO_MAX_TOKENS` when that is more |
+| `IMAGE_TOKENS` | 16384 | Rows of the image table (embeddings in pinned host memory, 10 KiB per token: 160 MiB). Not a limit on a request's images: the table holds the images near one prefill call (two prefill chunks and the largest image at each end), reusing the rows of those the prompt has passed. An image larger than the table: HTTP 400. Unset or empty: 16,384, or what `PREFILL_CHUNK` and `IMAGE_MAX_PIXELS` need when that is more |
 | `VIDEO_MAX_TOKENS` | the checkpoint's 12,288 | Tokens of a video at most (the pixels of all its sampled frames together, 2,048 per token; the checkpoint's `size.longest_edge`), besides the time stamps of its pairs. A pair of frames takes at most 768 tokens all the same, so a video of up to 16 pairs (16 s at 2 frames per second) keeps its size; longer ones get larger frames. A request's `mm_processor_kwargs.size.longest_edge` replaces it for that request ([Long videos](#long-videos)) |
 | `VIDEO_MAX_FRAMES` | the checkpoint's 768 | Frames sampled from a video at most (2 per second until then), and the most a request's `num_frames` / `min_frames` / `max_frames` may ask for |
 | `VRAM_BUDGET_GIB` / `WDDM_MARGIN_GIB` | free − 0.6 / 0.6 | VRAM budget and the margin kept free for the display driver. The budget is never above the automatic one (free − margin, at most 30.3 GiB for the process): beyond it the driver moves memory to system RAM without an error, about 7 times slower. A higher `VRAM_BUDGET_GIB` is lowered, with a line in the log |
@@ -164,7 +164,7 @@ a request:
 VIDEO_MAX_TOKENS=131072 VIDEO_MAX_FRAMES=2048 docker compose up -d serve
 ```
 
-Or per request, within `IMAGE_TOKENS` and `VIDEO_MAX_FRAMES`:
+Or per request, within `VIDEO_MAX_FRAMES`:
 `"mm_processor_kwargs": {"fps": 2, "max_frames": 2048, "size": {"longest_edge": 268435456}}`
 (`size.longest_edge` is T in pixels: 2,048 per token; `num_frames` takes a frame count instead of `fps`).
 
@@ -216,9 +216,8 @@ finer time.
 
 ### Limits and costs
 
-- `IMAGE_TOKENS` follows `VIDEO_MAX_TOKENS` unless it is set: the embeddings take 10 KiB of pinned host memory per
-  token (1.25 GiB for 131,072), allocated when the engine starts. A request with more tokens of images and videos
-  gets HTTP 400.
+- A long video needs no larger `IMAGE_TOKENS`: its pairs go through the image table a prefill call at a time (the
+  frames are decoded once and kept in host memory until the prompt has passed the video).
 - The tokens of the videos, their pairs' text included, must fit the context: 1,024 pairs add about 10K tokens of
   text.
 - A frame takes at least about 4,300 pixels (about 4 tokens), so with a very high F and a low T (more than about

@@ -95,7 +95,7 @@ services:
       CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-8192}
       VISION: ${VISION:-host}                      # off | host | fp8 | bf16: image input (P4-12)
       IMAGE_MAX_PIXELS: ${IMAGE_MAX_PIXELS:-4194304}  # images are resized to at most this many pixels
-      IMAGE_TOKENS: ${IMAGE_TOKENS:-}              # image and video tokens per request (pinned host embeddings, 10 KiB each); empty: 16384 or VIDEO_MAX_TOKENS if more
+      IMAGE_TOKENS: ${IMAGE_TOKENS:-}              # rows of the image table (pinned host, 10 KiB each), reused within a request; empty: 16384 or what PREFILL_CHUNK and IMAGE_MAX_PIXELS need
       VIDEO_MAX_TOKENS: ${VIDEO_MAX_TOKENS:-}      # tokens of a video at most; empty: the checkpoint's 12288
       VIDEO_MAX_FRAMES: ${VIDEO_MAX_FRAMES:-}      # frames sampled from a video at most (and a request's bound); empty: the checkpoint's 768
       Q27_ATTN_FP8: ${Q27_ATTN_FP8:-}              # prefill attention MMAs: empty = 2 (FP8 KV) / 3 (NVFP4 KV: Q·K on FP4 MMAs, P7-8); 2 Q·K and P·V in FP8, 1 P·V only, 0 BF16

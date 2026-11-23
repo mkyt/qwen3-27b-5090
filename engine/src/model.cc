@@ -298,7 +298,7 @@ Model::Model(const Options& opt) : opt_(opt) {
     vis_ws_ = o_vis ? act_.at<void>(o_vis) : act_.at<void>(o_x);
     mm_ = host_mm_.at<bf16>(0);
     static const char* kWhere[] = {"", "BF16 on the device", "BF16 in pinned host memory", "FP8 on the device"};
-    log("vision: %s, workspace %.0f MiB%s, images up to %d px, %d image tokens per request", kWhere[opt.vision],
+    log("vision: %s, workspace %.0f MiB%s, images up to %d px, an image table of %d tokens", kWhere[opt.vision],
         vis_ws_bytes_ / 1048576.0, o_vis ? "" : " (in the prefill activations)", opt.image_max_pixels,
         opt.image_tokens);
   }
@@ -1198,25 +1198,40 @@ void Model::mm_set(const int32_t* spans, int n) {
   Q27_CHECK(n == 0 || opt_.vision, "images need the vision tower (VISION)");
   batch_exit();
   mm_spans_.clear();
+  // Rows of mm_ in order while they fit; the spans past IMAGE_TOKENS rows have none until mm_place gives them some
+  // (a request with more image tokens than the table runs them a part at a time, reusing rows).
   int rows = 0, delta = 0, end = 0;
   for (int i = 0; i < n; i++) {
-    MmSpan sp{spans[3 * i], spans[3 * i + 1], spans[3 * i + 2], rows};
+    MmSpan sp{spans[3 * i], spans[3 * i + 1], spans[3 * i + 2], -1};
     Q27_CHECK(sp.gh > 0 && sp.gw > 0 && sp.start >= end, "images: bad or overlapping spans");
+    if (rows + sp.len() <= opt_.image_tokens) sp.row = rows;
     rows += sp.len();
     end = sp.start + sp.len();
     delta += std::max(sp.gh, sp.gw) - sp.len();  // the rotary position advances by max(gh, gw)
     mm_spans_.push_back(sp);
   }
-  Q27_CHECK(rows <= opt_.image_tokens, "images: more image tokens than IMAGE_TOKENS");
   Q27_CUDA(cudaMemcpyAsync(rope_delta_, &delta, 4, cudaMemcpyHostToDevice, s_));
   Q27_CUDA(cudaStreamSynchronize(s_));
+}
+
+void Model::mm_place(int i, int n, int row) {
+  Q27_CHECK(n > 0 && i >= 0 && i + n <= int(mm_spans_.size()) && row >= 0, "mm_place: no such image");
+  for (int k = 0; k < n; k++) {
+    MmSpan& sp = mm_spans_[i + k];
+    Q27_CHECK(row + sp.len() <= opt_.image_tokens, "images: more image tokens at once than IMAGE_TOKENS");
+    sp.row = row;
+    row += sp.len();
+  }
 }
 
 void Model::mm_encode(int i, const VisionPixels* pixels, int n) {
   Q27_CHECK(opt_.vision && n > 0 && i >= 0 && i + n <= int(mm_spans_.size()), "mm_encode: no such image");
   const MmSpan& sp = mm_spans_[i];
-  for (int k = 1; k < n; k++)  // (rows of consecutive spans are consecutive: mm_set)
+  Q27_CHECK(sp.row >= 0, "mm_encode: the image has no rows (mm_place)");
+  for (int k = 1; k < n; k++) {  // (written as one block of rows)
     Q27_CHECK(mm_spans_[i + k].gh == sp.gh && mm_spans_[i + k].gw == sp.gw, "mm_encode: images of different grids");
+    Q27_CHECK(mm_spans_[i + k].row == sp.row + k * sp.len(), "mm_encode: images in rows apart (mm_place)");
+  }
   const int gh = sp.gh * vdims::kMerge, gw = sp.gw * vdims::kMerge;
   const int64_t pixels_each = int64_t(gh) * gw * vdims::kPatchPixels * vdims::kPatchPixels;
   Q27_CHECK(pixels_each <= opt_.image_max_pixels, "image larger than IMAGE_MAX_PIXELS");
@@ -1236,12 +1251,14 @@ void Model::mm_encode(int i, const VisionPixels* pixels, int n) {
 void Model::mm_embeds(int i, bf16* out) {
   Q27_CHECK(opt_.vision && i >= 0 && i < int(mm_spans_.size()), "mm_embeds: no such image");
   const MmSpan& sp = mm_spans_[i];
+  Q27_CHECK(sp.row >= 0, "mm_embeds: the image has no rows (mm_place)");
   memcpy(out, mm_ + size_t(sp.row) * kHidden, size_t(sp.len()) * kHidden * sizeof(bf16));
 }
 
 void Model::mm_put(int i, const bf16* in) {
   Q27_CHECK(opt_.vision && i >= 0 && i < int(mm_spans_.size()), "mm_put: no such image");
   const MmSpan& sp = mm_spans_[i];
+  Q27_CHECK(sp.row >= 0, "mm_put: the image has no rows (mm_place)");
   memcpy(mm_ + size_t(sp.row) * kHidden, in, size_t(sp.len()) * kHidden * sizeof(bf16));
 }
 
@@ -1270,6 +1287,7 @@ void Model::upload_ids(const int32_t* ids, int T) {
     const bool img = k < mm_spans_.size() && p >= mm_spans_[k].start;
     if (img) {
       const MmSpan& sp = mm_spans_[k];
+      Q27_CHECK(sp.row >= 0, "images: an image in the chunk has no rows (mm_place)");
       const int r = p - sp.start, base = sp.start + delta;
       tr[t] = kVocab + sp.row + r;
       if (mpos_on_) mp[3 * t] = base, mp[3 * t + 1] = base + r / sp.gw, mp[3 * t + 2] = base + r % sp.gw;

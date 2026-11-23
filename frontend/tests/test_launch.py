@@ -220,16 +220,18 @@ def test_default_spec_falls_back_to_a_downloaded_dflash2(monkeypatch):
     assert launch.env_settings()["spec"] == "dspine"
 
 
-def test_image_tokens_follow_video_max_tokens(monkeypatch, tmp_path):
-    """IMAGE_TOKENS unset or empty: 16,384, or VIDEO_MAX_TOKENS when more; set, it stays."""
+def test_image_tokens_default(monkeypatch, tmp_path):
+    """IMAGE_TOKENS unset or empty: 16,384, or what two prefill chunks and the largest image at each end take; set,
+    it stays. (VIDEO_MAX_TOKENS no longer counts: a video's pairs go through the table a chunk at a time.)"""
     env = {}
     monkeypatch.setattr(os, "environ", env)  # (set_engine_env also sets the engine's defaults)
-    for video, image, want in ((None, None, "16384"), ("8192", "", "16384"), ("131072", "", "131072"),
-                               ("131072", "20000", "20000")):
+    for extra, want in (({}, "16384"), ({"VIDEO_MAX_TOKENS": "131072", "IMAGE_TOKENS": ""}, "16384"),
+                        ({"IMAGE_TOKENS": "20000"}, "20000"), ({"IMAGE_MAX_PIXELS": "16777216"}, str(4096 + 32768)),
+                        ({"PREFILL_CHUNK": "8192"}, str(16384 + 8192)), ({"IMAGE_MAX_PIXELS": "x"}, "16384")):
         env.clear()
-        env.update({k: v for k, v in (("VIDEO_MAX_TOKENS", video), ("IMAGE_TOKENS", image)) if v is not None})
+        env.update(extra)
         launch.set_engine_env(tmp_path)
-        assert env["IMAGE_TOKENS"] == want
+        assert env["IMAGE_TOKENS"] == want, extra
     for bad in ("0", "-1", "1e5", "x"):
         env["VIDEO_MAX_FRAMES"] = bad
         with pytest.raises(ValueError):
