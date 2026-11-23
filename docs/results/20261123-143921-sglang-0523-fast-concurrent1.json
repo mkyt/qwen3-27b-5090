@@ -1,0 +1,56 @@
+{
+  "label": "sglang-0523-fast-concurrent1",
+  "model": "qwen3.8-27b",
+  "started": "2026-11-23T14:38:38.202594",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "label": "sglang-0523-fast-concurrent1",
+    "prompts": "reason",
+    "concurrency": "1",
+    "max_tokens": 4096,
+    "reps": 2,
+    "extra_body": "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"presence_penalty\":0}"
+  },
+  "results": {
+    "reason": [
+      {
+        "concurrency": 1,
+        "tokens": [
+          4096
+        ],
+        "finish": [
+          "length"
+        ],
+        "ttft": [
+          0.25
+        ],
+        "stream_tps": [
+          182.8
+        ],
+        "sum_stream_tps": 182.8,
+        "window_s": 22.4,
+        "wall_s": 22.65,
+        "wall_tps": 180.82
+      },
+      {
+        "concurrency": 1,
+        "tokens": [
+          4096
+        ],
+        "finish": [
+          "length"
+        ],
+        "ttft": [
+          0.087
+        ],
+        "stream_tps": [
+          198.47
+        ],
+        "sum_stream_tps": 198.47,
+        "window_s": 20.63,
+        "wall_s": 20.72,
+        "wall_tps": 197.68
+      }
+    ]
+  }
+}

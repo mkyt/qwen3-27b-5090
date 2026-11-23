@@ -1,0 +1,45 @@
+{
+ "weights": "gdnfp4",
+ "kv_dtype": "nvfp4",
+ "tokens": 64,
+ "sampling": [
+  0.0,
+  20,
+  0.95
+ ],
+ "rows": [
+  {
+   "ctx": 19000,
+   "prefill_tok_s": 12169.5,
+   "prefill_s": [
+    1.561,
+    1.604
+   ],
+   "decode_ms": 10.755,
+   "decode_tok_s": 92.98,
+   "decode_ms_p90": 10.869
+  },
+  {
+   "ctx": 73000,
+   "prefill_tok_s": 9272.1,
+   "prefill_s": [
+    7.873,
+    7.91
+   ],
+   "decode_ms": 11.492,
+   "decode_tok_s": 87.02,
+   "decode_ms_p90": 11.566
+  },
+  {
+   "ctx": 194000,
+   "prefill_tok_s": 6148.6,
+   "prefill_s": [
+    31.552,
+    31.642
+   ],
+   "decode_ms": 13.036,
+   "decode_tok_s": 76.71,
+   "decode_ms_p90": 13.109
+  }
+ ]
+}
