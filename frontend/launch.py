@@ -16,7 +16,11 @@ import threading
 from qwen27b.paths import DFLASH2, DRAFTS, DSPINE, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
 from tokenizer import fingerprint
 
-CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dspine", "dflash2", "none"), "vision": ("host", "fp8", "bf16", "off")}
+CHOICES = {"kv_dtype": ("nvfp4", "fp8", "bf16"), "spec": ("dspine", "dflash2", "none"), "vision": ("host", "fp8", "bf16", "off"),
+           "act_a4x2": ("off", "decode", "all")}
+# Q27_ACT_A4X2, the quality mode (two-term NVFP4 activations): off = one term (the default, fastest), decode = in the
+# decode / verify GEMMs only (prefill unchanged), all = every NVFP4 GEMM (prefill about -40%). The engine takes these
+# names, or 0 / 2 / 1.
 MAX_SEQS = 8                # (the engine's lanes of a batched step)
 MAX_CONTEXT = 262144        # max_position_embeddings of the checkpoint
 MIN_BUDGET_GIB = 4.0
@@ -32,7 +36,7 @@ GiB = 1 << 30
 ENGINE_ENV_DEFAULTS = {"MAX_TOKENS_FIT": "1", "STATE_HOST_CACHE": "4"}
 # The variables the settings start from (server.py).
 ENV_NAMES = {"weights": "WEIGHTS", "kv_dtype": "KV_DTYPE", "spec": "SPEC", "vision": "VISION", "max_seqs": "MAX_SEQS",
-             "max_tokens": "MAX_TOKENS", "vram_budget_gib": "VRAM_BUDGET_GIB"}
+             "max_tokens": "MAX_TOKENS", "vram_budget_gib": "VRAM_BUDGET_GIB", "act_a4x2": "Q27_ACT_A4X2"}
 
 
 IMAGE_TOKENS = 16384  # (the engine's image and video tokens per request without IMAGE_TOKENS or VIDEO_MAX_TOKENS)
@@ -76,7 +80,23 @@ def env_settings():
     budget = env("VRAM_BUDGET_GIB")
     return {"weights": env("WEIGHTS", "gdnfp4"), "kv_dtype": env("KV_DTYPE", "nvfp4"), "spec": default_spec(),
             "vision": env("VISION") or "host", "max_seqs": max(1, min(int(env("MAX_SEQS", 8)), MAX_SEQS)),
-            "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_budget_gib": float(budget) if budget else None}
+            "max_tokens": int(env("MAX_TOKENS", MAX_CONTEXT)), "vram_budget_gib": float(budget) if budget else None,
+            "act_a4x2": act_a4x2_setting(env("Q27_ACT_A4X2"))}
+
+
+def act_a4x2_setting(value):
+    """The act_a4x2 setting of a Q27_ACT_A4X2 value as the engine reads it (empty / 0 off, 2 decode, other numbers
+    all, or the setting's name); ValueError for anything else."""
+    v = (value or "").strip()
+    if not v:
+        return "off"
+    if v in CHOICES["act_a4x2"]:
+        return v
+    try:
+        n = int(v)
+    except ValueError:
+        raise ValueError(f"Q27_ACT_A4X2 must be empty, 0, 1 or 2, got {value!r}") from None
+    return "off" if n == 0 else "decode" if n == 2 else "all"
 
 
 def margin_gib():
@@ -101,7 +121,7 @@ class Launch:
     """The settings the next engine start uses (changed with a start, restart or save from the admin API; they last
     until the server restarts, which starts from the variables again) and their plans."""
 
-    KEYS = ("weights", "kv_dtype", "spec", "vision", "max_seqs", "max_tokens", "vram_budget_gib")
+    KEYS = ("weights", "kv_dtype", "spec", "vision", "max_seqs", "max_tokens", "vram_budget_gib", "act_a4x2")
 
     def __init__(self, base, settings, tokenizer=None):
         self.base = base            # the rest of the engine's configuration (prefill chunk, scheduling, ...)
@@ -141,6 +161,7 @@ class Launch:
     def validate(self, changes, base=None, device=None, check_budget=True):
         """The settings with `changes` applied; ValueError names a bad one."""
         s = dict(base or getattr(self, "settings", {}), **changes)
+        s.setdefault("act_a4x2", "off")  # (settings from before the quality mode was one)
         unknown = set(changes) - set(self.KEYS)
         if unknown:
             raise ValueError(f"unknown setting {sorted(unknown)[0]!r} (settings: {', '.join(self.KEYS)})")
@@ -174,7 +195,8 @@ class Launch:
         eos = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))["eos_token_id"]
         env = {"VISION": s["vision"], "MAX_SEQS": str(s["max_seqs"]),
                "VRAM_BUDGET_GIB": None if s["vram_budget_gib"] is None else f"{s['vram_budget_gib']:g}",
-               "Q27_LM_HEAD_CKPT": str(snapshot(*TARGET)) if s["weights"] == "quasar" else LM_HEAD_ENV}
+               "Q27_LM_HEAD_CKPT": str(snapshot(*TARGET)) if s["weights"] == "quasar" else LM_HEAD_ENV,
+               "Q27_ACT_A4X2": s["act_a4x2"]}
         return dict(self.base, model=str(path), weights=s["weights"], draft=str(draft) if draft else None,
                     max_tokens=s["max_tokens"], kv_dtype=s["kv_dtype"], max_seqs=s["max_seqs"],
                     eos=eos if isinstance(eos, list) else [eos], env=env, settings=dict(s))

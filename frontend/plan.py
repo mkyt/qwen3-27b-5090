@@ -2,7 +2,8 @@
 with no server running (the tray app's settings window). HF_HOME says the cache, and the variables the settings as the
 server would start with them. Q27_PLAN_REQUEST has the same JSON as the POST ({"settings": {...}}), and optionally
 "device": [free, total] bytes (default: NVML, as the server with no engine). Prints the answer, with "draft" (whether the
-draft of SPEC (DSpine by default) is in the cache) and "links" (paths.unreadable_repos), or {"error": ...}. Needs no GPU and allocates nothing.
+draft of the requested spec, else SPEC (DSpine by default), is in the cache), "drafts" (the same for each draft: dspine,
+dflash2) and "links" (paths.unreadable_repos), or {"error": ...}. Needs no GPU and allocates nothing.
 """
 
 import json
@@ -18,9 +19,8 @@ from qwen27b import paths  # noqa: E402
 from stats import HUB, Nvml  # noqa: E402
 
 
-def has_draft():
+def has_draft(spec):
     try:
-        spec = os.environ.get("SPEC") or "dspine"
         return (paths.snapshot(*paths.DRAFTS.get(spec, paths.DSPINE)) / "config.json").is_file()
     except FileNotFoundError:
         return False
@@ -34,7 +34,9 @@ def main():
             HUB.nvml = Nvml()
         except OSError:
             pass
-    state = {"draft": has_draft(), "links": paths.unreadable_repos()}
+    spec = (request.get("settings") or {}).get("spec") or os.environ.get("SPEC") or "dspine"
+    state = {"draft": spec == "none" or has_draft(spec), "drafts": {s: has_draft(s) for s in paths.DRAFTS},
+             "links": paths.unreadable_repos()}
     device, source = (tuple(request["device"]), "server") if request.get("device") else HUB.plan_device()
     if device is None:
         return {**state, "error": "the device's memory is unknown (no NVML)"}

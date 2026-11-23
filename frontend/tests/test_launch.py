@@ -17,7 +17,7 @@ from test_stats import hub  # noqa: E402
 
 GiB = 1 << 30
 DEFAULTS = {"weights": "gdnfp4", "kv_dtype": "nvfp4", "spec": "dspine", "vision": "host", "max_seqs": 8,
-            "max_tokens": 262144, "vram_budget_gib": None}
+            "max_tokens": 262144, "vram_budget_gib": None, "act_a4x2": "off"}
 DEVICE = (int(30.20 * GiB), int(31.82 * GiB))  # (free at the start, total) of an engine on the RTX 5090 under WSL2
 
 
@@ -49,6 +49,25 @@ def test_env_changes_name_what_changed_since_the_start():
     assert lc.env_changes() == {}
     lc.settings = dict(lc.at_start, kv_dtype="fp8", max_seqs=4, vram_budget_gib=None)
     assert lc.env_changes() == {"KV_DTYPE": "fp8", "MAX_SEQS": "4", "VRAM_BUDGET_GIB": ""}
+    lc.settings = dict(lc.at_start, act_a4x2="decode")
+    assert lc.env_changes() == {"Q27_ACT_A4X2": "decode"}
+
+
+def test_act_a4x2_setting():
+    """The quality mode (Q27_ACT_A4X2) as the engine reads the variable (a number or the setting's name, which the
+    engine is given and keep_env lists)."""
+    for v, s in (("", "off"), (None, "off"), ("0", "off"), ("2", "decode"), ("1", "all"), (" 3 ", "all"), ("decode", "decode"),
+                 ("off", "off"), ("all", "all")):
+        assert launch.act_a4x2_setting(v) == s
+    with pytest.raises(ValueError):
+        launch.act_a4x2_setting("on")
+    lc = settings()
+    for bad in ({"act_a4x2": "2"}, {"act_a4x2": True}, {"act_a4x2": None}):
+        with pytest.raises(ValueError):
+            lc.validate(bad)
+    # Settings without it (a client from before): off.
+    old = {k: v for k, v in DEFAULTS.items() if k != "act_a4x2"}
+    assert lc.validate({}, base=old)["act_a4x2"] == "off"
 
 
 def test_plan_device():
