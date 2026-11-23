@@ -36,6 +36,8 @@ SIGNATURES = {
     "q27_spec_block": ([P], I),
     "q27_last_step_block": ([P], I),
     "q27_last_lane_block": ([P, I], I),
+    "q27_last_lane_draft": ([P, I], I),
+    "q27_spec_set_draft_rows": ([P, I], I),
     "q27_spec_set_block": ([P, I, I], I),
     "q27_max_lanes": ([P], I),
     "q27_max_tokens": ([P], I),
@@ -361,6 +363,15 @@ class Engine:
     def last_lane_block(self, z):
         """Rows of lane z's block in the last spec_step_lanes (0 for builds without the entry)."""
         return lib().q27_last_lane_block(self.h, z) if hasattr(lib(), "q27_last_lane_block") else 0
+
+    def last_lane_draft(self, z):
+        """Draft rows of lane z in the last spec_step_lanes (more than last_lane_block in a cut step, Q27_SPEC_CUT)."""
+        return lib().q27_last_lane_draft(self.h, z)
+
+    def spec_set_draft_rows(self, rows):
+        """Tests of cut steps: the running sequence's single steps draft `rows` (0: as many as they verify) and verify
+        the first rows of them (spec_set_block)."""
+        self._check(lib().q27_spec_set_draft_rows(self.h, rows), "q27_spec_set_draft_rows")
 
     def spec_set_block(self, area, block):
         """Pins a decoding sequence's verify width (area None: the running one) for its single and batched steps."""

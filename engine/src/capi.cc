@@ -338,6 +338,11 @@ int q27_spec_block(void* m) { return static_cast<Model*>(m)->spec_block(); }
 int q27_last_step_block(void* m) { return static_cast<Model*>(m)->last_step_block(); }
 // Rows of lane z's block in the last q27_spec_step_lanes (0: no such lane).
 int q27_last_lane_block(void* m, int z) { return static_cast<Model*>(m)->last_lane_block(z); }
+int q27_last_lane_draft(void* m, int z) { return static_cast<Model*>(m)->last_lane_draft(z); }
+// Tests of cut steps (Model::spec_set_draft_rows): the running sequence's single steps draft `rows` (0: as verified).
+int q27_spec_set_draft_rows(void* m, int rows) {
+  return guard([&] { static_cast<Model*>(m)->spec_set_draft_rows(rows); });
+}
 
 // Speculative counters since the last call: steps, lookup steps, tokens.
 int q27_spec_stats(void* m, int64_t* out) {

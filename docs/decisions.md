@@ -139,7 +139,14 @@ gate without an explicit decision, recorded below with its numbers.
   pairs): mixed prompts +9.1% / +4.3% at 4 / 8 requests, four code requests +20.6%, eight Japanese +4.4%. Through the
   server on reasoning ([benchmarks.md](benchmarks.md#concurrent-requests)) four and eight requests are as fast as with
   v0.5.0 (899-901 and 1,313-1,314 tok/s), and DFlash2 is still 3% and 6% faster there. The width depends only on past steps, so the output distribution
-  is unchanged (greedy output is identical to plain decoding; a chi-square test of the sampled tokens passes). The
+  is unchanged (greedy output is identical to plain decoding; a chi-square test of the sampled tokens passes). Since
+  2026-11-23 (P3-39) a lane may also verify only a prefix of its draft, chosen per step from the draft's own tables
+  (`Q27_SPEC_CUT`). The choice must not depend on the drafted tokens: an argmax over the drawn path's confidence (as
+  in a step-cost-aware policy we compared) biased the output distribution in an exact enumeration once the cost has
+  steps, while any function of the table (here the expected tokens, marginalized over the draws) keeps it, even
+  chosen jointly over the lanes. A single request does not use it: cutting 16 rows to 8 saves about 1 ms (7%) and
+  the host's decision costs 0.2 ms and the step could no longer be launched ahead. In-process against the rule alone, four / eight requests:
+  sampled +2.0% / +3.2%, greedy +5.6% / +5.6%; four requests at a 16K context: sampled +2.3%, greedy +1.7%. The
   table of candidates is computed exactly for the 15 x 16 x 16 (position, sender, candidate) triples instead of
   DSpine's reference tables over the whole vocabulary (0.76 GB), and the 0.5 GB codebook stays in host memory.
   At a 32K context (greedy, the same output for both drafts) DSpine stays ahead on code and JSON (1.21 and 1.28 times)

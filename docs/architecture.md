@@ -219,7 +219,12 @@ below walks that table. A sequence verifies 16 rows while its tokens per step st
 the rows are packed, the kernels take each lane's first row and count, and every few steps (8) the engine moves one
 lane's rows at a time while that raises the step's expected tokens per ms, from each lane's tokens per step at
 the widths it ran (moving averages; untried widths extrapolated) and a model of the step time (about 11 + 0.18 per lane + 1.1 per 16 rows begun + 0.11 per row ms; the GEMMs step up
-every 16 rows). A new split of the rows updates the step's CUDA graph in place. `SPEC=dflash2` selects DFlash2, described next.
+every 16 rows). A new split of the rows updates the step's CUDA graph in place. After the draft, each lane may verify
+fewer rows than it drafted (`Q27_SPEC_CUT`): a small kernel turns each lane's table into its expected tokens at every
+width (a logistic accept model per position, on the largest probability and the entropy of the row, carried through
+the walk's distribution), the host picks the prefixes that maximize the expected tokens minus the recent tokens per ms
+times the verify's time (a DP over the total rows), and the verify runs on those rows. The draft and the verify are two
+CUDA graphs. `SPEC=dflash2` selects DFlash2, described next.
 
 The DFlash2 draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"
 layers that read the target's hidden states from five layers, attend to the last 2,048 tokens and propose 7 tokens

@@ -338,6 +338,8 @@ Model::Model(const Options& opt) : opt_(opt) {
     Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&b_out_), size_t(kMaxLanes) * 2 * sizeof(SpecOut),
                            cudaHostAllocMapped));
     Q27_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void**>(&b_out_dev_), b_out_, 0));
+    Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&b_conf_), size_t(kMaxLanes) * kSpecBlock * 4, cudaHostAllocMapped));
+    Q27_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void**>(&b_conf_dev_), b_conf_, 0));
     log("batched decode: up to %d sequences per step", lanes);
   }
 
@@ -407,6 +409,10 @@ void Model::configure() {
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
   batch_adapt_ = adapt_on_ && env_int("Q27_SPEC_ADAPT_BATCH", 1) != 0;
   batch_hyst_ = std::max(0.f, env_f("Q27_SPEC_ADAPT_HYST", 0.01f));
+  batch_cut_ = draft_ && draft_->dspine() && env_int("Q27_SPEC_CUT", 1) != 0;
+  // (fitted on recorded DSpine steps of 7 workloads, P3-39: [1, logit(c), entropy, log(1 + e), logit(c) log(1 + e)])
+  cut_cal_ = ConfCalib{{{0.300642f, 0.664243f, -0.350132f, -0.201407f, -0.015231f},
+                        {0.291596f, 0.479417f, -0.143337f, -0.351559f, 0.054301f}}};
   batch_period_ = std::max(1, env_int("Q27_SPEC_ADAPT_PERIOD", 8));
   batch_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_BATCH_ALPHA", 0.03125f), 0.f, 1.f);
   spec_pipeline_ = env_int("Q27_SPEC_PIPELINE", 1) != 0;
@@ -434,6 +440,7 @@ Model::~Model() {
   if (mask_dev_) cudaFree(mask_dev_);
   if (draft_host_) cudaFreeHost(draft_host_);
   if (b_out_) cudaFreeHost(b_out_);
+  if (b_conf_) cudaFreeHost(b_conf_);
   if (host_io_) cudaFreeHost(host_io_);
   if (lp_) cudaFreeHost(lp_);
   if (cs_) cudaStreamSynchronize(cs_), cudaStreamDestroy(cs_);
@@ -1585,9 +1592,12 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
     mark("lookup");
     if (lk.on) spec_lookup(lk, ids_ver_, s_);
     mark("draft");
+    const int rows = std::max(spec_block_of(smp), spec_draft_rows_);
     if (!skip("draft"))  // (Q27_SKIP=draft: timing only, the step verifies the previous step's tokens)
       draft_->propose(block_ids_, pos_dev_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], smp, rng_, ids_ver_,
-                    aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_, spec_block_of(smp));
+                    aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_, rows);
+    if (rows > spec_rows(smp))  // (a cut step's test: the verify's rows of the draft)
+      lane_cut(LaneRows::one(rows), LaneRows::one(spec_rows(smp)), ids_ver_, tree_, s_);
     if (part == 1) return;
   }
   const int W = spec_rows(smp);
@@ -1660,7 +1670,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   } else if (spec_inflight_) {
     Q27_CHECK(same(smp, spec_key_), "spec_step: sampling changed with a step in flight");
     slot = inflight_slot_;
-  } else if (!graphs_ || !spec_warm_) {
+  } else if (!graphs_ || !spec_warm_ || spec_draft_rows_ > 0) {
     spec_body(smp);
     spec_warm_ = true;
     par_host_ ^= 1;
@@ -2170,6 +2180,7 @@ void Model::batch_enter(const int32_t* lanes, int n) {
     Q27_CHECK(a >= 0 ? parked_[a].spec_last >= 0 : spec_last_ >= 0, "spec_step_lanes: the sequence is not decoding");
   }
   blanes_.assign(lanes, lanes + n);
+  cut_lam_ = 0.f;
   bsl_ = SeqLanes{};
   bsl_.n = n, bsl_.pos = b_pos_, bsl_.rope_delta = b_delta_;
   const size_t rb = draft_->ring_layers_bytes();
@@ -2268,17 +2279,24 @@ bool Model::batch_masked() const {
 void Model::batch_body(int n, int part) {
   const auto& lm = w_.lm_head;
   DraftLanes dl;
-  dl.n = n, dl.pos = b_pos_, dl.lr = blr_;
+  dl.n = n, dl.pos = b_pos_, dl.lr = bdlr_;
   SelectLanes sel;
-  sel.lr = blr_;
+  sel.lr = bdlr_;
   for (int z = 0; z < n; z++) dl.ring_k[z] = bring_k_[z], dl.ring_v[z] = bring_v_[z], sel.smp[z] = bacc_.smp[z];
   if (part != 2) {
     mark("draft");
-    lane_blocks(blr_, b_anchor_, ddims::kMaskId, b_blk_, b_ids_, s_);
+    lane_blocks(bdlr_, b_anchor_, ddims::kMaskId, b_blk_, b_ids_, s_);
     draft_->propose_lanes(dl, b_blk_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], sel, b_rng_, b_ids_,
                           b_tree_, aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, s_);
+    if (cut_step_) {  // (the expected tokens at each width, for cut_rows)
+      uint32_t greedy = 0;
+      for (int z = 0; z < n; z++) greedy |= uint32_t(bacc_.smp[z].temperature <= 0.f) << z;
+      dspine_conf_tokens(draft_->lane_lattice(), bdlr_, greedy, cut_cal_, b_conf_dev_, s_);
+    }
     if (part == 1) return;
   }
+  if (!(bdlr_ == blr_)) lane_cut(bdlr_, blr_, b_ids_, b_tree_, s_);
+  dl.lr = blr_;  // (the context: the verify's rows)
   const int W = blr_.total();
   verify_ = true;
   verify_paths_ = 1;
@@ -2326,7 +2344,7 @@ void Model::batch_body(int n, int part) {
 // The lanes' graph cache entry (the graph holds their state pointers: keyed by the lanes, the running one's state
 // buffer, their sampling and their total rows), created when missing (the least recently used one goes beyond
 // kBatchGraphCache). Another split of the same total re-captures the graph and updates it in place (spec_step_lanes).
-Model::BatchGraph& Model::batch_graph(int n) {
+Model::BatchGraph& Model::batch_graph(int n, int tag) {
   const int sb = std::count(blanes_.begin(), blanes_.end(), -1) ? sbuf_host_ : -1;
   auto same_acc = [&](const AcceptLanes& a) {
     for (int z = 0; z < n; z++) {
@@ -2337,7 +2355,7 @@ Model::BatchGraph& Model::batch_graph(int n) {
     return true;
   };
   for (auto& g : bgraphs_)
-    if (g.lanes == blanes_ && g.sbuf == sb && g.lr.total() == blr_.total() && same_acc(g.acc)) {
+    if (g.tag == tag && g.lanes == blanes_ && g.sbuf == sb && g.lr.total() == blr_.total() && same_acc(g.acc)) {
       g.used = ++graph_clock_;
       return g;
     }
@@ -2350,6 +2368,7 @@ Model::BatchGraph& Model::batch_graph(int n) {
   bgraphs_.push_back({blanes_, sb, bacc_, nullptr, ++graph_clock_});
   BatchGraph& g = bgraphs_.back();
   g.lr = g.lr2 = blr_;
+  g.tag = tag, g.clr = bdlr_;
   return g;
 }
 
@@ -2454,6 +2473,7 @@ void Model::batch_prepare(const int32_t* lanes, int n) {
   batch_enter(lanes, n);
   // Lanes of different rows need DSpine (DFlash2's blocks are 8) and the FP8-MMA verify; else every lane has 8.
   const bool vary = draft_->dspine() && attention_lanes_vary(opt_.kv_type);
+  bvary_ = vary;
   int w[kMaxLanes];
   if (!vary) {
     std::fill(w, w + n, ddims::kBlock);
@@ -2461,7 +2481,9 @@ void Model::batch_prepare(const int32_t* lanes, int n) {
     batch_rows(n, w);
   }
   blr_.set(n, w);
-  bsl_.lr = bacc_.lr = blr_;
+  bdlr_ = blr_;
+  bsl_.lr = bacc_.lr = bacc_.clr = blr_;
+  cut_step_ = false;
   for (int z = 0; z < n; z++) {
     bacc_.smp[z].block = w[z];
     LaneRef r = lane_ref(z);
@@ -2487,6 +2509,63 @@ bool Model::batch_part(int n, int part) {
   return true;
 }
 
+namespace {
+// A batched verify's time (ms) by lanes and total rows, the draft excluded (P3-39: fitted on measured split steps,
+// RTX 5090 at 400 W, gdnfp4 weights, 4 and 8 lanes); the draft's rows past the verify's cost about 0.018 ms each.
+float verify_ms(int lanes, int rows) {
+  return 11.14f + 0.303f * float(lanes) + 0.694f * float((rows + 15) / 16) + 0.126f * float(rows);
+}
+}  // namespace
+
+// The verify rows of a cut step: each lane's prefix of its draft rows (4, 8, .. or all of them; pinned lanes: all)
+// that maximizes sum(E_z(w_z)) - lam * verify_ms(lanes, total), by a DP over the total (E: b_conf_, a function of the
+// draft's table only, so the verify stays lossless; lam: the tokens per ms of the earlier cut steps).
+bool Model::cut_rows(int n) {
+  constexpr int kR = kMaxBatchRows;
+  const float lam = cut_lam_ > 0.f ? cut_lam_ : 4.25f * float(n) / verify_ms(n, 8 * n);
+  float best[kR + 1];
+  uint8_t pick[kMaxLanes][kR + 1];
+  std::fill(best, best + kR + 1, -1e30f);
+  best[0] = 0.f;
+  for (int z = 0; z < n; z++) {
+    const int d = bdlr_.rows(z);
+    const bool fixed = lane_smp(z).pinned;
+    float nb[kR + 1];
+    std::fill(nb, nb + kR + 1, -1e30f);
+    for (int c = fixed ? d : std::min(4, d); c <= d; c = c + 4 > d && c < d ? d : c + 4) {
+      const float e = b_conf_[z * kSpecBlock + c - 1];
+      for (int r = 0; r + c <= kR; r++)
+        if (best[r] > -1e29f && best[r] + e > nb[r + c]) nb[r + c] = best[r] + e, pick[z][r + c] = uint8_t(c);
+    }
+    std::copy(nb, nb + kR + 1, best);
+  }
+  int R = -1;
+  float bo = -1e30f;
+  for (int r = 1; r <= kR; r++)
+    if (best[r] > -1e29f && best[r] - lam * verify_ms(n, r) > bo) bo = best[r] - lam * verify_ms(n, r), R = r;
+  int w[kMaxLanes];
+  for (int z = n - 1; z >= 0; z--) w[z] = pick[z][R], R -= w[z];
+  blr_.set(n, w);
+  bsl_.lr = bacc_.lr = blr_;
+  for (int z = 0; z < n; z++) bacc_.smp[z].block = w[z];
+  return !(blr_ == bdlr_);
+}
+
+// A cut step's part (batch_body's: 1 the draft with the expected tokens, 2 the cut and the rest), its graph keyed by
+// the part's total rows (part 2's re-captured when the split of its verify or draft rows differs).
+bool Model::cut_part(int n, int part) {
+  if (!graphs_ || !bwarm_) {
+    batch_body(n, part);
+    return false;
+  }
+  BatchGraph& g = batch_graph(n, part);
+  if (g.exec && !(g.lr == blr_ && g.clr == bdlr_)) g.exec = capture([&] { batch_body(n, part); }, g.exec);
+  if (!g.exec) g.exec = capture([&] { batch_body(n, part); });
+  g.lr = blr_, g.clr = bdlr_;
+  Q27_CUDA(cudaGraphLaunch(g.exec, s_));
+  return true;
+}
+
 void Model::spec_draft_lanes(const int32_t* lanes, int n, int32_t* chain) {
   batch_prepare(lanes, n);
   Q27_CHECK(batch_masked(), "spec_draft_lanes: no masked lane");
@@ -2504,7 +2583,21 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
   cudaGraphExec_t exec = nullptr;
-  if (batch_masked()) {
+  bool graphed = false;
+  // Cut steps: batched DSpine steps of 2 or more lanes without a grammar mask, with a lane that could verify fewer rows.
+  bool cut = batch_cut_ && bvary_ && n >= 2 && !batch_masked();
+  if (cut) {
+    cut = false;
+    for (int z = 0; z < n; z++) cut |= !lane_smp(z).pinned && bdlr_.rows(z) > 4;
+  }
+  if (cut) {
+    cut_step_ = true;
+    cut_part(n, 1);
+    Q27_CUDA(cudaStreamSynchronize(s_));  // (b_conf_ written)
+    cut_rows(n);
+    graphed = cut_part(n, 2);
+    bwarm_ = true;
+  } else if (batch_masked()) {
     Q27_CHECK(b_drafted_, "spec_step_lanes: a step with masked lanes is drafted first (spec_draft_lanes)");
     b_drafted_ = false;
     if (batch_part(n, 2)) exec = batch_graph(n).exec2;
@@ -2520,11 +2613,12 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     Q27_CUDA(cudaGraphLaunch(exec, s_));
   }
   Q27_CUDA(cudaStreamSynchronize(s_));
-  profile_collect(exec != nullptr);
+  profile_collect(exec != nullptr || graphed);
   static int trace_steps = 0;
   static const int trace_at = getenv("Q27_TRACE_STEP") ? atoi(getenv("Q27_TRACE_STEP")) : 20;
   if (trace && ++trace_steps == trace_at) trace_step_end(trace);
   batch_pending_ = true;
+  int got = 0;
   for (int z = 0; z < n; z++) {
     const SpecOut& so = b_out_[2 * z + bpar_];
     const int k = so.n;
@@ -2545,7 +2639,14 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     *r.spec_last = o[k - 1];
     stat_steps_++, stat_tokens_ += k;
     spec_adapt(lane_smp(z), k);  // (the width of the sequence's later steps, batched or not)
-    lane_note(lane_smp(z), blr_.rows(z), k);  // (its rows in later batched steps)
+    // (its rows in later batched steps; a cut step's: noted at its draft rows, as the cut was chosen in P3-39)
+    lane_note(lane_smp(z), bdlr_.rows(z), k);
+    got += k;
+  }
+  if (cut_step_) {  // (the verify, the draft's rows past it and the host's decision)
+    const float ms = verify_ms(n, blr_.total()) + 0.018f * float(bdlr_.total() - blr_.total()) + 0.12f;
+    const float lam0 = cut_lam_ > 0.f ? cut_lam_ : 4.25f * float(n) / verify_ms(n, 8 * n);
+    cut_lam_ = lam0 + (float(got) / ms - lam0) / 32.f;
   }
   bpar_ ^= 1;
   bstep_++;

@@ -1471,6 +1471,70 @@ void dspine_select(int nd, const SelectLanes* sl, const SpecSampling& smp, const
   Q27_CUDA(cudaGetLastError());
 }
 
+// Block per lane, thread (a, b) of the 16 x 16 table at each position: the walk's mass m over the predecessors, the
+// accept probability g of each, and the mass carried to the next position (sampled: by softmax(lattice); greedy: to
+// the argmax). reach(e + 1) = sum_a m(a) g(a); E(w) = 1 + reach(1) + .. + reach(w - 1).
+__global__ void __launch_bounds__(256) dspine_conf_kernel(const float* lattice, LaneRows lr, uint32_t greedy,
+                                                          ConfCalib cal, float* out) {
+  pdl_trigger();
+  pdl_wait();
+  const int z = blockIdx.x, t = threadIdx.x, a = t / kSelK, b = t % kSelK;
+  const int nd = lr.rows(z) - 1;
+  const bool gr = greedy >> z & 1;
+  const float* w = gr ? cal.w[0] : cal.w[1];
+  const float* lat = lattice + int64_t(lr.pos0(z)) * kSelK * kSelK;
+  __shared__ float m[kSelK], h[kSelK];
+  __shared__ int amax[kSelK];
+  if (t < kSelK) m[t] = t == 0 ? 1.f : 0.f;
+  float E = 1.f;
+  if (t == 0) out[z * kSpecBlock] = 1.f;
+  for (int e = 0; e < nd; e++) {
+    const float x = lat[(e * kSelK + a) * kSelK + b];
+    float mx = x;
+    for (int o = 8; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o, kSelK));
+    const float ex = expf(x - mx);
+    float sum = ex;
+    for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, kSelK);
+    const float q = ex / sum;
+    float ent = q > 0.f ? -q * logf(q) : 0.f;
+    for (int o = 8; o > 0; o >>= 1) ent += __shfl_xor_sync(0xffffffffu, ent, o, kSelK);
+    // (the argmax: the lowest b of the row's largest, as the greedy walk takes)
+    unsigned top = __ballot_sync(0xffffffffu, x == mx);
+    top = (top >> (t & 16)) & 0xffffu;
+    __syncthreads();  // (m of the previous position written)
+    if (b == 0) {
+      const float c = fminf(fmaxf(1.f / sum, 1e-4f), 1.f - 1e-5f);
+      const float lc = logf(c / fmaxf(1.f - c, 1e-5f)), ld = log1pf(float(e));
+      const float g = 1.f / (1.f + expf(-(w[0] + w[1] * lc + w[2] * ent + w[3] * ld + w[4] * lc * ld)));
+      h[a] = m[a] * g;
+      amax[a] = __ffs(top) - 1;
+    }
+    __syncthreads();
+    float reach = 0.f;
+#pragma unroll
+    for (int i = 0; i < kSelK; i++) reach += h[i];
+    E += reach;
+    if (t < kSelK) {  // (thread t: the mass on candidate t at position e)
+      float v = 0.f;
+      if (gr) {
+#pragma unroll
+        for (int i = 0; i < kSelK; i++) v += amax[i] == t ? h[i] : 0.f;
+      }
+      m[t] = v;  // (sampled: added below)
+    }
+    __syncthreads();
+    if (!gr) atomicAdd(&m[b], h[a] * q);
+    if (t == 0) out[z * kSpecBlock + e + 1] = E;
+  }
+  for (int i = nd + 1 + t; i < kSpecBlock; i += blockDim.x) out[z * kSpecBlock + i] = E;
+}
+
+void dspine_conf_tokens(const float* lattice, const LaneRows& lr, uint32_t greedy, const ConfCalib& cal, float* out,
+                        cudaStream_t s) {
+  launch_pdl(dspine_conf_kernel, dim3(lr.n), dim3(256), 0, s, lattice, lr, greedy, cal, out);
+  Q27_CUDA(cudaGetLastError());
+}
+
 void draft_round_bf16(const float* x, int64_t n, bf16* out, cudaStream_t s) {
   round_bf16_kernel<<<unsigned((n + 255) / 256), 256, 0, s>>>(x, n, out);
   Q27_CUDA(cudaGetLastError());

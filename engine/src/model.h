@@ -116,11 +116,15 @@ class Model {
   // Pins a decoding sequence's verify width (area -1: the running one) to `block` rows (2 .. the draft's block; DFlash2
   // 8) for its single and batched steps: tests (batched lanes of given widths against single runs).
   void spec_set_block(int area, int block);
+  // Tests of cut steps (P3-39): the running sequence's single steps draft `rows` (0: their verify width; more: that
+  // many, the verify takes the first rows of them, eagerly).
+  void spec_set_draft_rows(int rows) { spec_draft_rows_ = rows; }
   bool has_draft() const { return draft_ != nullptr; }
   int spec_block() const { return draft_ ? draft_->block() : 0; }
   int last_step_block() const { return last_block_; }  // rows of the block the last spec_step returned (adaptive width)
   // Rows of lane z's block in the last spec_step_lanes / spec_draft_lanes.
   int last_lane_block(int z) const { return z >= 0 && z < blr_.n ? blr_.rows(z) : 0; }
+  int last_lane_draft(int z) const { return z >= 0 && z < bdlr_.n ? bdlr_.rows(z) : 0; }  // (its draft rows)
   // Counters since the last call: verify steps, steps that used the lookup chain, tokens produced.
   void spec_stats(int64_t* out);
   // Debug: KV rows (K then V, raw bytes) of attention layer `layer` at positions pos..pos+n-1, and the
@@ -379,7 +383,17 @@ class Model {
   bool bwarm_ = false;
   AcceptLanes bacc_;                 // the lanes' sampling (chains) and top-k list lengths
   SeqLanes bsl_;                     // positions, rotary deltas and page tables of the lanes
-  LaneRows blr_;                     // the rows of the lanes' blocks in the current step
+  LaneRows blr_;                     // the rows of the lanes' blocks in the current step (their verify rows)
+  LaneRows bdlr_;                    // their draft rows: blr_, or more in a cut step (P3-39)
+  bool bvary_ = false;               // the lanes' rows may differ (DSpine, the FP8-MMA verify)
+  // Cut steps (P3-39, Q27_SPEC_CUT): the draft at the lanes' rows (batch_rows), then each lane verifies the prefix
+  // that maximizes the expected tokens per ms (from the draft's table, dspine_conf_tokens; cut_rows).
+  bool batch_cut_ = false;
+  int spec_draft_rows_ = 0;          // (spec_set_draft_rows)
+  bool cut_step_ = false;            // the current step is cut
+  float cut_lam_ = 0.f;              // tokens per ms of the recent cut steps (0: none yet)
+  ConfCalib cut_cal_{};
+  float *b_conf_ = nullptr, *b_conf_dev_ = nullptr;  // [lanes][16] expected tokens at 1..16 rows, mapped pinned
   int batch_rows_ = 0;               // rows of a batched step, at most (batch_row_budget)
   float *bconv_[kMaxLanes] = {}, *bssm_[kMaxLanes] = {};  // their GDN states (replayed in place)
   bf16 *bring_k_[kMaxLanes] = {}, *bring_v_[kMaxLanes] = {};  // their draft context rings
@@ -399,6 +413,8 @@ class Model {
     uint64_t used;
     cudaGraphExec_t exec2 = nullptr;  // masked lanes: the rest
     LaneRows lr, lr2;  // the rows exec / exec2 were captured with (other rows: re-captured and updated in place)
+    int tag = 0;       // 0: a whole step (or a masked one's two parts); a cut step's part: 1 the draft, 2 the rest
+    LaneRows clr;      // (tag 2: the draft rows it was captured with)
   };
   std::vector<BatchGraph> bgraphs_;
   struct LaneRef {  // the host state of a lane's sequence
@@ -414,7 +430,9 @@ class Model {
   void batch_body(int n, int part = 0);  // one step of the lanes (captured; part: as spec_body's)
   bool batch_masked() const;
   struct BatchGraph;
-  BatchGraph& batch_graph(int n);
+  BatchGraph& batch_graph(int n, int tag = 0);
+  bool cut_part(int n, int part);    // a cut step's part (as batch_part's); returns whether a graph ran
+  bool cut_rows(int n);              // the verify rows of a cut step (blr_) from b_conf_; false: none cut
   void batch_prepare(const int32_t* lanes, int n);
   void batch_rows(int n, int* rows);  // the lanes' rows of a batched step (DSpine)
   void lane_note(SpecSampling& m, int rows, int tokens) const;
@@ -491,7 +509,7 @@ class Model {
   static constexpr int kGraphCache = 4;
   // Batched steps: an entry per lanes, sampling and total rows (the launches depend on the total; the lanes' split of
   // it only changes arguments and grids, so a step of other rows updates the entry's graph in place).
-  static constexpr int kBatchGraphCache = 8;
+  static constexpr int kBatchGraphCache = 24;  // (cut steps: an entry per draft total and per verify total)
   struct CachedGraph {
     GraphKey key;
     SpecSampling smp;

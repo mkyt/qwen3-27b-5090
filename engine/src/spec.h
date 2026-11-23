@@ -171,6 +171,7 @@ struct AcceptLanes {
   SpecSampling smp[kMaxLanes] = {};
   int k[kMaxLanes] = {};
   LaneRows lr;
+  LaneRows clr;  // the draft's rows (the candidates'): lr, or more in a cut step (P3-39, lane_cut)
 };
 // spec_accept for al.lr.n lanes (block z: lane z). Lane z's verify rows are al.lr.first(z) .. (ids and the top-k lists
 // tv / ti, ld entries per row), its candidates on the rows after the first of cand ([rows][16]), its tree trees[z],
@@ -189,6 +190,9 @@ void spec_advance_lanes(const LaneRows& lr, int32_t* pos, const int32_t* ncommit
 // on its first row of ids (the verify ids; the draft writes the rest).
 void lane_blocks(const LaneRows& lr, const int32_t* anchor, int mask_id, int32_t* block_ids, int32_t* ids,
                  cudaStream_t s);
+// A cut step (P3-39): lane z verifies the first vlr.rows(z) <= dlr.rows(z) rows of its draft block. Moves the
+// drafted ids from the draft rows to the verify rows and ends each cut chain (trees [n]) at its last verified node.
+void lane_cut(const LaneRows& dlr, const LaneRows& vlr, int32_t* ids, SpecTree* trees, cudaStream_t s);
 // The lookup match for the next draft block (see Lookup); `anchor` is the uncommitted last token.
 void spec_lookup(const Lookup& lk, const int32_t* anchor, cudaStream_t s);
 // End of a step: *pos += *ncommit, *par ^= 1, *sbuf ^= 1 (the GDN state buffer), rng[1] += 1, and

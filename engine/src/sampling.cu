@@ -405,7 +405,7 @@ __global__ void spec_accept_lanes_kernel(int32_t* ids, int32_t* anchor, const fl
   if (threadIdx.x != 0) return;
   const int z = blockIdx.x, r0 = al.lr.first(z);
   DraftChoice ch;
-  ch.cand = const_cast<int32_t*>(cand) + (r0 + 1) * kSpecSelK;
+  ch.cand = const_cast<int32_t*>(cand) + (al.clr.first(z) + 1) * kSpecSelK;
   ch.tree = trees + z;
   ch.src = const_cast<int32_t*>(src) + z;
   spec_accept_body(ids + r0, anchor + z, tv + r0 * ld, ti + r0 * ld, lane_sel(al.k, z), ld, ch, lane_sel(al.smp, z),
@@ -703,6 +703,36 @@ void lane_blocks(const LaneRows& lr, const int32_t* anchor, int mask_id, int32_t
                  cudaStream_t s) {
   Q27_CHECK(lr.total() <= kMaxBatchRows, "lane_blocks: too many rows");
   launch_pdl(lane_blocks_kernel, dim3(1), dim3(kMaxBatchRows), 0, s, lr, anchor, mask_id, block_ids, ids);
+  Q27_CUDA(cudaGetLastError());
+}
+
+// The verify rows of a cut step (P3-39): lane z's first vlr.rows(z) drafted rows, moved from its draft rows (dlr) to
+// its verify rows; a cut chain ends at its last verified node.
+__global__ void lane_cut_kernel(LaneRows dlr, LaneRows vlr, int32_t* ids, SpecTree* trees) {
+  pdl_trigger();
+  pdl_wait();
+  __shared__ int32_t sh[kMaxBatchRows];
+  const int t = threadIdx.x;
+  if (t < dlr.total()) sh[t] = ids[t];
+  __syncthreads();
+  if (t < vlr.total()) {
+    const int z = vlr.lane(t);
+    ids[t] = sh[dlr.first(z) + t - vlr.first(z)];
+  }
+  if (t < vlr.n) {
+    const int w = vlr.rows(t);
+    if (w < dlr.rows(t)) {
+      SpecTree& tr = trees[t];
+      tr.n = w;
+      tr.ndraws[w - 1] = 0;
+      tr.leaf[0] = int8_t(w - 1);
+    }
+  }
+}
+
+void lane_cut(const LaneRows& dlr, const LaneRows& vlr, int32_t* ids, SpecTree* trees, cudaStream_t s) {
+  Q27_CHECK(dlr.total() <= kMaxBatchRows && vlr.n == dlr.n, "lane_cut: out of range");
+  launch_pdl(lane_cut_kernel, dim3(1), dim3(kMaxBatchRows), 0, s, dlr, vlr, ids, trees);
   Q27_CUDA(cudaGetLastError());
 }
 
