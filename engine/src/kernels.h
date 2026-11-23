@@ -264,9 +264,11 @@ struct AlphaSegments {
 // leave the counters at zero).
 // x2 > 0 (W4A4x2): a has M = 2 x2 rows, row t + x2 the second NVFP4 term of token t; d [x2][N] gets the sum of the
 // two terms' products (+ c, beta 1), each product rounded, then (c + first) + second.
+// a2row >= 0 (with x2 <= 64): the second term of token t is row a2row + t instead (a multiple of 128, its scales in
+// the same swizzled array), still one pass over the weights; M = 2 x2.
 void skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                 const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
-                cudaStream_t s, int x2 = 0);
+                cudaStream_t s, int x2 = 0, int a2row = -1);
 void skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, const AlphaSegments& alpha, const float* c,
                 float beta, float* d, void* ws, size_t ws_bytes, cudaStream_t s);
 // Draft model weights quantized at load: d[t][n] = acc * wscale[n] * ascale[t] (per-output-channel weight

@@ -620,6 +620,14 @@ int q27t_skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, 
                     float alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
   return kernel([&] { skinny_fp4(M, N, K, a, a_sf, w, w_sf, AlphaSegments::one(alpha), c, beta, d, ws, ws_bytes, ts()); });
 }
+// W4A4x2 activations (Q27_ACT_A4X2): T tokens, the second term of token t at row a2row + t of a (a_sf swizzled for
+// all rows); d = c + alpha * first + alpha * second (c may be null).
+int q27t_skinny_fp4_x2(int T, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
+                       float alpha, const float* c, float* d, void* ws, size_t ws_bytes, int a2row) {
+  return kernel([&] {
+    skinny_fp4(2 * T, N, K, a, a_sf, w, w_sf, AlphaSegments::one(alpha), c, c ? 1.f : 0.f, d, ws, ws_bytes, ts(), T, a2row);
+  });
+}
 int q27t_skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, float alpha, const float* c, float beta,
                     float* d, void* ws, size_t ws_bytes) {
   return kernel([&] { skinny_fp8(M, N, K, a, w, AlphaSegments::one(alpha), c, beta, d, ws, ws_bytes, ts()); });

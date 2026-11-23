@@ -281,3 +281,41 @@ def test_quant_fp4x2(normed, scale):
     assert float((terms[1::2] - want).abs().gt(1e-5 + 1e-5 * want.abs()).float().mean()) < 1e-3
     if scale:
         assert rel_err(terms[0::2] + terms[1::2], v) < 0.02
+
+
+
+@pytest.mark.parametrize("N,K", [(5120, 17408), (34816, 5120), (128, 5120)])
+@pytest.mark.parametrize("residual", [False, True])
+def test_skinny_fp4_x2_rows_independent_of_t(N, K, residual):
+    """W4A4x2 activations (Q27_ACT_A4X2) in one pass over the weights: the second terms right after the first
+    (a2row = T, up to 32 tokens) or from a row block of their own (a2row = 128, up to 64 tokens). A token's
+    row is bit-identical whatever T and the layout (decode rows = verify / batched rows), and is the sum of the two
+    terms' products."""
+    x0, s0, d0 = fp4_operand(64, K, 1.0)
+    x1, s1, d1 = fp4_operand(64, K, 1.0)
+    b, bsf, bdq = fp4_operand(N, K, 1.0)
+    b, bsw = b.to(dev), swizzled(bsf, N, K // 16)
+    ws = torch.zeros(WS, dtype=torch.uint8, device=dev)
+    c = torch.randn(64, N, device=dev) * 10
+
+    def run(T, a2row):
+        rows = a2row + T
+        a = torch.zeros(rows, K // 2, dtype=torch.uint8)
+        sf = torch.zeros(rows, K // 16, dtype=torch.float8_e4m3fn)
+        a[:T], a[a2row:] = x0[:T], x1[:T]
+        sf[:T], sf[a2row:] = s0[:T], s1[:T]
+        cc = c[:T].clone() if residual else None
+        d = cc if residual else torch.full((T, N), float("nan"), device=dev)
+        call("q27t_skinny_fp4_x2", T, N, K, a.to(dev), swizzled(sf, rows, K // 16), b, bsw, 0.37, cc, d, ws, WS,
+             a2row)
+        return d.cpu()
+
+    full = run(64, 128)
+    ref = 0.37 * ((d0.double() + d1.double()) @ bdq.double().T) + (c.cpu().double() if residual else 0)
+    assert rel_err(full.double(), ref) < 1e-5
+    assert torch.equal(run(64, 128), full)  # (the split-K counters reset)
+    assert torch.equal(run(64, 256), full)
+    for T in (1, 2, 5, 8, 16, 32):
+        assert torch.equal(run(T, T), full[:T]), f"T={T}"
+    for T in (1, 8, 33, 41, 63):
+        assert torch.equal(run(T, 128), full[:T]), f"T={T} a2row=128"

@@ -131,8 +131,16 @@ Model::Model(const Options& opt) : opt_(opt) {
          o_beta = f32("beta", Tc * kVHeads);
   // (an FP8 MLP's down GEMM takes [T][I] bytes)
   // (Q27_ACT_A4X2: room for the second term, from row Tp on)
-  act_a4x2_ = getenv("Q27_ACT_A4X2") && atoi(getenv("Q27_ACT_A4X2")) != 0;
-  act_a4x2_small_ = act_a4x2_ && atoi(getenv("Q27_ACT_A4X2")) == 2;  // (2: decode / verify-sized GEMMs only)
+  // (by number, or by the name of the start setting: off = 0, decode = 2, all = 1)
+  const int a4x2 = [] {
+    const char* e = getenv("Q27_ACT_A4X2");
+    if (!e || !*e || !strcmp(e, "off")) return 0;
+    if (!strcmp(e, "decode")) return 2;
+    if (!strcmp(e, "all")) return 1;
+    return atoi(e);
+  }();
+  act_a4x2_ = a4x2 != 0;
+  act_a4x2_small_ = a4x2 == 2;  // (2: decode / verify-sized GEMMs only)
   const int64_t Ta = !act_a4x2_ ? Tp : act_a4x2_small_ ? Tp + 2 * 128 : 2 * Tp;  // (2: second terms of <= 64 rows)
   size_t o_aq = act_.add("act quant", size_t(Ta) * (w_.mlp8 ? kInter : std::max(kInter / 2, kHeads * kHeadDim)));
   size_t o_asf = act_.add("act sf", size_t(sf_bytes(Ta, kInter / 16)));
@@ -911,12 +919,9 @@ void Model::gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool
     const uint8_t* q1 = aq_ + size_t(r2) * (K / 2);
     const uint8_t* sf1 = asf_ + sf_bytes(r2, K / 16);
     if (T <= kSkinnyMaxM && skinny_) {
-      if (r2 == T) {  // one GEMM of 2 T rows (the weights read once) that sums each token's two terms
-        skinny_fp4(2 * T, N, K, aq_, asf_, l.w, l.sf, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_, T);
-      } else {
-        skinny_fp4(T, N, K, aq_, asf_, l.w, l.sf, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_);
-        skinny_fp4(T, N, K, q1, sf1, l.w, l.sf, l.alpha, out, 1.f, out, skinny_ws_, kSkinnyWsBytes, s_);
-      }
+      // One GEMM of 2 T rows (the weights read once) that sums each token's two terms; the second terms follow the
+      // first (r2 = T, up to 32 tokens) or start at row 128 (33..64 tokens).
+      skinny_fp4(2 * T, N, K, aq_, asf_, l.w, l.sf, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_, T, r2);
       return;
     }
     Q27_CHECK(l.alpha.count == 1, std::string(what) + ": fused projections need the skinny path");

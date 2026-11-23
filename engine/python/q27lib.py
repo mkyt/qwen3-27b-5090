@@ -94,6 +94,7 @@ SIGNATURES = {
     "q27t_skinny_fp4_a4x2": ([I, I, I, P, P, P, P, F, P], I),
     "q27t_quant_fp4x2": ([P, P, I, I, F, F, P, P], I),
     "q27t_skinny_fp4": ([I, I, I, P, P, P, P, F, P, F, P, P, SZ], I),
+    "q27t_skinny_fp4_x2": ([I, I, I, P, P, P, P, F, P, P, P, SZ, I], I),
     "q27t_skinny_fp8": ([I, I, I, P, P, F, P, F, P, P, SZ], I),
     "q27t_gemm_fp8_scaled": ([I, I, I, P, P, P, P, P, F, P], I),
     "q27t_skinny_fp8_scaled": ([I, I, I, P, P, P, P, P, F, P, P, SZ], I),

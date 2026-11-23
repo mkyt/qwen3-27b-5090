@@ -47,6 +47,7 @@ struct Params {
   int* counters;        // [N / 128], zero between calls
   int x2;               // > 0: W4A4x2, M = 2 x2 rows (token t + x2: the second term of token t); d is [x2][N] and
                         // d[t] = c[t] + alpha * acc[t] + alpha * acc[t + x2] (c: the residual, beta 1)
+  int a2row;            // W4A4x2: the row of a holding token 0's second term (x2, or a multiple of 128 for kX2)
 };
 
 // The output of a W4A4x2 token: (c + alpha v0) + alpha v1, each step rounded (as the separate sum of the two
@@ -160,11 +161,19 @@ constexpr int kL2ChunksDefault = 8;
 // (matrix = 8 tokens x one 16-byte piece: b0 / b1 of k-steps 2 per x4). kG = 8 runs one CTA per SM
 // (170-225 registers), so the extra 24 KiB of shared memory are free; the 8 warps no longer load and
 // transpose the same activations each. The MMA inputs are the same.
+// kX2 (W4A4x2 of 33..64 tokens; NVFP4, kG = 8): both terms of every token against each weight chunk, so
+// the weights are read once for 2 x 64 rows. The activations' ring holds 128 rows (term 0 in rows 0..63, term 1,
+// from row a2row of a, in rows 64..127: 96 KiB of shared memory with the weights' rings, the most a CTA may have on
+// sm_120 is 99 KiB, so the activations' scales come from global memory as in kG = 8). The B fragments are taken per
+// two k-steps and term, the second term's accumulators beside the first's. Each accumulator sees the MMAs of a
+// one-term call in the same order, so the partials equal those of two calls.
 constexpr int kActChunkBytes = kMaxTokens * 128;  // one chunk of the activations (kG = 8)
-template <Fmt kFmt, int kStages, int kG, bool kWideB = false>
+template <Fmt kFmt, int kStages, int kG, bool kWideB = false, bool kX2 = false>
 __global__ void __launch_bounds__(kWarps * 32) skinny_kernel(Params p) {
   constexpr bool kFp4 = kFmt == Fmt::kFp4;
   constexpr bool kSmemB = kG == 8;
+  static_assert(!kX2 || (kSmemB && kFp4), "kX2 is the NVFP4 kG = 8 kernel");
+  constexpr int kTerms = kX2 ? 2 : 1;
   extern __shared__ __align__(128) uint8_t smem[];
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
   const int tile = blockIdx.x, split = blockIdx.y;
@@ -187,19 +196,26 @@ __global__ void __launch_bounds__(kWarps * 32) skinny_kernel(Params p) {
     dst[j] = r * 128 + ((c ^ (r % 8)) * 16);
   }
   // kSmemB: thread i copies pieces (token i / 8 + 32 j, piece i % 8), j = 0, 1, of the tokens < 8 groups.
+  // kX2: pieces j = 0..3, smem rows threadIdx.x / 8 + 32 j (term j / 2, token row % 64).
   const uint32_t aring = uint32_t(__cvta_generic_to_shared(smem)) + kWarps * kStages * kChunkBytes;
-  const uint8_t* asrc[2];
-  uint32_t adst[2];
-  bool aok[2], acopy[2];
+  constexpr int kActCopies = 2 * kTerms;
+  constexpr int kActSlot = kTerms * kActChunkBytes;
+  const int ntok = kX2 ? p.x2 : p.M;  // tokens per term
+  const uint8_t* asrc[kActCopies];
+  uint32_t adst[kActCopies];
+  bool aok[kActCopies], acopy[kActCopies];
   if constexpr (kSmemB) {
 #pragma unroll
-    for (int j = 0; j < 2; j++) {
-      const int tok = threadIdx.x / 8 + 32 * j, c = threadIdx.x % 8;
-      aok[j] = tok < p.M, acopy[j] = tok < 8 * ((p.M + 7) / 8);
-      asrc[j] = p.a + int64_t(aok[j] ? tok : 0) * p.kbytes + int64_t(s0) * 32 + c * 16;
-      adst[j] = tok * 128 + ((c ^ (tok % 8)) * 16);
+    for (int j = 0; j < kActCopies; j++) {
+      const int srow = threadIdx.x / 8 + 32 * j, c = threadIdx.x % 8;
+      const int tok = srow % kMaxTokens, arow = kX2 && srow >= kMaxTokens ? p.a2row + tok : tok;
+      aok[j] = tok < ntok, acopy[j] = tok < 8 * ((ntok + 7) / 8);
+      asrc[j] = p.a + int64_t(aok[j] ? arow : 0) * p.kbytes + int64_t(s0) * 32 + c * 16;
+      adst[j] = srow * 128 + ((c ^ (srow % 8)) * 16);
     }
   }
+  // kX2: the scales of term 0 (row block 0) and term 1 (row block a2row / 128)
+  const uint8_t* sf2[2] = {p.a_sf, p.a_sf + int64_t(p.a2row / 128) * p.steps * 512};
   // (weights / activations: the activations come from the previous kernel, after the PDL wait; the
   // prologue's weight groups come first, then those of its activations, then one group per chunk.)
   auto issue = [&](int chunk, bool wts = true, bool acts = true) {
@@ -210,9 +226,9 @@ __global__ void __launch_bounds__(kWarps * 32) skinny_kernel(Params p) {
         for (int j = 0; j < 4; j++) cp_async16(base + dst[j], src[j] + int64_t(chunk) * 128);
       }
       if (kSmemB && acts) {
-        const uint32_t abase = aring + (chunk % kStages) * kActChunkBytes;
+        const uint32_t abase = aring + (chunk % kStages) * kActSlot;
 #pragma unroll
-        for (int j = 0; j < 2; j++)
+        for (int j = 0; j < kActCopies; j++)
           if (acopy[j]) cp_async16z(abase + adst[j], asrc[j] + (aok[j] ? int64_t(chunk) * 128 : 0), aok[j]);
       }
     }
@@ -252,7 +268,63 @@ __global__ void __launch_bounds__(kWarps * 32) skinny_kernel(Params p) {
   float acc[kG][4];
 #pragma unroll
   for (int gi = 0; gi < kG; gi++) acc[gi][0] = acc[gi][1] = acc[gi][2] = acc[gi][3] = 0.f;
+  float acc2[kX2 ? kG : 1][4];  // kX2: the second term
+#pragma unroll
+  for (int gi = 0; gi < (kX2 ? kG : 1); gi++) acc2[gi][0] = acc2[gi][1] = acc2[gi][2] = acc2[gi][3] = 0.f;
   for (int ch = 0; ch < chunks; ch++) {
+    if constexpr (kX2) {
+      const int st0 = s0 + ch * kChunkSteps;
+      uint32_t SA[kChunkSteps], SB[2][kChunkSteps][kG];
+#pragma unroll
+      for (int u = 0; u < kChunkSteps; u++) {
+        SA[u] = ld_cached(wsf + int64_t(st0 + u) * 512);
+#pragma unroll
+        for (int term = 0; term < 2; term++)
+#pragma unroll
+          for (int gi = 0; gi < kG; gi++) {
+            const int tok = 8 * gi + g;  // (sf_step_offset of row block + tok)
+            SB[term][u][gi] =
+                tok < ntok ? ld_cached(sf2[term] + int64_t(st0 + u) * 512 + (tok % 32) * 16 + (tok / 32) * 4) : 0u;
+          }
+      }
+      cp_async_wait<kStages - 2>();
+      __syncthreads();
+      const uint32_t base = ring + (ch % kStages) * kChunkBytes;
+      uint32_t A[kChunkSteps][4];
+#pragma unroll
+      for (int u = 0; u < kChunkSteps; u++) {
+        int c = 2 * u + lm_half;
+        ldmatrix_x4(A[u], base + lm_row * 128 + ((c ^ (lm_row % 8)) * 16));
+      }
+      __syncwarp();  // the slot is refilled below (the activations' slot was read by all warps before the barrier)
+      issue(ch + kStages - 1);
+      const uint32_t abase = aring + (ch % kStages) * kActSlot;
+#pragma unroll
+      for (int term = 0; term < 2; term++) {
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          uint32_t B[2][kG][2];
+#pragma unroll
+          for (int gi = 0; gi < kG; gi++) {
+            if (8 * gi >= ntok) break;  // (uniform)
+            const int srow = term * kMaxTokens + 8 * gi + lane % 8;
+            uint32_t r[4];
+            ldmatrix_x4(r, abase + srow * 128 + (((4 * h + lane / 8) ^ (srow % 8)) * 16));
+            B[0][gi][0] = r[0], B[0][gi][1] = r[1], B[1][gi][0] = r[2], B[1][gi][1] = r[3];
+          }
+#pragma unroll
+          for (int uu = 0; uu < 2; uu++) {
+            const int u = 2 * h + uu;
+#pragma unroll
+            for (int gi = 0; gi < kG; gi++) {
+              if (8 * gi >= ntok) break;  // (uniform; groups past the tokens carry zeros)
+              mma_fp4(term ? acc2[gi] : acc[gi], A[u], B[uu][gi], SA[u], SB[term][u][gi]);
+            }
+          }
+        }
+      }
+      continue;
+    }
     const int st0 = s0 + ch * kChunkSteps;
     uint32_t B[kChunkSteps][kG][2], SA[kChunkSteps], SB[kChunkSteps][kG];
 #pragma unroll
@@ -345,6 +417,19 @@ __global__ void __launch_bounds__(kWarps * 32) skinny_kernel(Params p) {
     if (p.c) out += p.beta * p.c[i];
     p.d[i] = out;
   };
+  if constexpr (kX2) {  // (always through the reduce kernel: term 1 of token t is partial row x2 + t)
+#pragma unroll
+    for (int term = 0; term < 2; term++)
+#pragma unroll
+      for (int gi = 0; gi < kG; gi++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const int row = row0 + (j / 2) * 8, tok = 8 * gi + 2 * t + j % 2;
+          if (tok < p.x2)
+            p.part[(int64_t(split) * p.M + term * p.x2 + tok) * p.N + row] = term ? acc2[gi][j] : acc[gi][j];
+        }
+    return;
+  }
   if (p.splits == 1 && p.x2 == 1) {  // tokens 0 and 1 are j and j + 1 of lane t = 0
     if (t == 0)
 #pragma unroll
@@ -499,8 +584,13 @@ __global__ void __launch_bounds__(256) skinny_reduce_kernel(Params p) {
 template <Fmt kFmt>
 void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
             const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
-            cudaStream_t s, const float* wscale = nullptr, const float* ascale = nullptr, int x2 = 0) {
-  Q27_CHECK(M >= 1 && M <= kMaxTokens, "skinny gemm: M must be 1..64");
+            cudaStream_t s, const float* wscale = nullptr, const float* ascale = nullptr, int x2 = 0, int a2row = -1) {
+  if (a2row < 0) a2row = x2;
+  // W4A4x2 with the second terms elsewhere (a2row != x2): x2 <= 64 tokens, M = 2 x2 partial rows (kX2)
+  const bool x2far = x2 && a2row != x2;
+  Q27_CHECK(x2far ? x2 <= kMaxTokens && M == 2 * x2 && a2row % 128 == 0 && a2row >= x2 && kFmt == Fmt::kFp4
+                  : M >= 1 && M <= kMaxTokens,
+            "skinny gemm: M must be 1..64");
   Q27_CHECK(N % kRowsPerCta == 0, "skinny gemm: N must be a multiple of 128");
   constexpr bool kFp4 = kFmt == Fmt::kFp4;
   const int kbytes = kFp4 ? K / 2 : kFmt == Fmt::kFp8 ? K : 2 * K;
@@ -509,6 +599,7 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
   constexpr int kStages = Q27_SKINNY_STAGES;
   constexpr int kSmem = kWarps * kStages * kChunkBytes;
   constexpr int kSmem8 = kSmem + kStages * kActChunkBytes;  // kG = 8: the activations' ring as well
+  constexpr int kSmemX2 = kSmem + kStages * 2 * kActChunkBytes;  // kX2: the two terms' activations
   static bool attr = false;
   if (!attr) {
     Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
@@ -516,6 +607,9 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
     Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
     Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem8));
     Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
+    if constexpr (kFp4)
+      Q27_CUDA(cudaFuncSetAttribute(skinny_kernel<kFmt, kStages, 8, false, true>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemX2));
     attr = true;
   }
   Params p{};
@@ -558,15 +652,17 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
   const char* e_ext = getenv("Q27_SKINNY_EXT_REDUCE_M");
   // (W4A4x2: decided by the tokens, x2, as for a one-term call of x2 rows; with one split and more than one token
   // the partials go through the reduce kernel, which sums the two terms of a token)
-  p.x2 = x2;
-  p.ext_reduce = (splits > 1 && (x2 ? x2 : M) > (e_ext ? atoi(e_ext) : 1)) || (x2 > 1 && splits == 1);
+  p.x2 = x2, p.a2row = a2row;
+  p.ext_reduce = (splits > 1 && (x2 ? x2 : M) > (e_ext ? atoi(e_ext) : 1)) || (x2 > 1 && splits == 1) || x2far;
   p.counters = static_cast<int*>(ws);
   p.part = reinterpret_cast<float*>(static_cast<uint8_t*>(ws) + cnt_bytes);
   const dim3 grid(tiles, splits), block(kWarps * 32);
   // M > 16: 16-byte activation loads (kWideB), except for calls of >= 1024 tiles (the lm_head: 250 -> 261 us
   // at M = 32 with them; the other shapes 3-8% faster; P6-11).
   const bool wide = tiles < kWideMaxTiles;
-  if (M <= 8)
+  if (x2far) {
+    if constexpr (kFp4) launch_pdl(skinny_kernel<kFmt, kStages, 8, false, true>, grid, block, kSmemX2, s, p);
+  } else if (M <= 8)
     launch_pdl(skinny_kernel<kFmt, kStages, 1>, grid, block, kSmem, s, p);
   else if (M <= 16)
     launch_pdl(skinny_kernel<kFmt, kStages, 2>, grid, block, kSmem, s, p);
@@ -585,8 +681,8 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
 
 void skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                 const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
-                cudaStream_t s, int x2) {
-  launch<Fmt::kFp4>(M, N, K, a, a_sf, w, w_sf, alpha, c, beta, d, ws, ws_bytes, s, nullptr, nullptr, x2);
+                cudaStream_t s, int x2, int a2row) {
+  launch<Fmt::kFp4>(M, N, K, a, a_sf, w, w_sf, alpha, c, beta, d, ws, ws_bytes, s, nullptr, nullptr, x2, a2row);
 }
 
 void skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, const AlphaSegments& alpha, const float* c,
