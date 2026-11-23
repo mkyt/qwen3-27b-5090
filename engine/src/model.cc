@@ -130,8 +130,13 @@ Model::Model(const Options& opt) : opt_(opt) {
   size_t o_a = f32("a", Tc * kVHeads), o_bb = f32("b", Tc * kVHeads), o_g = f32("g", Tc * kVHeads),
          o_beta = f32("beta", Tc * kVHeads);
   // (an FP8 MLP's down GEMM takes [T][I] bytes)
-  size_t o_aq = act_.add("act quant", size_t(Tp) * (w_.mlp8 ? kInter : std::max(kInter / 2, kHeads * kHeadDim)));
-  size_t o_asf = act_.add("act sf", size_t(sf_bytes(Tp, kInter / 16)));
+  // (Q27_ACT_A4X2: room for the second term, from row Tp on)
+  act_a4x2_ = getenv("Q27_ACT_A4X2") && atoi(getenv("Q27_ACT_A4X2")) != 0;
+  act_a4x2_small_ = act_a4x2_ && atoi(getenv("Q27_ACT_A4X2")) == 2;  // (2: decode / verify-sized GEMMs only)
+  const int64_t Ta = !act_a4x2_ ? Tp : act_a4x2_small_ ? Tp + 2 * 128 : 2 * Tp;  // (2: second terms of <= 64 rows)
+  size_t o_aq = act_.add("act quant", size_t(Ta) * (w_.mlp8 ? kInter : std::max(kInter / 2, kHeads * kHeadDim)));
+  size_t o_asf = act_.add("act sf", size_t(sf_bytes(Ta, kInter / 16)));
+  size_t o_x2y = act_a4x2_ ? f32("act x2 terms", int64_t(kSkinnyMaxM) * 2 * kInter) : 0;
   size_t o_asc = w_.dyn8 ? f32("act row scales", Tp) : 0;
   size_t o_ids = act_.add("ids", Tc * 4);
   size_t o_mpos = act_.add("mrope positions", Tc * 3 * 4);
@@ -279,6 +284,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   n_ = act_.at<float>(o_n), a_ = act_.at<float>(o_a), b_ = act_.at<float>(o_bb), g_ = act_.at<float>(o_g);
   beta_ = act_.at<float>(o_beta);
   aq_ = act_.at<uint8_t>(o_aq), asf_ = act_.at<uint8_t>(o_asf);
+  if (act_a4x2_) x2y_ = act_.at<float>(o_x2y);
   if (w_.dyn8) ascale_ = act_.at<float>(o_asc);
   ids_ = act_.at<int32_t>(o_ids);
   mpos_ = act_.at<int32_t>(o_mpos);
@@ -347,7 +353,10 @@ Model::Model(const Options& opt) : opt_(opt) {
   }
 
   Q27_CUDA(cudaMemset(page_table_, 0, size_t(max_pages_) * 4));  // all unmapped (pages come from pool_)
-  Q27_CUDA(cudaMemset(asf_, 0, sf_bytes(Tp, kInter / 16)));
+  {
+    const int64_t tp = round_up(opt_.prefill_chunk, 128);
+    Q27_CUDA(cudaMemset(asf_, 0, sf_bytes(!act_a4x2_ ? tp : act_a4x2_small_ ? tp + 2 * 128 : 2 * tp, kInter / 16)));
+  }
   if (ascale_) Q27_CUDA(cudaMemset(ascale_, 0, size_t(Tp) * 4));
 
   w_.load(s_);
@@ -828,7 +837,16 @@ bool Model::skip(const char* kind) const {
 }
 
 QuantOut Model::q8(float in_scale) const { return {QuantOut::kFp8, in_scale, aq_, nullptr}; }
-QuantOut Model::q4(float in_scale) const { return {QuantOut::kFp4, in_scale, aq_, asf_}; }
+QuantOut Model::q4(float in_scale, int T) const {
+  a2_row_ = x2_row(T);
+  return {QuantOut::kFp4, in_scale, aq_, asf_, nullptr, a2_row_};
+}
+
+int Model::x2_row(int T) const {
+  if (!act_a4x2_ || T <= 0) return 0;
+  if (act_a4x2_small_ && !(skinny_ && T <= kSkinnyMaxM)) return 0;
+  return skinny_ && 2 * T <= kSkinnyMaxM ? T : int(round_up(T, 128));
+}
 QuantOut Model::q8row() const { return {QuantOut::kFp8Row, 1.f, aq_, nullptr, ascale_}; }
 
 // The input of an NVFP4 or per-token FP8 projection from fp32 rows (an FP8 one with a calibrated input scale was
@@ -839,9 +857,13 @@ void Model::quant_in(const LinearQ& l, const float* x, int T, int K) {
     quant_fp8_rows(x, K, T, K, aq_, ascale_, s_);
     return;
   }
-  if (!l.fp4) return;
+  if (!l.fp4) {
+    a2_row_ = 0;
+    return;
+  }
   mark("quant fp4");
-  quant_fp4(x, T, K, l.in_scale(), aq_, asf_, s_);
+  a2_row_ = x2_row(T);
+  quant_fp4(x, T, K, l.in_scale(), aq_, asf_, s_, a2_row_);
 }
 
 // GEMMs on the activation already quantized into aq_ (and asf_). Fused projections (several alpha
@@ -886,6 +908,25 @@ void Model::gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool
   if (skip("gemm") || skip("gemm4")) return;
   const float* c = residual ? out : nullptr;
   const float beta = residual ? 1.f : 0.f;
+  if (const int r2 = a2_row_; r2 > 0) {  // W4A4x2 (Q27_ACT_A4X2): the two terms of aq_
+    const int N = l.out, K = l.in;
+    const uint8_t* q1 = aq_ + size_t(r2) * (K / 2);
+    const uint8_t* sf1 = asf_ + sf_bytes(r2, K / 16);
+    if (T <= kSkinnyMaxM && skinny_) {
+      if (r2 == T) {  // one GEMM of 2 T rows (the weights read once), then the sum
+        skinny_fp4(2 * T, N, K, aq_, asf_, l.w, l.sf, l.alpha, nullptr, 0.f, x2y_, skinny_ws_, kSkinnyWsBytes, s_);
+        add_x2_terms(x2y_, T, N, out, residual, s_);
+      } else {
+        skinny_fp4(T, N, K, aq_, asf_, l.w, l.sf, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_);
+        skinny_fp4(T, N, K, q1, sf1, l.w, l.sf, l.alpha, out, 1.f, out, skinny_ws_, kSkinnyWsBytes, s_);
+      }
+      return;
+    }
+    Q27_CHECK(l.alpha.count == 1, std::string(what) + ": fused projections need the skinny path");
+    gemm_fp4(T, N, K, aq_, asf_, l.w, l.sf, l.alpha.alpha[0], c, beta, out, s_);
+    gemm_fp4(T, N, K, q1, sf1, l.w, l.sf, l.alpha.alpha[0], out, 1.f, out, s_);
+    return;
+  }
   if (T <= kSkinnyMaxM && skinny_) {
     auto run = [&] {
       skinny_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_);
@@ -949,7 +990,7 @@ void Model::gdn(int i, int T) {
   // the rstd per token, in_proj_a / b normalizing x_ itself.
   const bool norm_ab = !verify_ && T > 1 && linear_bf16_pair_norm_ok(T);
   if (!skip("norm"))
-    rmsnorm_quant(x_, L.in_norm, T, kEps, norm_ab ? nullptr : h_, qin(G.qkv), s_, cap_for(i), ddims::kCtxFeatures * kHidden,
+    rmsnorm_quant(x_, L.in_norm, T, kEps, norm_ab ? nullptr : h_, qin(G.qkv, T), s_, cap_for(i), ddims::kCtxFeatures * kHidden,
                   norm_ab ? h_ : nullptr);
   float *qkv = big1_, *z = big2_;
   int ld = kConvDim, ldz = kVHeads * kVDim;
@@ -1016,7 +1057,7 @@ void Model::attn(int i, int T) {
   KvLayer kv = kv_layers_[i / kAttnEvery];
   mark("norm+quant");
   if (!skip("norm"))
-    rmsnorm_quant(x_, L.in_norm, T, kEps, nullptr, qin(A.q), s_, cap_for(i), ddims::kCtxFeatures * kHidden);
+    rmsnorm_quant(x_, L.in_norm, T, kEps, nullptr, qin(A.q, T), s_, cap_for(i), ddims::kCtxFeatures * kHidden);
   // qg [T][24][512]: query | gate per head; k, v [T][4][256].
   float *qg = big1_, *k = k_, *v = q_;  // (q_ is free in attention layers)
   int ldq = kHeads * 2 * kHeadDim, ldkv = kKvHeads * kHeadDim;
@@ -1073,11 +1114,12 @@ void Model::mlp(int i, int T) {
     return;
   }
   mark("norm+quant");
-  if (!skip("norm")) rmsnorm_quant(x_, L.post_norm, T, kEps, nullptr, q4(L.gate.in_scale), s_);
+  if (!skip("norm")) rmsnorm_quant(x_, L.post_norm, T, kEps, nullptr, q4(L.gate.in_scale, T), s_);
   // gate_up is the interleaved gate | up with alpha 1 (Weights::fp4_glu): the silu step reads it as such and
   // applies the gate's and the up's alphas.
   const float ag = L.gate.alpha.alpha[0], au = L.up.alpha.alpha[0];
-  if (mlp_fused_ && T > kSkinnyMaxM && !fused(T)) {
+  // (Q27_ACT_A4X2: the fp32 path below, whose silu step writes both terms)
+  if (mlp_fused_ && !(act_a4x2_ && !act_a4x2_small_) && T > kSkinnyMaxM && !fused(T)) {
     // Prefill: one GEMM for gate | up whose epilogue writes silu(gate) * up as the down GEMM's NVFP4
     // activations (big1_ / big2_: aq_ is this GEMM's input), instead of BF16 gate / up written and read
     // back.
@@ -1091,13 +1133,14 @@ void Model::mlp(int i, int T) {
       gemm_fp4(T, kHidden, kInter, q, qsf, L.down.w, L.down.sf, L.down.alpha.alpha[0], x_, 1.f, x_, s_);
     return;
   }
-  if (mlp_bf16_ && T > kSkinnyMaxM && !fused(T)) {
+  if (mlp_bf16_ && !(act_a4x2_ && !act_a4x2_small_) && T > kSkinnyMaxM && !fused(T)) {
     // Prefill: gate | up in BF16 (it only feeds silu * up and its FP4 quantization; [T][2 I] in big1_).
     bf16* gu = reinterpret_cast<bf16*>(big1_);
     mark("mlp gate_up");
     if (!skip("gemm") && !skip("gemm4"))
       gemm_fp4_bf16(T, L.gate_up.out, L.gate_up.in, aq_, asf_, L.gate_up.w, L.gate_up.sf, 1.f, gu, s_);
     mark("mlp silu+quant");
+    a2_row_ = 0;
     if (!skip("silu")) silu_mul_quant_fp4_glu(gu, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
   } else {
     // fp32 [T][2 I]: in big1_ ([Tc][I]) up to Tc / 2 rows, beyond that also in big2_ (adjacent).
@@ -1105,7 +1148,8 @@ void Model::mlp(int i, int T) {
               "MLP: big1_ / big2_ not adjacent");
     gemm_q("mlp gate_up", L.gate_up, T, big1_, false);
     mark("mlp silu+quant");
-    if (!skip("silu")) silu_mul_quant_fp4_glu(big1_, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
+    a2_row_ = x2_row(T);
+    if (!skip("silu")) silu_mul_quant_fp4_glu(big1_, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_, a2_row_);
   }
   gemm_q("mlp down", L.down, T, x_, true);
 }

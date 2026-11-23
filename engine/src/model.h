@@ -264,9 +264,15 @@ class Model {
     l.fp4 ? gemm_q(what, l.f4, T, out, residual) : gemm_q(what, l.f8, T, out, residual);
   }
   QuantOut q8(float in_scale) const;  // quantize into aq_
-  QuantOut q4(float in_scale) const;  // quantize into aq_ / asf_
+  QuantOut q4(float in_scale, int T = 0) const;  // quantize into aq_ / asf_ (T > 0: in two terms under Q27_ACT_A4X2)
   QuantOut q8row() const;             // quantize into aq_ per token, the row scales into ascale_
-  QuantOut qin(const LinearQ& l) const { return l.fp4 ? q4(l.in_scale()) : l.dyn ? q8row() : q8(l.in_scale()); }
+  QuantOut qin(const LinearQ& l, int T = 0) const {
+    if (!l.fp4) a2_row_ = 0;
+    return l.fp4 ? q4(l.in_scale(), T) : l.dyn ? q8row() : q8(l.in_scale());
+  }
+  // Q27_ACT_A4X2: the row of aq_ / asf_ where the second term of a T-row activation starts (0: one term). T when
+  // the two terms run as one skinny GEMM of 2 T rows, else T rounded up to 128 (a second matrix, a second GEMM).
+  int x2_row(int T) const;
   // The input of a projection from its fp32 rows x [T][K] (FP8 projections: the producing kernel already
   // wrote aq_; NVFP4 ones quantize here).
   void quant_in(const LinearQ& l, const float* x, int T, int K);
@@ -496,6 +502,10 @@ class Model {
   bool skinny_check_ = false;
   std::string skip_;  // Q27_SKIP (debug timing)
   bool skip(const char* kind) const;
+  bool act_a4x2_ = false;   // Q27_ACT_A4X2: two-term NVFP4 activations into every NVFP4 layer GEMM (quality mode)
+  bool act_a4x2_small_ = false;  // Q27_ACT_A4X2=2: only the skinny (decode / verify) GEMMs
+  mutable int a2_row_ = 0;  // the x2_row of the activation last quantized into aq_ (0: one term)
+  float* x2y_ = nullptr;    // [2 kSkinnyMaxM / 2 .. ][N]: the two terms' outputs of a one-call skinny W4A4x2 GEMM
   bool head_a4x2_ = true;  // Q27_LM_HEAD_A4X2: two-term NVFP4 activations into the NVFP4 lm_head (logits)
   // Decode step as a CUDA graph (Q27_NO_GRAPH=1: eager). Not used while profiling.
   bool graphs_ = true, graph_warm_ = false;

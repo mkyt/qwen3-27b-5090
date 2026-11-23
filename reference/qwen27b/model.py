@@ -163,12 +163,13 @@ class SeqState:
 
 class Qwen38Reference:
     def __init__(self, ckpt: Checkpoint, device="cpu", dtype=torch.float32, act_quant=True,
-                 kv_dtype="bf16", state_dtype=torch.float32, gdn="chunked", head_terms=2):
+                 kv_dtype="bf16", state_dtype=torch.float32, gdn="chunked", head_terms=2, act_terms=1):
         self.ckpt = ckpt
         self.cfg = TextConfig.from_hf(ckpt.config)
         self.device, self.dtype = torch.device(device), dtype
         self.act_quant = act_quant
         self.head_terms = head_terms
+        self.act_terms = act_terms  # of every other NVFP4 linear's activations (2: the engine's Q27_ACT_A4X2=1)
         self.kv_dtype = kv_dtype  # "bf16" | "fp8" (e4m3, scale 1.0, as stored by the engines) | "fp32"
         self.state_dtype = state_dtype  # storage precision of the GDN state between calls
         self.gdn = gdn  # "chunked" | "recurrent"
@@ -179,7 +180,10 @@ class Qwen38Reference:
         return self.ckpt.get(name, self.device)
 
     def _linear(self, prefix):
-        return self.ckpt.linear(prefix, self.device, self.dtype, self.act_quant)
+        lin = self.ckpt.linear(prefix, self.device, self.dtype, self.act_quant)
+        if lin.kind == "nvfp4":
+            lin.act_terms = self.act_terms
+        return lin
 
     # --- layers ---------------------------------------------------------
     def mlp(self, i, x):

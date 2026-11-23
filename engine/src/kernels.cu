@@ -96,6 +96,8 @@ __device__ uint8_t cvt_e2m1x2(float even, float odd) {
 
 
 // NVFP4 quantization of one 16-element block (row m, k-block kb) of a [M][K] activation.
+__constant__ float kE2m1Values[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
 __device__ void quant_block16(const float* v, float input_scale, int m, int kb, int K, uint8_t* q, uint8_t* sf) {
   int kblocks = K / 16;
   float amax = 0.f;
@@ -110,6 +112,39 @@ __device__ void quant_block16(const float* v, float input_scale, int m, int kb, 
   for (int j = 0; j < 8; j++) packed[j / 4] |= uint32_t(cvt_e2m1x2(v[2 * j] * inv, v[2 * j + 1] * inv)) << (8 * (j % 4));
   *reinterpret_cast<uint2*>(q + int64_t(m) * (K / 2) + kb * 8) = make_uint2(packed[0], packed[1]);
   sf[sf_offset(m, kb, kblocks)] = sfq;
+}
+
+// The same block in two terms (W4A4x2): the first exactly as quant_block16, then the quantization of what it left
+// (same global scale) as row m + row2 (skinny_a4x2.cu's quant_fp4x2 arithmetic).
+__device__ void quant_block16_x2(const float* in, float input_scale, int m, int kb, int K, uint8_t* q, uint8_t* sf,
+                                 int row2) {
+  const int kblocks = K / 16;
+  const float gs = 1.f / input_scale;
+  float v[16];
+#pragma unroll
+  for (int j = 0; j < 16; j++) v[j] = in[j];
+#pragma unroll
+  for (int term = 0; term < 2; term++) {
+    float amax = 0.f;
+#pragma unroll
+    for (int j = 0; j < 16; j++) amax = fmaxf(amax, fabsf(v[j]));
+    const __nv_fp8_storage_t sfq = __nv_cvt_float_to_fp8(gs * amax / 6.f, __NV_SATFINITE, __NV_E4M3);
+    const float sff = float(__half(__nv_cvt_fp8_to_halfraw(sfq, __NV_E4M3)));
+    const float inv = sff != 0.f ? gs / sff : 0.f;
+    uint32_t packed[2] = {0, 0};
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      const uint8_t codes = cvt_e2m1x2(v[2 * j] * inv, v[2 * j + 1] * inv);
+      packed[j / 4] |= uint32_t(codes) << (8 * (j % 4));
+      if (term == 0) {
+        v[2 * j] -= kE2m1Values[codes & 15] * sff / gs;
+        v[2 * j + 1] -= kE2m1Values[codes >> 4] * sff / gs;
+      }
+    }
+    const int64_t row = m + (term ? row2 : 0);
+    *reinterpret_cast<uint2*>(q + row * (K / 2) + kb * 8) = make_uint2(packed[0], packed[1]);
+    sf[sf_offset(row, kb, kblocks)] = sfq;
+  }
 }
 
 __device__ __forceinline__ void load16(const bf16* p, float* v) {
@@ -148,21 +183,24 @@ __device__ __forceinline__ void store_fp8x16(const float* v, float s, uint8_t* q
 }
 
 // One thread per 16-element block.
-__global__ void quant_fp4_kernel(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf) {
+template <bool kX2 = false>
+__global__ void quant_fp4_kernel(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, int row2) {
   int kblocks = K / 16;
   int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= int64_t(M) * kblocks) return;
   int m = int(idx / kblocks), kb = int(idx % kblocks);
   float v[16];
   load16(x + int64_t(m) * K + kb * 16, v);
-  quant_block16(v, input_scale, m, kb, K, q, sf);
+  if constexpr (kX2)
+    quant_block16_x2(v, input_scale, m, kb, K, q, sf, row2);
+  else
+    quant_block16(v, input_scale, m, kb, K, q, sf);
 }
 
 __device__ __forceinline__ float e4m3_float(__nv_fp8_storage_t c) {
   return float(__half(__nv_cvt_fp8_to_halfraw(c, __NV_E4M3)));
 }
 
-__constant__ float kE2m1Values[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
 
 // One thread per 16-element block of a BF16 weight matrix: NVFP4 with the block's e4m3 scale searched, of the
 // codes from 4 below to 8 above the rounded amax / 6, for the smallest squared error (as scripts/quantize_proj.py
@@ -208,7 +246,7 @@ __global__ void quant_fp4_weight_kernel(const bf16* w, int M, int K, float globa
 // Block per token, one thread per 16 elements of the hidden state: zero-centered RMSNorm, then
 // optionally the fp32 result and the quantized activation for the next GEMM. kRows: QuantOut::kFp8Row (its own
 // instantiation: the block-wide maximum stays out of the other kinds' code).
-template <bool kRows>
+template <bool kRows, bool kX2 = false>
 __global__ void rmsnorm_quant_kernel(const float* x, const bf16* w, float eps, float* out, QuantOut qo, bf16* cap,
                                      int cap_ld, float* rstd) {
   pdl_trigger();
@@ -252,7 +290,10 @@ __global__ void rmsnorm_quant_kernel(const float* x, const bf16* w, float eps, f
     if (kb == 0) qo.scale[t] = rs;
     store_fp8x16(v, rs, qo.q + int64_t(t) * D + kb * 16);
   } else if (qo.kind == QuantOut::kFp4) {
-    quant_block16(v, qo.in_scale, t, kb, D, qo.q, qo.sf);
+    if constexpr (kX2)
+      quant_block16_x2(v, qo.in_scale, t, kb, D, qo.q, qo.sf, qo.row2);
+    else
+      quant_block16(v, qo.in_scale, t, kb, D, qo.q, qo.sf);
   } else if (qo.kind == QuantOut::kFp8) {
     uint32_t packed[4] = {0, 0, 0, 0};
 #pragma unroll
@@ -316,10 +357,10 @@ __global__ void dequant_fp8_rows_kernel(const uint8_t* w, const float* scale, in
 // silu(gate) * up, NVFP4-quantized; one thread per 16-element block. gate / up rows are ld apart.
 // kGlu: gate is the [T][2 I] output of the interleaved gate | up (gate_glu_offset; up 64 columns after the
 // gate), scaled by alpha_gate / alpha_up here (1 otherwise: exact).
-template <typename E, bool kGlu = false>
+template <typename E, bool kGlu = false, bool kX2 = false>
 __global__ void silu_mul_quant_fp4_kernel(const E* gate, const E* up, int64_t ld, int T, int I,
                                           float input_scale, uint8_t* q, uint8_t* sf, float alpha_gate,
-                                          float alpha_up) {
+                                          float alpha_up, int row2) {
   pdl_trigger();
   pdl_wait();
   int kblocks = I / 16;
@@ -335,7 +376,20 @@ __global__ void silu_mul_quant_fp4_kernel(const E* gate, const E* up, int64_t ld
     if (kGlu) g[j] *= alpha_gate, u[j] *= alpha_up;
     g[j] = g[j] / (1.f + expf(-g[j])) * u[j];
   }
-  quant_block16(g, input_scale, t, kb, I, q, sf);
+  if constexpr (kX2)
+    quant_block16_x2(g, input_scale, t, kb, I, q, sf, row2);
+  else
+    quant_block16(g, input_scale, t, kb, I, q, sf);
+}
+
+// out[t][n] = y[t][n] + y[T + t][n] (+ out[t][n]): the two terms of a W4A4x2 GEMM.
+__global__ void add_x2_terms_kernel(const float4* y, int64_t n4, float4* out, bool residual) {
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n4) return;
+  const float4 a = y[i], b = y[i + n4];
+  float4 r = residual ? out[i] : make_float4(0.f, 0.f, 0.f, 0.f);
+  r.x = r.x + a.x + b.x, r.y = r.y + a.y + b.y, r.z = r.z + a.z + b.z, r.w = r.w + a.w + b.w;
+  out[i] = r;
 }
 
 __global__ void quant_fp8_kernel(const float* x, int64_t n, float s, uint8_t* q) {
@@ -660,10 +714,13 @@ void rmsnorm(const float* x, const bf16* w, int T, int D, float eps, bool zero_c
   Q27_CUDA(cudaGetLastError());
 }
 
-void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s) {
+void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s, int row2) {
   Q27_CHECK(K % 64 == 0, "quant_fp4: K must be a multiple of 64");
   if (M == 0) return;
-  quant_fp4_kernel<<<blocks(int64_t(M) * (K / 16)), kThreads, 0, s>>>(x, M, K, input_scale, q, sf);
+  if (row2 > 0)
+    quant_fp4_kernel<true><<<blocks(int64_t(M) * (K / 16)), kThreads, 0, s>>>(x, M, K, input_scale, q, sf, row2);
+  else
+    quant_fp4_kernel<<<blocks(int64_t(M) * (K / 16)), kThreads, 0, s>>>(x, M, K, input_scale, q, sf, 0);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -720,6 +777,9 @@ void rmsnorm_quant(const float* x, const bf16* w, int T, float eps, float* out, 
   if (T == 0) return;
   if (q.kind == QuantOut::kFp8Row)
     launch_pdl(rmsnorm_quant_kernel<true>, dim3(T), dim3(dims::kHidden / 16), 0, s, x, w, eps, out, q, cap, cap_ld, rstd);
+  else if (q.kind == QuantOut::kFp4 && q.row2 > 0)
+    launch_pdl(rmsnorm_quant_kernel<false, true>, dim3(T), dim3(dims::kHidden / 16), 0, s, x, w, eps, out, q, cap, cap_ld,
+               rstd);
   else
     launch_pdl(rmsnorm_quant_kernel<false>, dim3(T), dim3(dims::kHidden / 16), 0, s, x, w, eps, out, q, cap, cap_ld, rstd);
   Q27_CUDA(cudaGetLastError());
@@ -729,7 +789,7 @@ void silu_mul_quant_fp4(const float* gate, const float* up, int64_t ld, int T, i
                         uint8_t* sf, cudaStream_t s) {
   Q27_CHECK(I % 64 == 0, "silu_mul_quant_fp4: I must be a multiple of 64");
   if (T == 0) return;
-  launch_pdl(silu_mul_quant_fp4_kernel<float>, dim3(blocks(int64_t(T) * (I / 16))), dim3(kThreads), 0, s, gate, up, ld, T, I, input_scale, q, sf, 1.f, 1.f);
+  launch_pdl(silu_mul_quant_fp4_kernel<float>, dim3(blocks(int64_t(T) * (I / 16))), dim3(kThreads), 0, s, gate, up, ld, T, I, input_scale, q, sf, 1.f, 1.f, 0);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -737,26 +797,39 @@ void silu_mul_quant_fp4(const bf16* gate, const bf16* up, int64_t ld, int T, int
                         uint8_t* sf, cudaStream_t s) {
   Q27_CHECK(I % 64 == 0, "silu_mul_quant_fp4: I must be a multiple of 64");
   if (T == 0) return;
-  launch_pdl(silu_mul_quant_fp4_kernel<bf16>, dim3(blocks(int64_t(T) * (I / 16))), dim3(kThreads), 0, s, gate, up, ld, T, I, input_scale, q, sf, 1.f, 1.f);
+  launch_pdl(silu_mul_quant_fp4_kernel<bf16>, dim3(blocks(int64_t(T) * (I / 16))), dim3(kThreads), 0, s, gate, up, ld, T, I, input_scale, q, sf, 1.f, 1.f, 0);
   Q27_CUDA(cudaGetLastError());
 }
 
 template <typename E>
 void silu_mul_quant_fp4_glu_impl(const E* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
-                                 uint8_t* q, uint8_t* sf, cudaStream_t s) {
+                                 uint8_t* q, uint8_t* sf, cudaStream_t s, int row2) {
   Q27_CHECK(I % 64 == 0, "silu_mul_quant_fp4_glu: I must be a multiple of 64");
   if (T == 0) return;
-  launch_pdl(silu_mul_quant_fp4_kernel<E, true>, dim3(blocks(int64_t(T) * (I / 16))), dim3(kThreads), 0, s, gu,
-             nullptr, int64_t(2) * I, T, I, input_scale, q, sf, alpha_gate, alpha_up);
+  if (row2 > 0)
+    launch_pdl(silu_mul_quant_fp4_kernel<E, true, true>, dim3(blocks(int64_t(T) * (I / 16))), dim3(kThreads), 0, s, gu,
+               nullptr, int64_t(2) * I, T, I, input_scale, q, sf, alpha_gate, alpha_up, row2);
+  else
+    launch_pdl(silu_mul_quant_fp4_kernel<E, true>, dim3(blocks(int64_t(T) * (I / 16))), dim3(kThreads), 0, s, gu,
+               nullptr, int64_t(2) * I, T, I, input_scale, q, sf, alpha_gate, alpha_up, 0);
   Q27_CUDA(cudaGetLastError());
 }
 void silu_mul_quant_fp4_glu(const float* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
-                            uint8_t* q, uint8_t* sf, cudaStream_t s) {
-  silu_mul_quant_fp4_glu_impl(gu, T, I, alpha_gate, alpha_up, input_scale, q, sf, s);
+                            uint8_t* q, uint8_t* sf, cudaStream_t s, int row2) {
+  silu_mul_quant_fp4_glu_impl(gu, T, I, alpha_gate, alpha_up, input_scale, q, sf, s, row2);
 }
 void silu_mul_quant_fp4_glu(const bf16* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
-                            uint8_t* q, uint8_t* sf, cudaStream_t s) {
-  silu_mul_quant_fp4_glu_impl(gu, T, I, alpha_gate, alpha_up, input_scale, q, sf, s);
+                            uint8_t* q, uint8_t* sf, cudaStream_t s, int row2) {
+  silu_mul_quant_fp4_glu_impl(gu, T, I, alpha_gate, alpha_up, input_scale, q, sf, s, row2);
+}
+
+void add_x2_terms(const float* y, int T, int N, float* out, bool residual, cudaStream_t s) {
+  Q27_CHECK(N % 4 == 0, "add_x2_terms: N must be a multiple of 4");
+  const int64_t n4 = int64_t(T) * N / 4;
+  if (n4 == 0) return;
+  add_x2_terms_kernel<<<blocks(n4), kThreads, 0, s>>>(reinterpret_cast<const float4*>(y), n4,
+                                                      reinterpret_cast<float4*>(out), residual);
+  Q27_CUDA(cudaGetLastError());
 }
 
 bool linear_bf16_pair_norm_ok(int T) {

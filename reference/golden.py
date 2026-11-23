@@ -71,7 +71,7 @@ def cmd_ref(args):
     else:
         ckpt = Checkpoint(snapshot(*(BF16 if args.model == "bf16" else TARGET)))
     ref = Qwen38Reference(ckpt, device=args.device, act_quant=not args.no_act_quant,
-                          kv_dtype=args.kv_dtype, head_terms=args.lm_head_terms)
+                          kv_dtype=args.kv_dtype, head_terms=args.lm_head_terms, act_terms=args.act_terms)
     head = ref.lm_head()
     with open_text(args.out, "w") as f:
         for p in read_jsonl(args.prompts):
@@ -194,6 +194,8 @@ def main():
     p.add_argument("--no-act-quant", action="store_true")
     p.add_argument("--lm-head-terms", type=int, default=2, choices=[1, 2],
                    help="terms of an NVFP4 lm_head's activations (2: the engine's default, 1: W4A4)")
+    p.add_argument("--act-terms", type=int, default=1, choices=[1, 2],
+                   help="terms of the other NVFP4 linears' activations (2: the engine under Q27_ACT_A4X2=1)")
     p = sub.add_parser("engine")
     p.add_argument("--prompts", default="bench/golden/prompts.jsonl")
     p.add_argument("--out", required=True)

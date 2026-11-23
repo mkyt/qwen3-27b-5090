@@ -130,6 +130,8 @@ struct QuantOut {
   uint8_t* q = nullptr;   // fp8 [T][D] / packed e2m1 [T][D/2]
   uint8_t* sf = nullptr;  // NVFP4 only: swizzled scale factors
   float* scale = nullptr; // kFp8Row only: [T]
+  int row2 = 0;           // kFp4: > 0 also writes the second term (W4A4x2: the quantization of what the first left,
+                          // the same global scale) as row t + row2 of q / sf
 };
 
 // ---------------------------------------------------------------- elementwise (kernels.cu)
@@ -142,7 +144,8 @@ void embed_gather(const bf16* table, const int32_t* ids, int T, int D, float* ou
 void rmsnorm(const float* x, const bf16* w, int T, int D, float eps, bool zero_centered, float* out, cudaStream_t s);
 // Dynamic NVFP4 quantization (modelopt / FlashInfer numerics, see reference/qwen27b/quant.py):
 // q [M][K/2] packed e2m1 (low nibble = even column), sf in the CUTLASS SM1xx swizzled layout.
-void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s);
+void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s,
+               int row2 = 0);  // row2 > 0: two terms, as QuantOut::row2
 // A BF16 weight matrix [M][K] to NVFP4 (Weights::fp4_from_bf16), global = its weight_scale_2 (amax / 2688), the
 // block scales searched for the smallest error. The scale factors of rows m0.. of a larger matrix start at
 // sf + sf_bytes(m0, K / 16) when m0 is a multiple of 128.
@@ -161,9 +164,9 @@ void silu_mul_quant_fp4(const bf16* gate, const bf16* up, int64_t ld, int T, int
 // The same from the [T][2 I] output of the interleaved gate | up weights (glu_row: gate and up in alternate blocks
 // of 64 rows), with the gate's and the up's alphas applied here (the GEMM ran with alpha 1).
 void silu_mul_quant_fp4_glu(const float* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
-                            uint8_t* q, uint8_t* sf, cudaStream_t s);
+                            uint8_t* q, uint8_t* sf, cudaStream_t s, int row2 = 0);
 void silu_mul_quant_fp4_glu(const bf16* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
-                            uint8_t* q, uint8_t* sf, cudaStream_t s);
+                            uint8_t* q, uint8_t* sf, cudaStream_t s, int row2 = 0);
 // x' = e4m3(x / input_scale), [n] elements.
 void quant_fp8(const float* x, int64_t n, float input_scale, uint8_t* q, cudaStream_t s);
 // Dynamic per-row FP8 (QuantOut::kFp8Row): scale[t] = amax(row t) / 448 (1 for an all-zero row),
@@ -276,6 +279,10 @@ void skinny_fp4_scaled(int M, int N, int K, const uint8_t* a, const uint8_t* a_s
 // BF16 activations [M][K] x BF16 weights [N][K] (the draft model).
 void skinny_bf16(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,
                  void* ws, size_t ws_bytes, cudaStream_t s);
+
+// W4A4x2 of a layer's GEMM run as one GEMM over 2 T rows (row t + T: the second term) into y [2 T][N]:
+// out[t] = y[t] + y[T + t] (+ out[t] when residual).
+void add_x2_terms(const float* y, int T, int N, float* out, bool residual, cudaStream_t s);
 
 // W4A4x2 for the lm_head (skinny_a4x2.cu): d = alpha * (x0 + x1) . W^T with the two NVFP4 terms of quant_fp4x2
 // (q [2 M][K / 2], q_sf [2 M][K / 16] row-major; row 2 tok + term) x NVFP4 weights [N][K] (skinny_fp4's layout);
