@@ -28,9 +28,10 @@ permissions:
 env:
   CUDA_VERSION: 13.3.1
   CUDA_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3
-  # MSVC toolset for nvcc: CUDA 13.3's cudafe++ crashes (0xC0000005) on MSVC 14.52 (the runner image of 2026-11-16),
-  # even on CMake's compiler-id test. Used when the runner has it; otherwise the default toolset.
-  MSVC_TOOLSET: "14.51"
+  # MSVC toolset for nvcc: CUDA 13.3's cudafe++ crashes (0xC0000005) on MSVC 14.52 (the runner image of 2026-11-16,
+  # which keeps 14.29, 14.44 and 14.52), even on CMake's compiler-id test. 14.44 is Visual Studio 2022's last toolset.
+  # Used when the runner has it; otherwise the default toolset.
+  MSVC_TOOLSET: "14.44"
 
 jobs:
   # A release pushes main and its v* tag together: the tag's run builds that commit (and also tags it latest), so
