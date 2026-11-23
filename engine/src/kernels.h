@@ -262,9 +262,11 @@ struct AlphaSegments {
 // Same contract as gemm_fp4 / gemm_fp8 for M = 1..64 (N a multiple of 128). The workspace holds the
 // split-K partials and per-tile counters; it must be zeroed once before the first call (the kernels
 // leave the counters at zero).
+// x2 > 0 (W4A4x2): a has M = 2 x2 rows, row t + x2 the second NVFP4 term of token t; d [x2][N] gets the sum of the
+// two terms' products (+ c, beta 1), each product rounded, then (c + first) + second.
 void skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                 const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
-                cudaStream_t s);
+                cudaStream_t s, int x2 = 0);
 void skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, const AlphaSegments& alpha, const float* c,
                 float beta, float* d, void* ws, size_t ws_bytes, cudaStream_t s);
 // Draft model weights quantized at load: d[t][n] = acc * wscale[n] * ascale[t] (per-output-channel weight
@@ -279,10 +281,6 @@ void skinny_fp4_scaled(int M, int N, int K, const uint8_t* a, const uint8_t* a_s
 // BF16 activations [M][K] x BF16 weights [N][K] (the draft model).
 void skinny_bf16(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,
                  void* ws, size_t ws_bytes, cudaStream_t s);
-
-// W4A4x2 of a layer's GEMM run as one GEMM over 2 T rows (row t + T: the second term) into y [2 T][N]:
-// out[t] = y[t] + y[T + t] (+ out[t] when residual).
-void add_x2_terms(const float* y, int T, int N, float* out, bool residual, cudaStream_t s);
 
 // W4A4x2 for the lm_head (skinny_a4x2.cu): d = alpha * (x0 + x1) . W^T with the two NVFP4 terms of quant_fp4x2
 // (q [2 M][K / 2], q_sf [2 M][K / 16] row-major; row 2 tok + term) x NVFP4 weights [N][K] (skinny_fp4's layout);

@@ -136,7 +136,6 @@ Model::Model(const Options& opt) : opt_(opt) {
   const int64_t Ta = !act_a4x2_ ? Tp : act_a4x2_small_ ? Tp + 2 * 128 : 2 * Tp;  // (2: second terms of <= 64 rows)
   size_t o_aq = act_.add("act quant", size_t(Ta) * (w_.mlp8 ? kInter : std::max(kInter / 2, kHeads * kHeadDim)));
   size_t o_asf = act_.add("act sf", size_t(sf_bytes(Ta, kInter / 16)));
-  size_t o_x2y = act_a4x2_ ? f32("act x2 terms", int64_t(kSkinnyMaxM) * 2 * kInter) : 0;
   size_t o_asc = w_.dyn8 ? f32("act row scales", Tp) : 0;
   size_t o_ids = act_.add("ids", Tc * 4);
   size_t o_mpos = act_.add("mrope positions", Tc * 3 * 4);
@@ -284,7 +283,6 @@ Model::Model(const Options& opt) : opt_(opt) {
   n_ = act_.at<float>(o_n), a_ = act_.at<float>(o_a), b_ = act_.at<float>(o_bb), g_ = act_.at<float>(o_g);
   beta_ = act_.at<float>(o_beta);
   aq_ = act_.at<uint8_t>(o_aq), asf_ = act_.at<uint8_t>(o_asf);
-  if (act_a4x2_) x2y_ = act_.at<float>(o_x2y);
   if (w_.dyn8) ascale_ = act_.at<float>(o_asc);
   ids_ = act_.at<int32_t>(o_ids);
   mpos_ = act_.at<int32_t>(o_mpos);
@@ -913,9 +911,8 @@ void Model::gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool
     const uint8_t* q1 = aq_ + size_t(r2) * (K / 2);
     const uint8_t* sf1 = asf_ + sf_bytes(r2, K / 16);
     if (T <= kSkinnyMaxM && skinny_) {
-      if (r2 == T) {  // one GEMM of 2 T rows (the weights read once), then the sum
-        skinny_fp4(2 * T, N, K, aq_, asf_, l.w, l.sf, l.alpha, nullptr, 0.f, x2y_, skinny_ws_, kSkinnyWsBytes, s_);
-        add_x2_terms(x2y_, T, N, out, residual, s_);
+      if (r2 == T) {  // one GEMM of 2 T rows (the weights read once) that sums each token's two terms
+        skinny_fp4(2 * T, N, K, aq_, asf_, l.w, l.sf, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_, T);
       } else {
         skinny_fp4(T, N, K, aq_, asf_, l.w, l.sf, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_);
         skinny_fp4(T, N, K, q1, sf1, l.w, l.sf, l.alpha, out, 1.f, out, skinny_ws_, kSkinnyWsBytes, s_);

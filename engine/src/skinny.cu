@@ -45,7 +45,17 @@ struct Params {
   int ext_reduce;       // split-K partials summed by skinny_reduce_kernel (the next launch), not the last CTA
   float* part;          // [splits][8][N]
   int* counters;        // [N / 128], zero between calls
+  int x2;               // > 0: W4A4x2, M = 2 x2 rows (token t + x2: the second term of token t); d is [x2][N] and
+                        // d[t] = c[t] + alpha * acc[t] + alpha * acc[t + x2] (c: the residual, beta 1)
 };
+
+// The output of a W4A4x2 token: (c + alpha v0) + alpha v1, each step rounded (as the separate sum of the two
+// terms' outputs was, so the rows equal those of every other path).
+__device__ __forceinline__ void x2_store(const Params& p, float al, int row, int tok, float v0, float v1) {
+  const int64_t i = int64_t(tok) * p.N + row;
+  const float a = __fmul_rn(al, v0), b = __fmul_rn(al, v1);
+  p.d[i] = __fadd_rn(p.c ? __fadd_rn(p.c[i], a) : a, b);
+}
 
 __device__ __forceinline__ uint32_t ld_cached(const uint8_t* p) {
   return __ldg(reinterpret_cast<const uint32_t*>(p));
@@ -335,7 +345,16 @@ __global__ void __launch_bounds__(kWarps * 32) skinny_kernel(Params p) {
     if (p.c) out += p.beta * p.c[i];
     p.d[i] = out;
   };
-  if (p.splits == 1) {
+  if (p.splits == 1 && p.x2 == 1) {  // tokens 0 and 1 are j and j + 1 of lane t = 0
+    if (t == 0)
+#pragma unroll
+      for (int j = 0; j < 4; j += 2) {
+        const int row = row0 + (j / 2) * 8;
+        x2_store(p, alpha_of(p.alpha, row), row, 0, acc[0][j], acc[0][j + 1]);
+      }
+    return;
+  }
+  if (p.splits == 1 && !p.x2) {
 #pragma unroll
     for (int gi = 0; gi < kG; gi++)
 #pragma unroll
@@ -405,20 +424,28 @@ __global__ void __launch_bounds__(kWarps * 32) skinny_kernel(Params p) {
       }
     }
   } else {
-    for (int i = threadIdx.x; i < kRowsPerCta * p.M; i += blockDim.x) {
+    const int outs = p.x2 ? p.x2 : p.M;  // (W4A4x2: a token's two terms summed by the same thread)
+    for (int i = threadIdx.x; i < kRowsPerCta * outs; i += blockDim.x) {
       int row = tile * kRowsPerCta + i % kRowsPerCta, tok = i / kRowsPerCta;
-      const float* src = p.part + int64_t(tok) * p.N + row;
       const int64_t stride = int64_t(p.M) * p.N;
-      float v = 0.f;
-      for (int sp0 = 0; sp0 < p.splits; sp0 += 8) {
-        float x[8];
+      float v[2] = {0.f, 0.f};
 #pragma unroll
-        for (int u = 0; u < 8; u++) x[u] = sp0 + u < p.splits ? __ldcg(src + (sp0 + u) * stride) : 0.f;
+      for (int term = 0; term < 2; term++) {
+        if (term && !p.x2) break;
+        const float* src = p.part + int64_t(tok + term * p.x2) * p.N + row;
+        for (int sp0 = 0; sp0 < p.splits; sp0 += 8) {
+          float x[8];
 #pragma unroll
-        for (int u = 0; u < 8; u++)
-          if (sp0 + u < p.splits) v += x[u];
+          for (int u = 0; u < 8; u++) x[u] = sp0 + u < p.splits ? __ldcg(src + (sp0 + u) * stride) : 0.f;
+#pragma unroll
+          for (int u = 0; u < 8; u++)
+            if (sp0 + u < p.splits) v[term] += x[u];
+        }
       }
-      epilogue(row, tok, v);
+      if (p.x2)
+        x2_store(p, alpha_of(p.alpha, row), row, tok, v[0], v[1]);
+      else
+        epilogue(row, tok, v[0]);
     }
   }
   if (threadIdx.x == 0) p.counters[tile] = 0;
@@ -434,21 +461,31 @@ int g_sms = 0;
 __global__ void __launch_bounds__(256) skinny_reduce_kernel(Params p) {
   pdl_trigger();
   const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t n4 = int64_t(p.M) * p.N / 4;
+  const int64_t n4 = int64_t(p.x2 ? p.x2 : p.M) * p.N / 4;
   pdl_wait();
   if (i >= n4) return;
   const int tok = int(i * 4 / p.N), row = int(i * 4 % p.N);
   const int64_t o = int64_t(tok) * p.N + row, stride = int64_t(p.M) * p.N;
+  auto sum = [&](int64_t at, float* v) {
+    for (int sp0 = 0; sp0 < p.splits; sp0 += 8) {
+      float4 x[8];
+#pragma unroll
+      for (int u = 0; u < 8; u++)
+        x[u] = sp0 + u < p.splits ? __ldcg(reinterpret_cast<const float4*>(p.part + (sp0 + u) * stride + at))
+                                  : make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+      for (int u = 0; u < 8; u++)
+        if (sp0 + u < p.splits) v[0] += x[u].x, v[1] += x[u].y, v[2] += x[u].z, v[3] += x[u].w;
+    }
+  };
   float v[4] = {0.f, 0.f, 0.f, 0.f};
-  for (int sp0 = 0; sp0 < p.splits; sp0 += 8) {
-    float4 x[8];
+  sum(o, v);
+  if (p.x2) {  // W4A4x2: the second term of token tok is token tok + x2
+    float v1[4] = {0.f, 0.f, 0.f, 0.f};
+    sum(o + int64_t(p.x2) * p.N, v1);
 #pragma unroll
-    for (int u = 0; u < 8; u++)
-      x[u] = sp0 + u < p.splits ? __ldcg(reinterpret_cast<const float4*>(p.part + (sp0 + u) * stride + o))
-                                : make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll
-    for (int u = 0; u < 8; u++)
-      if (sp0 + u < p.splits) v[0] += x[u].x, v[1] += x[u].y, v[2] += x[u].z, v[3] += x[u].w;
+    for (int e = 0; e < 4; e++) x2_store(p, alpha_of(p.alpha, row + e), row + e, tok, v[e], v1[e]);
+    return;
   }
 #pragma unroll
   for (int e = 0; e < 4; e++) {
@@ -462,7 +499,7 @@ __global__ void __launch_bounds__(256) skinny_reduce_kernel(Params p) {
 template <Fmt kFmt>
 void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
             const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
-            cudaStream_t s, const float* wscale = nullptr, const float* ascale = nullptr) {
+            cudaStream_t s, const float* wscale = nullptr, const float* ascale = nullptr, int x2 = 0) {
   Q27_CHECK(M >= 1 && M <= kMaxTokens, "skinny gemm: M must be 1..64");
   Q27_CHECK(N % kRowsPerCta == 0, "skinny gemm: N must be a multiple of 128");
   constexpr bool kFp4 = kFmt == Fmt::kFp4;
@@ -511,14 +548,18 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
   // Fixed-size counter area: every shape must see zeroed counters, whatever ran before it.
   constexpr size_t cnt_bytes = kMaxTiles * 4;
   Q27_CHECK(tiles <= kMaxTiles, "skinny gemm: N too large");
-  if (splits > 1)
+  Q27_CHECK(!x2 || (M == 2 * x2 && !wscale && (!c || beta == 1.f)), "skinny gemm: W4A4x2 needs M = 2 x2, residual beta 1");
+  if (splits > 1 || x2 > 1)
     Q27_CHECK(cnt_bytes + size_t(splits) * M * N * 4 <= ws_bytes, "skinny gemm: workspace too small");
   p.a = a, p.a_sf = a_sf, p.w = w, p.w_sf = w_sf, p.alpha = alpha, p.c = c, p.beta = beta, p.d = d;
   p.wscale = wscale, p.ascale = ascale;
   // Split-K sums in their own kernel above Q27_SKINNY_EXT_REDUCE_M rows (default 1: every verify and batched
   // step; P7-4. At M = 1 the last CTA is faster: decode 11.47 vs 11.74 ms).
   const char* e_ext = getenv("Q27_SKINNY_EXT_REDUCE_M");
-  p.ext_reduce = splits > 1 && M > (e_ext ? atoi(e_ext) : 1);
+  // (W4A4x2: decided by the tokens, x2, as for a one-term call of x2 rows; with one split and more than one token
+  // the partials go through the reduce kernel, which sums the two terms of a token)
+  p.x2 = x2;
+  p.ext_reduce = (splits > 1 && (x2 ? x2 : M) > (e_ext ? atoi(e_ext) : 1)) || (x2 > 1 && splits == 1);
   p.counters = static_cast<int*>(ws);
   p.part = reinterpret_cast<float*>(static_cast<uint8_t*>(ws) + cnt_bytes);
   const dim3 grid(tiles, splits), block(kWarps * 32);
@@ -544,8 +585,8 @@ void launch(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const ui
 
 void skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                 const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
-                cudaStream_t s) {
-  launch<Fmt::kFp4>(M, N, K, a, a_sf, w, w_sf, alpha, c, beta, d, ws, ws_bytes, s);
+                cudaStream_t s, int x2) {
+  launch<Fmt::kFp4>(M, N, K, a, a_sf, w, w_sf, alpha, c, beta, d, ws, ws_bytes, s, nullptr, nullptr, x2);
 }
 
 void skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, const AlphaSegments& alpha, const float* c,

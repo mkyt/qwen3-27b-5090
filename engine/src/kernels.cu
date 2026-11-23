@@ -116,10 +116,21 @@ __device__ void quant_block16(const float* v, float input_scale, int m, int kb, 
 
 // The same block in two terms (W4A4x2): the first exactly as quant_block16, then the quantization of what it left
 // (same global scale) as row m + row2 (skinny_a4x2.cu's quant_fp4x2 arithmetic).
+// The values of two e2m1 codes (low nibble: .x), exact in f16 (hardware conversion: a table in constant memory
+// serializes when a warp's codes differ).
+__device__ __forceinline__ float2 e2m1x2_to_float2(uint8_t codes) {
+  uint32_t r;
+  asm("{ .reg .b8 lo;\n  cvt.u8.u16 lo, %1;\n  cvt.rn.f16x2.e2m1x2 %0, lo; }\n" : "=r"(r) : "h"(uint16_t(codes)));
+  return __half22float2(*reinterpret_cast<const __half2*>(&r));
+}
+
 __device__ void quant_block16_x2(const float* in, float input_scale, int m, int kb, int K, uint8_t* q, uint8_t* sf,
                                  int row2) {
   const int kblocks = K / 16;
   const float gs = 1.f / input_scale;
+  // What the first term leaves is v - c * sff / gs: the division by gs (the same for every element) as a multiply
+  // by its reciprocal and one FMA correction (Markstein), the correctly rounded quotient without 16 divisions.
+  const float rgs = __frcp_rn(gs);
   float v[16];
 #pragma unroll
   for (int j = 0; j < 16; j++) v[j] = in[j];
@@ -137,8 +148,13 @@ __device__ void quant_block16_x2(const float* in, float input_scale, int m, int 
       const uint8_t codes = cvt_e2m1x2(v[2 * j] * inv, v[2 * j + 1] * inv);
       packed[j / 4] |= uint32_t(codes) << (8 * (j % 4));
       if (term == 0) {
-        v[2 * j] -= kE2m1Values[codes & 15] * sff / gs;
-        v[2 * j + 1] -= kE2m1Values[codes >> 4] * sff / gs;
+        const float2 c = e2m1x2_to_float2(codes);
+        const float n0 = c.x * sff, n1 = c.y * sff;  // (exact: e2m1 times e4m3)
+        float q0 = n0 * rgs, q1 = n1 * rgs;
+        q0 = __fmaf_rn(__fmaf_rn(-q0, gs, n0), rgs, q0);
+        q1 = __fmaf_rn(__fmaf_rn(-q1, gs, n1), rgs, q1);
+        v[2 * j] -= q0;
+        v[2 * j + 1] -= q1;
       }
     }
     const int64_t row = m + (term ? row2 : 0);
@@ -382,15 +398,6 @@ __global__ void silu_mul_quant_fp4_kernel(const E* gate, const E* up, int64_t ld
     quant_block16(g, input_scale, t, kb, I, q, sf);
 }
 
-// out[t][n] = y[t][n] + y[T + t][n] (+ out[t][n]): the two terms of a W4A4x2 GEMM.
-__global__ void add_x2_terms_kernel(const float4* y, int64_t n4, float4* out, bool residual) {
-  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= n4) return;
-  const float4 a = y[i], b = y[i + n4];
-  float4 r = residual ? out[i] : make_float4(0.f, 0.f, 0.f, 0.f);
-  r.x = r.x + a.x + b.x, r.y = r.y + a.y + b.y, r.z = r.z + a.z + b.z, r.w = r.w + a.w + b.w;
-  out[i] = r;
-}
 
 __global__ void quant_fp8_kernel(const float* x, int64_t n, float s, uint8_t* q) {
   int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -821,15 +828,6 @@ void silu_mul_quant_fp4_glu(const float* gu, int T, int I, float alpha_gate, flo
 void silu_mul_quant_fp4_glu(const bf16* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
                             uint8_t* q, uint8_t* sf, cudaStream_t s, int row2) {
   silu_mul_quant_fp4_glu_impl(gu, T, I, alpha_gate, alpha_up, input_scale, q, sf, s, row2);
-}
-
-void add_x2_terms(const float* y, int T, int N, float* out, bool residual, cudaStream_t s) {
-  Q27_CHECK(N % 4 == 0, "add_x2_terms: N must be a multiple of 4");
-  const int64_t n4 = int64_t(T) * N / 4;
-  if (n4 == 0) return;
-  add_x2_terms_kernel<<<blocks(n4), kThreads, 0, s>>>(reinterpret_cast<const float4*>(y), n4,
-                                                      reinterpret_cast<float4*>(out), residual);
-  Q27_CUDA(cudaGetLastError());
 }
 
 bool linear_bf16_pair_norm_ok(int T) {

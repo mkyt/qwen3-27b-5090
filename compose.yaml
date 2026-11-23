@@ -102,7 +102,7 @@ services:
       Q27_ATTN_FP4_STAGE: ${Q27_ATTN_FP4_STAGE:-1} # NVFP4 KV prefill: V (mode 3) rounded to E4M3 once per call (P7-8; 1 KiB/token; 0 = per CTA, mode 2)
       Q27_ATTN_TC_F8: ${Q27_ATTN_TC_F8:-}          # decode / verify attention MMAs: empty / 1 = FP8 with FP8 and NVFP4 KV (P7-7), 0 = BF16 / f16
       Q27_LM_HEAD_A4X2: ${Q27_LM_HEAD_A4X2:-}      # NVFP4 lm_head: empty / 1 = two-term NVFP4 activations (W4A4x2: as good as BF16 activations there, same speed and memory), 0 = one (W4A4)
-      Q27_ACT_A4X2: ${Q27_ACT_A4X2:-}              # quality mode: 1 = two-term NVFP4 activations into every NVFP4 layer (closer to BF16, prefill about -40%, decode -5%), 2 = decode / verify only (prefill unchanged); empty / 0 = one term
+      Q27_ACT_A4X2: ${Q27_ACT_A4X2:-}              # quality mode: 1 = two-term NVFP4 activations into every NVFP4 layer (closer to BF16, prefill about -40%, decode -1 to -4%), 2 = decode / verify only (prefill unchanged); empty / 0 = one term
       Q27_NVDEC_WAKE: ${Q27_NVDEC_WAKE:-}          # video decoding: empty = on WSL2, wake the idle GPU before a decode (NVDEC can hang from P8 there); 0 never, 1 always
       Q27_MLP_FUSED: ${Q27_MLP_FUSED:-1}           # prefill MLP: 1 = gate | up, silu * up and its NVFP4 quantization in one GEMM (gemm_mma.cu); 0 = BF16 gate | up, then the silu step
     healthcheck:

@@ -505,7 +505,6 @@ class Model {
   bool act_a4x2_ = false;   // Q27_ACT_A4X2: two-term NVFP4 activations into every NVFP4 layer GEMM (quality mode)
   bool act_a4x2_small_ = false;  // Q27_ACT_A4X2=2: only the skinny (decode / verify) GEMMs
   mutable int a2_row_ = 0;  // the x2_row of the activation last quantized into aq_ (0: one term)
-  float* x2y_ = nullptr;    // [2 kSkinnyMaxM / 2 .. ][N]: the two terms' outputs of a one-call skinny W4A4x2 GEMM
   bool head_a4x2_ = true;  // Q27_LM_HEAD_A4X2: two-term NVFP4 activations into the NVFP4 lm_head (logits)
   // Decode step as a CUDA graph (Q27_NO_GRAPH=1: eager). Not used while profiling.
   bool graphs_ = true, graph_warm_ = false;
