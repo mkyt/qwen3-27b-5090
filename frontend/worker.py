@@ -622,7 +622,7 @@ class Scheduler:
                 """The image's pixels, or the video's frames from its pair g on."""
                 nonlocal waited
                 t1, f = time.time(), s.decoding.pop(key, None)
-                loan = -1
+                loan, lost = -1, False
                 try:
                     if f is not None and f.first_pair <= g:  # (prefetched from its first pair past the prefix)
                         out = f.result()
@@ -631,12 +631,16 @@ class Scheduler:
                         f.cancel()
                     sessions, loan = self.lend(s, key, g)
                     return self.decode(s, key, sessions, g)
-                except Exception as e:  # noqa: BLE001 - any decoder error is the client's
+                except Exception as e:  # noqa: BLE001 - any decoder error is the client's, but a lost CUDA context
+                    if getattr(e, "device_lost", False):  # (videoproc.DeviceLost: the process ends, the server's 503)
+                        lost = True
+                        raise
                     raise ImageError(f"cannot decode {'video' if isinstance(key, tuple) else 'image'}: {e}") from e
                 finally:
-                    if loan >= 0:
-                        self.engine.kv_unlend(loan)
-                    self.unlend()
+                    if not lost:  # (on a dead context the return would fail and hide the decode's error)
+                        if loan >= 0:
+                            self.engine.kv_unlend(loan)
+                        self.unlend()
                     waited += time.time() - t1
 
             i, frames = 0, {}

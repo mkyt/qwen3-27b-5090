@@ -419,6 +419,16 @@ gate without an explicit decision, recorded below with its numbers.
   CUDA's virtual memory management (available on WSL2 and on native Windows), and the server lends the blocks below
   the parking areas for the decode's duration: unmapping 1 GiB takes 3 to 7 ms in 32 MiB chunks, does not wait for
   running kernels, and gives the memory back to the device (NVML used drops by as much).
+- **Under WSL2, the GPU is woken before a video decode** (2026-11, driver 621.01, RTX 5090). The video tests
+  sometimes ended in "illegal memory access": a job on the GPU had stopped for 2 s, with the GPU and the decoder at
+  0% utilization, and Windows had reset the engine. It also happened with no other decoder on the GPU. All four
+  traced failures were decodes in P8. Replaying one failing process's 26 decode calls (the same inputs) failed in 2
+  of 4 runs with the original pauses between the calls, in none of 30 without the pauses (the GPU stays in P1), and
+  in none of 12 with the pauses and the wake-up. The cause inside the driver is not known, so this avoids the
+  condition rather than repairing it. Destroying the decoder before its stream and synchronizing after the unmap
+  did not help. A burst of kernels raises P1 only after about 0.2 s of work and, when it was light, held it for
+  0.5 s; a context created and destroyed takes 0.1 s and holds it for 6 s. Native Windows and Linux were not seen
+  to fail and are left alone.
 
 ## Weights
 

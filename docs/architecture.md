@@ -424,6 +424,12 @@ over the temporal patch instead of one image twice; attention, position embeddin
   resized on the GPU in one pass per axis, PIL's bicubic bit for bit (fixed-point weights computed as
   `libImaging/Resample.c` does). Only the resized frames (at most 75 MB for a video) go to host memory, for the
   vision tower's input path.
+- Under WSL2 a decode first wakes the GPU (`wake_gpu`): a CUDA context created and destroyed at once raises it to
+  P1 for about 6 s, without a clock or power setting. It costs about 0.1 s and, for that long, 0.5 GiB of device
+  memory, at most once in 2 s (`Q27_NVDEC_WAKE`; not part of the decode times below). Without it a decode starting
+  in P8 could hang until Windows reset the engine (TDR), and the process lost its CUDA context. A decode that loses
+  the context all the same returns -4 (`videoproc.DeviceLost`): the engine process exits, the request gets HTTP 503
+  (not the 400 of a broken video) and the server starts a new engine.
 - One decoding session keeps one NVDEC engine busy (the RTX 5090 has two): a video of 256 frames or more is cut at
   closed key frames (IDR / BLA, not CRA) into one part per engine, decoded at once; a part that shows another number
   of frames than its samples (an open GOP after all) makes the video decode again in one part. 60 s at 30 fps,

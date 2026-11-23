@@ -10,12 +10,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 
 #include "common.h"
 #include "third_party/nvcodec/dynlink_nvcuvid.h"
@@ -96,6 +99,57 @@ cudaVideoCodec codec_of(VideoCodec c) {
 
 double now_ms() {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// WSL2 (driver 621.01, RTX 5090): an NVDEC decode that starts on a GPU idled down to P8 can hang until Windows
+// resets the engine after 2 s (TDR), and the process's CUDA context is lost with it. The same calls on a GPU in P1
+// did not. Creating a CUDA context raises the GPU to P1 for about 6 s (no clock or power setting is touched), so a
+// decode is preceded by one, destroyed at once: about 0.1 s, and 0.5 GiB of device memory for that long. If it
+// cannot be created the decode runs without. Q27_NVDEC_WAKE=0 / 1: never / also outside WSL2.
+void wake_gpu() {
+  struct Api {  // (through the runtime: no link to the driver library, as in memory.cc)
+    decltype(&cuCtxCreate) create = nullptr;
+    decltype(&cuCtxDestroy) destroy = nullptr;
+    decltype(&cuCtxGetCurrent) get_current = nullptr;
+    decltype(&cuCtxSetCurrent) set_current = nullptr;
+  };
+  static const bool on = [] {
+    if (const char* e = std::getenv("Q27_NVDEC_WAKE"); e && *e) return std::atoi(e) != 0;
+#ifdef _WIN32
+    return false;
+#else
+    std::error_code ec;
+    return std::filesystem::exists("/dev/dxg", ec);  // (WSL2)
+#endif
+  }();
+  if (!on) return;
+  static const Api cu = [] {
+    Api a;
+    auto get = [](const char* name, auto& fn) {
+      void* f = nullptr;
+      cudaDriverEntryPointQueryResult q;
+      if (cudaGetDriverEntryPointByVersion(name, &f, CUDA_VERSION, cudaEnableDefault, &q) != cudaSuccess ||
+          q != cudaDriverEntryPointSuccess)
+        f = nullptr;
+      fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(f);
+    };
+    get("cuCtxCreate", a.create), get("cuCtxDestroy", a.destroy);
+    get("cuCtxGetCurrent", a.get_current), get("cuCtxSetCurrent", a.set_current);
+    return a;
+  }();
+  if (!cu.create || !cu.destroy || !cu.get_current || !cu.set_current) return;
+  constexpr double kHoldMs = 2000;  // (of the 6 s: the rest is for the decode that follows)
+  static std::mutex mu;
+  static double last = -kHoldMs;
+  std::lock_guard<std::mutex> lk(mu);  // (decodes that start together share one)
+  if (now_ms() - last < kHoldMs) return;
+  CUcontext prev = nullptr, c = nullptr;
+  if (cu.get_current(&prev) != CUDA_SUCCESS) return;
+  if (cu.create(&c, nullptr, 0, 0) == CUDA_SUCCESS) {
+    cu.destroy(c);
+    last = now_ms();
+  }
+  cu.set_current(prev);
 }
 
 // A part's frames were not where a closed key frame puts them (an open GOP after all): decode it whole.
@@ -731,6 +785,7 @@ VideoDecodeStats video_frames(const uint8_t* data, size_t n, const std::vector<i
                               uint8_t* out, int sessions) {
   const VideoTrack track = video_demux(data, n);
   Q27_CUDA(cudaSetDevice(0));
+  wake_gpu();
   cudaStream_t xs;  // (the allocations, stream-ordered: no device-wide synchronization)
   Q27_CUDA(cudaStreamCreateWithFlags(&xs, cudaStreamNonBlocking));
   std::unique_ptr<Resize> rs;

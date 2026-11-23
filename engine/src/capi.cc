@@ -37,6 +37,19 @@ int guard(F&& f) {
 
 float g_last_us = 0.f;
 
+// Whether the process's CUDA context is lost: after a fault, or a reset of a GPU engine by the driver (a job that
+// hung), every call returns the sticky error, the creation of a stream too. (No device or driver: nothing to lose.)
+bool cuda_lost() {
+  cudaStream_t s;
+  cudaError_t e = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+  if (e == cudaSuccess) {
+    e = cudaStreamSynchronize(s);
+    cudaStreamDestroy(s);
+  }
+  return e != cudaSuccess && e != cudaErrorNoDevice && e != cudaErrorInsufficientDriver &&
+         e != cudaErrorInitializationError && e != cudaErrorStartupFailure && e != cudaErrorMemoryAllocation;
+}
+
 VisionPixels rgb_pixels(const uint8_t* rgb, const float* norm) {
   VisionPixels px;
   px.rgb = rgb;
@@ -453,14 +466,16 @@ int q27_video_memory(const uint8_t* data, int64_t n, int out_w, int out_h, int s
 // Frames want[n_want] (ascending) of a video, decoded on NVDEC and resized on the GPU to out_w x out_h (0: their
 // size; PIL's bicubic), as RGB [h][w][3] uint8 into out (host), one after another. sessions: parallel decoders
 // (0: one per NVDEC engine). stats [5] = frames presented, pictures decoded, sessions, setup ms, total ms.
+// -4: the decode failed and took the CUDA context with it; only a new process can use the GPU again.
 int q27_video_frames(const uint8_t* data, int64_t n, const int32_t* want, int n_want, int out_w, int out_h, int sessions,
                      uint8_t* out, double* stats) {
-  return guard([&] {
+  const int rc = guard([&] {
     const VideoDecodeStats st = video_frames(data, size_t(n), std::vector<int>(want, want + n_want), out_w, out_h, out,
                                              sessions);
     const double v[5] = {double(st.presented), double(st.decoded), double(st.sessions), st.setup_ms, st.total_ms};
     std::memcpy(stats, v, sizeof v);
   });
+  return rc == -1 && cuda_lost() ? -4 : rc;
 }
 
 int q27_debug_kv(void* m, int layer, int pos, int n, void* out) {
