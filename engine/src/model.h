@@ -386,6 +386,15 @@ class Model {
   LaneRows blr_;                     // the rows of the lanes' blocks in the current step (their verify rows)
   LaneRows bdlr_;                    // their draft rows: blr_, or more in a cut step (P3-39)
   bool bvary_ = false;               // the lanes' rows may differ (DSpine, the FP8-MMA verify)
+  // Rows read on the device (P3-39, Q27_BATCH_DEV_ROWS): the batched kernels read blr_ / bdlr_ from b_lrd_ [2] (verify,
+  // draft), copied from the pinned b_lrh_ by the step itself (a memcpy node of its graph; stage_rows writes b_lrh_
+  // before each launch), so a graph runs any split of its shape (lanes, total rows, the longest lane's rows).
+  bool dev_rows_ = false;
+  LaneRows *b_lrh_ = nullptr, *b_lrd_ = nullptr;
+  void stage_rows();
+  LaneRows vrows() const;            // blr_ / bdlr_ as the kernels take them (with dev_rows_: their device copies)
+  LaneRows drows() const;
+  uint64_t bcaptures_ = 0;           // batched-step graphs captured (instantiated or updated)
   // Cut steps (P3-39, Q27_SPEC_CUT): the draft at the lanes' rows (batch_rows), then each lane verifies the prefix
   // that maximizes the expected tokens per ms (from the draft's table, dspine_conf_tokens; cut_rows).
   bool batch_cut_ = false;
@@ -415,6 +424,7 @@ class Model {
     LaneRows lr, lr2;  // the rows exec / exec2 were captured with (other rows: re-captured and updated in place)
     int tag = 0;       // 0: a whole step (or a masked one's two parts); a cut step's part: 1 the draft, 2 the rest
     LaneRows clr;      // (tag 2: the draft rows it was captured with)
+    int total = 0, longest = 0;  // its shape (the rows of the part: tag 1 the draft's, otherwise the verify's)
   };
   std::vector<BatchGraph> bgraphs_;
   struct LaneRef {  // the host state of a lane's sequence
@@ -509,7 +519,7 @@ class Model {
   static constexpr int kGraphCache = 4;
   // Batched steps: an entry per lanes, sampling and total rows (the launches depend on the total; the lanes' split of
   // it only changes arguments and grids, so a step of other rows updates the entry's graph in place).
-  static constexpr int kBatchGraphCache = 24;  // (cut steps: an entry per draft total and per verify total)
+  static constexpr int kBatchGraphCache = 48;  // (cut steps: an entry per shape of the draft and of the verify)
   struct CachedGraph {
     GraphKey key;
     SpecSampling smp;

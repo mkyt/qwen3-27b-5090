@@ -146,7 +146,10 @@ gate without an explicit decision, recorded below with its numbers.
   steps, while any function of the table (here the expected tokens, marginalized over the draws) keeps it, even
   chosen jointly over the lanes. A single request does not use it: cutting 16 rows to 8 saves about 1 ms (7%) and
   the host's decision costs 0.2 ms and the step could no longer be launched ahead. In-process against the rule alone, four / eight requests:
-  sampled +2.0% / +3.2%, greedy +5.6% / +5.6%; four requests at a 16K context: sampled +2.3%, greedy +1.7%. The
+  sampled +2.0% / +3.2%, greedy +5.6% / +5.6%; four requests at a 16K context: sampled +2.3%, greedy +1.7%. The split
+  changes in most cut steps, so the kernels read it from device memory instead of their arguments
+  (`Q27_BATCH_DEV_ROWS`): re-capturing and updating the graph cost 0.55 ms per new split, and with it gone four /
+  eight requests are another +0.5-2.0% faster (in-process, identical outputs). The
   table of candidates is computed exactly for the 15 x 16 x 16 (position, sender, candidate) triples instead of
   DSpine's reference tables over the whole vocabulary (0.76 GB), and the 0.5 GB codebook stays in host memory.
   At a 32K context (greedy, the same output for both drafts) DSpine stays ahead on code and JSON (1.21 and 1.28 times)

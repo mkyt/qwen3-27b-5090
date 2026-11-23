@@ -2,6 +2,7 @@
 // memory where noted); all launches go to `stream` and are asynchronous.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include <cuda_bf16.h>
@@ -19,7 +20,8 @@ constexpr size_t kv_row_bytes(KvType t) {
 
 // Batched speculative steps (P6-10): up to kMaxLanes sequences ("lanes") run one step together. Each lane verifies
 // its own block of 2..16 rows (DFlash2: 8): the compute row buffers hold the lanes' rows packed, lane z in
-// rows lr.row0[z] .. lr.row0[z + 1] - 1 (LaneRows, passed by value: a captured step has a fixed layout). The batched
+// rows lr.row0[z] .. lr.row0[z + 1] - 1 (LaneRows, passed by value; with dev set, the kernels read the layout from
+// that device copy instead, so a captured step runs any split of the same shape, see LaneRows::live). The batched
 // kernels take the lane from a grid dimension (or the row) and its scalars at strided offsets (pos + z, ...); what
 // differs per lane otherwise (states, page tables) comes as pointer arrays. What outlives a step (the anchor, the
 // commit path, the grammar masks) sits in per-lane slots of kLaneSlot rows, independent of the layout.
@@ -38,9 +40,25 @@ constexpr int batch_row_budget(int lanes) {
 #endif
 // (Device code reads row0 at constant indices only, by selects: a dynamic index into a kernel parameter goes through
 // the stack, which cost the batched attention kernel 9 us per call.)
-struct LaneRows {
+struct alignas(16) LaneRows {
   int n = 0;                          // lanes
   uint8_t row0[kMaxLanes + 1] = {};   // lane z: rows row0[z] .. row0[z + 1] - 1; row0[n] = the total
+  // (P3-39) The layout the kernels use, when set: a device copy (written before the step, e.g. by a memcpy node of
+  // the step's graph) of a LaneRows with the same lanes, total and longest lane as this one (the host's values
+  // still size the launches). Kernels read it once, by live(), into a local.
+  const LaneRows* dev = nullptr;
+#if defined(__CUDACC__)
+  __device__ LaneRows live() const {
+    if (!dev) return *this;
+    const int4 v = *reinterpret_cast<const int4*>(dev);  // (n, then row0 from byte 4)
+    LaneRows r;
+    r.n = v.x;
+    const uint32_t w[3] = {uint32_t(v.y), uint32_t(v.z), uint32_t(v.w)};
+    Q27_UNROLL
+    for (int j = 0; j <= kMaxLanes; j++) r.row0[j] = uint8_t(w[j / 4] >> (8 * (j % 4)));
+    return r;
+  }
+#endif
   static LaneRows one(int T) {  // (a single sequence: one lane of T rows)
     LaneRows r;
     r.n = 1;
@@ -86,13 +104,14 @@ struct LaneRows {
     for (int j = 1; j < kMaxLanes; j++) z += j < n && p >= row0[j] - j;
     return z;
   }
-  bool operator==(const LaneRows& o) const {
+  bool operator==(const LaneRows& o) const {  // (the layouts; dev is not compared)
     if (n != o.n) return false;
     for (int z = 0; z <= n; z++)
       if (row0[z] != o.row0[z]) return false;
     return true;
   }
 };
+static_assert(offsetof(LaneRows, row0) == 4 && kMaxLanes + 1 <= 12, "LaneRows::live reads n and row0 as one int4");
 struct SeqLanes {
   int n = 0;                                   // lanes (0: an unbatched call)
   const int32_t* pos = nullptr;                // [n] committed lengths

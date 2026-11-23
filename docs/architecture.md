@@ -219,7 +219,9 @@ below walks that table. A sequence verifies 16 rows while its tokens per step st
 the rows are packed, the kernels take each lane's first row and count, and every few steps (8) the engine moves one
 lane's rows at a time while that raises the step's expected tokens per ms, from each lane's tokens per step at
 the widths it ran (moving averages; untried widths extrapolated) and a model of the step time (about 11 + 0.18 per lane + 1.1 per 16 rows begun + 0.11 per row ms; the GEMMs step up
-every 16 rows). A new split of the rows updates the step's CUDA graph in place. After the draft, each lane may verify
+every 16 rows). The kernels read the split from device memory (`Q27_BATCH_DEV_ROWS`): the step's graph copies it
+from a host buffer the engine fills before each launch, and is cached per shape (requests, total rows, longest
+request's rows), so a new split runs in the same graph. After the draft, each lane may verify
 fewer rows than it drafted (`Q27_SPEC_CUT`): a small kernel turns each lane's table into its expected tokens at every
 width (a logistic accept model per position, on the largest probability and the entropy of the row, carried through
 the walk's distribution), the host picks the prefixes that maximize the expected tokens minus the recent tokens per ms

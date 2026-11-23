@@ -357,7 +357,7 @@ int q27_spec_set_draft_rows(void* m, int rows) {
   return guard([&] { static_cast<Model*>(m)->spec_set_draft_rows(rows); });
 }
 
-// Speculative counters since the last call: steps, lookup steps, tokens.
+// Speculative counters since the last call: steps, lookup steps, tokens, batched-step graphs captured (out[4]).
 int q27_spec_stats(void* m, int64_t* out) {
   return guard([&] { static_cast<Model*>(m)->spec_stats(out); });
 }

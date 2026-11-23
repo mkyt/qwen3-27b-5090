@@ -864,8 +864,9 @@ __global__ void __launch_bounds__(kPrepThreads) gdn_prep_kernel(const float* qkv
   if constexpr (kBatch) {
     ln = blockIdx.y;
     conv_state = lane_sel(sp.lconv, ln);
-    r0 = sp.lr.first(ln), pr0 = sp.prow0[ln], cp0 = int64_t(kLaneSlot) * ln;
-    if (T > 0) T = sp.lr.rows(ln);  // (0: a flush)
+    const LaneRows lr = sp.lr.live();
+    r0 = lr.first(ln), pr0 = sp.prow0[ln], cp0 = int64_t(kLaneSlot) * ln;
+    if (T > 0) T = lr.rows(ln);  // (0: a flush)
     qkv += r0 * ld, h += r0 * kHidden, po.q += r0 * kQ;
   }
   const int blk = blockIdx.x, tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
@@ -1108,7 +1109,7 @@ __global__ void __launch_bounds__(kRecWarps * 32) gdn_rec_kernel(RecIn in, int T
   int64_t r0 = 0, pr0 = 0, cp0 = 0;
   if constexpr (kBatch) {
     ln = blockIdx.y;
-    r0 = sp.lr.first(ln), pr0 = sp.prow0[ln], cp0 = int64_t(kLaneSlot) * ln;
+    r0 = sp.lr.live().first(ln), pr0 = sp.prow0[ln], cp0 = int64_t(kLaneSlot) * ln;
     in.q += r0 * kQ, z += r0 * ldz, out += r0 * kVHeads * kVDim;
     if (q8) q8 += r0 * kVHeads * kVDim;
   }

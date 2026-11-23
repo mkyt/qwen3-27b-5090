@@ -530,8 +530,9 @@ class Engine:
         self._check(lib().q27_mm_put(self.h, i, e.ctypes.data), "q27_mm_put")
 
     def spec_stats(self):
-        """Counters since the last call: {"steps", "lookup_steps", "tokens"}."""
-        out = (ctypes.c_int64 * 3)()
+        """Counters since the last call: {"steps", "lookup_steps", "tokens", "batch_captures"} (the last: graphs of
+        batched steps captured, new or updated)."""
+        out = (ctypes.c_int64 * 4)()
         self._check(lib().q27_spec_stats(self.h, out), "q27_spec_stats")
-        return {"steps": out[0], "lookup_steps": out[1], "tokens": out[2]}
+        return {"steps": out[0], "lookup_steps": out[1], "tokens": out[2], "batch_captures": out[3]}
 
