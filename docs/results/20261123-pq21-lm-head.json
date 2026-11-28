@@ -1,0 +1,292 @@
+{
+ "date": "2026-11-23",
+ "power_limit_w": 400,
+ "change": "the NVFP4 lm_head's activations in two NVFP4 terms (W4A4x2, the default; Q27_LM_HEAD_A4X2=0: one term)",
+ "prompts": "bench/golden/prompts.jsonl (13 prompts, 35,328 positions)",
+ "metric": "golden compare a b, position-weighted: top-1 agreement, mean KL(a || b) over a's top 20, share of positions with KL > 0.5",
+ "calibration_overlap": "code-cpp is mostly in the calibration text of gdnfp4's GPTQ (83.7% of code-cpp-4096 matches in 32-token runs); without_code_cpp leaves it out",
+ "golden": [
+  {
+   "a": "ref-gpu-kvfp8",
+   "b": "ref-gpu",
+   "positions": 35328,
+   "top1": 0.891,
+   "kl": 0.0359,
+   "kl_gt_0_5": 0.0015,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.8848,
+    "kl": 0.0375,
+    "kl_gt_0_5": 0.0016
+   },
+   "note": "noise floor, one-term lm_head"
+  },
+  {
+   "a": "engine nvidia, KV bf16, 1-term lm_head",
+   "b": "ref-gpu",
+   "positions": 35328,
+   "top1": 0.8916,
+   "kl": 0.0366,
+   "kl_gt_0_5": 0.0015
+  },
+  {
+   "a": "engine nvidia, KV bf16, 2-term lm_head",
+   "b": "reference nvidia, KV bf16, 2-term lm_head",
+   "positions": 35328,
+   "top1": 0.9083,
+   "kl": 0.0278,
+   "kl_gt_0_5": 0.0012,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.9032,
+    "kl": 0.029,
+    "kl_gt_0_5": 0.0013
+   }
+  },
+  {
+   "a": "ref-gpu (reference nvidia, 1-term lm_head)",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.8873,
+   "kl": 0.0361,
+   "kl_gt_0_5": 0.0023,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.8809,
+    "kl": 0.0377,
+    "kl_gt_0_5": 0.0025
+   }
+  },
+  {
+   "a": "reference nvidia, KV bf16, 2-term lm_head",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.8976,
+   "kl": 0.0322,
+   "kl_gt_0_5": 0.0022,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.8914,
+    "kl": 0.0334,
+    "kl_gt_0_5": 0.0023
+   }
+  },
+  {
+   "a": "engine gdnfp4, KV nvfp4, 1-term lm_head",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.8714,
+   "kl": 0.0467,
+   "kl_gt_0_5": 0.0061,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.8633,
+    "kl": 0.0488,
+    "kl_gt_0_5": 0.0066
+   }
+  },
+  {
+   "a": "engine gdnfp4, KV nvfp4, 2-term lm_head",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.8789,
+   "kl": 0.0426,
+   "kl_gt_0_5": 0.0055,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.8712,
+    "kl": 0.0445,
+    "kl_gt_0_5": 0.0059
+   }
+  },
+  {
+   "a": "engine nvidia, KV nvfp4, 1-term lm_head",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.8822,
+   "kl": 0.0383,
+   "kl_gt_0_5": 0.0026,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.8748,
+    "kl": 0.0392,
+    "kl_gt_0_5": 0.0026
+   }
+  },
+  {
+   "a": "engine nvidia, KV nvfp4, 2-term lm_head",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.8943,
+   "kl": 0.0343,
+   "kl_gt_0_5": 0.0023,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.888,
+    "kl": 0.0351,
+    "kl_gt_0_5": 0.0023
+   }
+  },
+  {
+   "a": "engine quasar (NVIDIA's lm_head), KV nvfp4, 1-term lm_head",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.8675,
+   "kl": 0.05,
+   "kl_gt_0_5": 0.0052,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.8593,
+    "kl": 0.052,
+    "kl_gt_0_5": 0.0051
+   }
+  },
+  {
+   "a": "engine quasar (NVIDIA's lm_head), KV nvfp4, 2-term lm_head",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.8768,
+   "kl": 0.0462,
+   "kl_gt_0_5": 0.0052,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.8695,
+    "kl": 0.0479,
+    "kl_gt_0_5": 0.0052
+   }
+  },
+  {
+   "a": "engine quasar (its lm_head quantized at load), KV nvfp4, 1-term lm_head",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.8643,
+   "kl": 0.0508,
+   "kl_gt_0_5": 0.0052,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.8553,
+    "kl": 0.0527,
+    "kl_gt_0_5": 0.0051
+   }
+  },
+  {
+   "a": "engine quasar (its lm_head quantized at load), KV nvfp4, 2-term lm_head",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.8731,
+   "kl": 0.0469,
+   "kl_gt_0_5": 0.005,
+   "without_code_cpp": {
+    "positions": 30592,
+    "top1": 0.8653,
+    "kl": 0.0485,
+    "kl_gt_0_5": 0.0051
+   }
+  },
+  {
+   "a": "engine unsloth, KV nvfp4 (FP8 lm_head)",
+   "b": "ref-gpu-bf16model",
+   "positions": 35328,
+   "top1": 0.9086,
+   "kl": 0.0259,
+   "kl_gt_0_5": 0.0014
+  }
+ ],
+ "perplexity": {
+  "metric": "teacher forcing on the true next token over the longest prompt of each text without code-cpp (24,573 positions); from top-20 recordings, so a token outside them counts with an upper bound of its probability",
+  "bf16": 7.1009,
+  "increase_over_bf16_percent": {
+   "gdnfp4, 1-term": 3.91,
+   "gdnfp4, 2-term": 3.2,
+   "nvidia, 1-term": 3.16,
+   "nvidia, 2-term": 2.65
+  }
+ },
+ "tasks": {
+  "configuration": "through the server, gdnfp4, KV nvfp4, the same build; one-term vs two-term lm_head",
+  "gsm8k_correct_of_300": [
+   284,
+   285
+  ],
+  "bfcl_correct_of_1000": [
+   894,
+   890
+  ],
+  "bfcl_note": "greedy; right in only one: 8 / 4, exact sign test p = 0.39",
+  "bfcl_percent": {
+   "simple": [
+    95.5,
+    95.2
+   ],
+   "multiple": [
+    97.0,
+    96.5
+   ],
+   "parallel": [
+    79.0,
+    78.5
+   ],
+   "parallel_multiple": [
+    80.0,
+    79.5
+   ]
+  },
+  "japanese_judge_0_100": {
+   "jsquad": [
+    100.0,
+    100.0
+   ],
+   "mt-ja-en": [
+    96.5,
+    96.8
+   ],
+   "mt-en-ja": [
+    91.0,
+    92.0
+   ],
+   "sum": [
+    98.8,
+    100.0
+   ]
+  },
+  "needle_190k_of_16": [
+   16,
+   16
+  ],
+  "needle_256k_of_64": [
+   58,
+   58
+  ],
+  "reasoning_loops_of_200": [
+   0,
+   0
+  ]
+ },
+ "cost": {
+  "kv_pool_tokens": [
+   601856,
+   601856
+  ],
+  "step_time_change_percent": {
+   "plain_128": 0.31,
+   "plain_16k": -0.35,
+   "one_json": 0.17,
+   "one_prose": 0.18,
+   "one_ja": 0.09,
+   "one_code_more_rows": 1.9,
+   "four_32_rows": 0.07,
+   "eight_64_rows": -0.01,
+   "eight_adaptive": 0.31
+  },
+  "prefill_16k_change_percent": -0.46,
+  "accepted_tokens_per_step_change_percent": {
+   "mean": 0.11,
+   "ci95": [
+    -1.14,
+    1.32
+   ],
+   "runs": "8 requests x 24 seeds x 200 steps"
+  }
+ },
+ "windows": "q27.dll built natively: both recordings (1-term, 2-term) identical to Linux at all 35,328 positions"
+}

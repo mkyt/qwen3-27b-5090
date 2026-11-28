@@ -130,9 +130,10 @@ def cases(args):
     return [(f"{pathlib.Path(v).stem}-{k}", v, q) for v in args.cases.split(",") for k, q in enumerate(QUESTIONS)]
 
 
-def chunked_head(ckpt, device="cuda", rows=8192):
+def chunked_head(ckpt, terms, device="cuda", rows=8192):
     """The reference's lm_head (Checkpoint.linear, fp32, activation quantization on) dequantized a block of vocab rows
-    at a time: the same numbers without the 20 GB of temporaries of a whole dequantization."""
+    at a time: the same numbers without the 20 GB of temporaries of a whole dequantization. `terms`: of an NVFP4
+    head's activations (Qwen38Reference.head_terms)."""
     import torch
 
     from qwen27b.quant import QLinear, dequant_nvfp4
@@ -148,7 +149,7 @@ def chunked_head(ckpt, device="cuda", rows=8192):
     for r in range(0, w.shape[0], rows):
         out[r:r + rows] = dequant_nvfp4(w[r:r + rows].to(device), scale[r:r + rows].to(device), s2).float()
     ins = c.get("lm_head.input_scale", device) if "lm_head.input_scale" in c else None
-    return QLinear("nvfp4", out, ins, True)
+    return QLinear("nvfp4", out, ins, True, act_terms=terms)
 
 
 def cmd_ref(args):
@@ -215,7 +216,7 @@ def cmd_ref(args):
     ref = Qwen38Reference(ckpt, "cuda", kv_dtype=args.kv_dtype)
     # (the head once, while the GPU is emptiest: its dequantization takes a temporary of over 10 GB)
     with torch.no_grad():
-        head = chunked_head(ckpt)
+        head = chunked_head(ckpt, ref.head_terms)
     torch.cuda.empty_cache()
     with gzip.open(args.out, "wt") as f:
         for name, ids, spans, grid, emb in prepared:

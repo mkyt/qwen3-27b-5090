@@ -403,9 +403,9 @@ __global__ void spec_accept_lanes_kernel(int32_t* ids, int32_t* anchor, const fl
   pdl_trigger();
   pdl_wait();
   if (threadIdx.x != 0) return;
-  const int z = blockIdx.x, r0 = al.lr.first(z);
+  const int z = blockIdx.x, r0 = al.lr.live().first(z);
   DraftChoice ch;
-  ch.cand = const_cast<int32_t*>(cand) + (r0 + 1) * kSpecSelK;
+  ch.cand = const_cast<int32_t*>(cand) + (al.clr.live().first(z) + 1) * kSpecSelK;
   ch.tree = trees + z;
   ch.src = const_cast<int32_t*>(src) + z;
   spec_accept_body(ids + r0, anchor + z, tv + r0 * ld, ti + r0 * ld, lane_sel(al.k, z), ld, ch, lane_sel(al.smp, z),
@@ -413,8 +413,9 @@ __global__ void spec_accept_lanes_kernel(int32_t* ids, int32_t* anchor, const fl
                    budget + z);
 }
 
-__global__ void spec_advance_lanes_kernel(LaneRows lr, int32_t* pos, const int32_t* ncommit, int32_t* par,
+__global__ void spec_advance_lanes_kernel(LaneRows lr_in, int32_t* pos, const int32_t* ncommit, int32_t* par,
                                           uint64_t* rng, int32_t* budget, int32_t* prow0) {
+  const LaneRows lr = lr_in.live();
   pdl_trigger();
   pdl_wait();
   const int z = threadIdx.x;
@@ -428,8 +429,9 @@ __global__ void spec_advance_lanes_kernel(LaneRows lr, int32_t* pos, const int32
 
 // The lanes' block ids (the anchor, then the mask id) and their verify rows' first id (the anchor) at the start of a
 // batched step.
-__global__ void lane_blocks_kernel(LaneRows lr, const int32_t* anchor, int mask_id, int32_t* block_ids,
+__global__ void lane_blocks_kernel(LaneRows lr_in, const int32_t* anchor, int mask_id, int32_t* block_ids,
                                    int32_t* ids) {
+  const LaneRows lr = lr_in.live();
   pdl_trigger();
   pdl_wait();
   const int t = threadIdx.x;
@@ -474,8 +476,9 @@ __global__ void spec_advance_kernel(int32_t* pos, const int32_t* ncommit, int32_
 }
 
 // Block (r, z): row r of lane z (node r of trees[z]).
-__global__ void __launch_bounds__(32) penalize_rows_kernel(float* tv, int32_t* ti, int ld, LaneRows lr, PenaltyLanes pl,
+__global__ void __launch_bounds__(32) penalize_rows_kernel(float* tv, int32_t* ti, int ld, LaneRows lr_in, PenaltyLanes pl,
                                                            const SpecTree* trees, float* raw_v, int32_t* raw_i) {
+  const LaneRows lr = lr_in.live();
   pdl_trigger();
   pdl_wait();
   const int r = blockIdx.x, z = blockIdx.y, lane = threadIdx.x;
@@ -514,7 +517,8 @@ __global__ void count_out_kernel(uint32_t* counts, const SpecOut* so, int delta)
   if (int(threadIdx.x) < so->n) atomicAdd(counts + so->tok[threadIdx.x], uint32_t(delta));
 }
 
-__global__ void mask_logits_kernel(float* logits, int V, const uint32_t* mask, int words, LaneRows lr, uint32_t lanes) {
+__global__ void mask_logits_kernel(float* logits, int V, const uint32_t* mask, int words, LaneRows lr_in, uint32_t lanes) {
+  const LaneRows lr = lr_in.live();
   pdl_trigger();
   pdl_wait();
   const int row = blockIdx.y;
@@ -525,7 +529,8 @@ __global__ void mask_logits_kernel(float* logits, int V, const uint32_t* mask, i
     if (!(m[t >> 5] >> (t & 31) & 1u)) x[t] = -INFINITY;
 }
 
-__global__ void bias_logits_kernel(float* logits, int V, BiasLanes bl, LaneRows lr) {
+__global__ void bias_logits_kernel(float* logits, int V, BiasLanes bl, LaneRows lr_in) {
+  const LaneRows lr = lr_in.live();
   pdl_trigger();
   pdl_wait();
   const int z = lr.lane(blockIdx.x);
@@ -566,10 +571,11 @@ __global__ void __launch_bounds__(kThreads) sample_logprobs_kernel(const float* 
 
 // Block (i, z): output token i of lane z (see spec_logprobs).
 __global__ void __launch_bounds__(kThreads) spec_logprobs_kernel(const float* logits, int V, const float* tv,
-                                                                 const int32_t* ti, int ld, LaneRows lr, LogprobLanes ln,
+                                                                 const int32_t* ti, int ld, LaneRows lr_in, LogprobLanes ln,
                                                                  const SpecTree* trees, const int32_t* cpath,
                                                                  const int32_t* ncommit, const int32_t* ids,
                                                                  Logprobs* out, const int32_t* par) {
+  const LaneRows lr = lr_in.live();
   pdl_trigger();
   pdl_wait();
   const int i = blockIdx.x, z = blockIdx.y, n = lane_sel(ln.n, z);
@@ -703,6 +709,37 @@ void lane_blocks(const LaneRows& lr, const int32_t* anchor, int mask_id, int32_t
                  cudaStream_t s) {
   Q27_CHECK(lr.total() <= kMaxBatchRows, "lane_blocks: too many rows");
   launch_pdl(lane_blocks_kernel, dim3(1), dim3(kMaxBatchRows), 0, s, lr, anchor, mask_id, block_ids, ids);
+  Q27_CUDA(cudaGetLastError());
+}
+
+// The verify rows of a cut step (P3-39): lane z's first vlr.rows(z) drafted rows, moved from its draft rows (dlr) to
+// its verify rows; a cut chain ends at its last verified node.
+__global__ void lane_cut_kernel(LaneRows dlr_in, LaneRows vlr_in, int32_t* ids, SpecTree* trees) {
+  const LaneRows dlr = dlr_in.live(), vlr = vlr_in.live();
+  pdl_trigger();
+  pdl_wait();
+  __shared__ int32_t sh[kMaxBatchRows];
+  const int t = threadIdx.x;
+  if (t < dlr.total()) sh[t] = ids[t];
+  __syncthreads();
+  if (t < vlr.total()) {
+    const int z = vlr.lane(t);
+    ids[t] = sh[dlr.first(z) + t - vlr.first(z)];
+  }
+  if (t < vlr.n) {
+    const int w = vlr.rows(t);
+    if (w < dlr.rows(t)) {
+      SpecTree& tr = trees[t];
+      tr.n = w;
+      tr.ndraws[w - 1] = 0;
+      tr.leaf[0] = int8_t(w - 1);
+    }
+  }
+}
+
+void lane_cut(const LaneRows& dlr, const LaneRows& vlr, int32_t* ids, SpecTree* trees, cudaStream_t s) {
+  Q27_CHECK(dlr.total() <= kMaxBatchRows && vlr.n == dlr.n, "lane_cut: out of range");
+  launch_pdl(lane_cut_kernel, dim3(1), dim3(kMaxBatchRows), 0, s, dlr, vlr, ids, trees);
   Q27_CUDA(cudaGetLastError());
 }
 

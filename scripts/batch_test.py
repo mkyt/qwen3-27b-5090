@@ -8,7 +8,8 @@ batch ends and starts again: replay of the pending commits, scalars back to the 
 its single steps and as a batched lane, so batched steps mix lanes of different rows. The widths of any lanes must
 fit the step's row budget (MAX_SEQS 8: 64 rows), or a lane's width is cut and its tokens differ.
 --rule (DSpine): the engine picks each lane's rows per step (Model::batch_rows); batched steps only, then each
-sequence's recorded rows are replayed alone, pinned per step, and must give the same tokens.
+sequence's recorded rows are replayed alone, pinned per step, and must give the same tokens. With Q27_SPEC_CUT=1 a lane
+may verify fewer rows than it drafted (cut steps): the replay drafts and verifies the recorded rows of each.
 
 kvfull: a small KV pool (KV_POOL_TOKENS, --max-tokens 2048): --seqs sequences in batched steps until the engine
 raises KvFull; the latest one is suspended to the prefix cache (seq_suspend) and the batch goes on. The others
@@ -139,7 +140,7 @@ def check_rule(eng, tok, args):
         new = eng.spec_step_lanes([where[i] for i in lanes])
         for z, (i, t) in enumerate(zip(lanes, new)):
             outs[i] += t
-            rows[i].append(eng.last_lane_block(z))
+            rows[i].append((eng.last_lane_block(z), eng.last_lane_draft(z)))
         steps += 1
     for i, a in where.items():
         if a is not None:
@@ -148,17 +149,22 @@ def check_rule(eng, tok, args):
     ok = True
     for i, (ids, smp, seed) in enumerate(cases):
         ref = [start(eng, ids, smp, seed)]
-        for w in rows[i]:
+        for w, d in rows[i]:
             eng.spec_set_block(None, w)
+            eng.spec_set_draft_rows(d if d > w else 0)
             ref += eng.spec_step(ahead=False)
+        eng.spec_set_draft_rows(0)
         eng.reset()
         diff = next((k for k, (a, b) in enumerate(zip(ref, outs[i])) if a != b), None)
         if diff is None and len(ref) != len(outs[i]):
             diff = min(len(ref), len(outs[i]))
         ok &= diff is None
-        hist = {w: rows[i].count(w) for w in sorted(set(rows[i]))}
-        changes = sum(a != b for a, b in zip(rows[i], rows[i][1:]))
+        ws = [w for w, _ in rows[i]]
+        hist = {w: ws.count(w) for w in sorted(set(ws))}
+        changes = sum(a != b for a, b in zip(ws, ws[1:]))
+        cuts = sum(d > w for w, d in rows[i])
         print(f"{'ok  ' if diff is None else 'FAIL'} {case_name(i)} {smp}: {len(outs[i])} tokens, rows {hist}, {changes} changes"
+              + (f", {cuts} cut" if cuts else "")
               + ("" if diff is None else f", differs at {diff}: {ref[diff:diff + 8]} vs {outs[i][diff:diff + 8]}"), flush=True)
     print(f"{steps} batched steps", flush=True)
     return ok

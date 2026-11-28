@@ -5,7 +5,8 @@ Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses (Codex), /v
 /v1/messages/count_tokens, /tokenize, /detokenize; GET /v1/models, /health, /metrics; GET / POST
 /admin/concurrency (the admission settings, P7-14); GET / POST /admin/engine (stop, start or restart the engine,
 with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); POST /admin/engine/idle (the unload when idle); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
-/ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py). Streaming everywhere (SSE), reasoning (`<think>`, returned as
+/ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py); GET /chat (a simple chat page on
+/v1/chat/completions). Streaming everywhere (SSE), reasoning (`<think>`, returned as
 `reasoning_content` / `reasoning`, or Anthropic thinking blocks), tool calls (qwen3_coder XML, streamed call by
 call), images and videos (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
 
@@ -20,6 +21,7 @@ Requests are cancelled when the client disconnects or a stop string matches.
 import argparse
 import base64
 import json
+import math
 import multiprocessing as mp
 import os
 import pathlib
@@ -54,6 +56,7 @@ SPEC_MARGIN = 16  # a verify block writes up to 16 positions past the committed 
 KEEPALIVE_S = 10.0
 DUMP_DIR = os.environ.get("API_DUMP_DIR")  # debug: write every POST body there
 UI_PAGE = ROOT / "frontend/ui/index.html"
+CHAT_PAGE = ROOT / "frontend/ui/chat.html"  # (the built-in chat page: GET /chat)
 GENERATE = ("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages")
 
 
@@ -107,7 +110,7 @@ class Images:
         self.path = path
         self.proc = ImageProcessor(path)
         self.max_pixels = max_pixels
-        self.max_tokens = max_tokens  # (IMAGE_TOKENS: the engine's embedding rows per request)
+        self.max_tokens = max_tokens  # (IMAGE_TOKENS: the engine's embedding rows, reused within a request)
         self._video = None
 
     @property
@@ -215,8 +218,9 @@ class Images:
             videos.append((raw, plan))
         if k != len(loaded):
             raise ApiError(400, f"{len(loaded)} images and videos for {k} pads in the prompt")
-        if (rows := sum(gh * gw for _, gh, gw in spans)) > self.max_tokens:
-            raise ApiError(400, f"the images and videos take {rows} tokens, more than IMAGE_TOKENS ({self.max_tokens}; "
+        # (any number of them: the engine's table holds the images near one prefill chunk at a time, worker.py mm_ready)
+        if (rows := max((gh * gw for _, gh, gw in spans), default=0)) > self.max_tokens:
+            raise ApiError(400, f"an image takes {rows} tokens, more than IMAGE_TOKENS ({self.max_tokens}; "
                                 "the server's setting)")
         return out, spans, srcs, videos
 
@@ -853,6 +857,19 @@ def sampling_of(body, top_k_key="top_k"):
     temp = body.get("temperature")
     top_p = body.get("top_p")
     top_k = body.get(top_k_key)
+    try:
+        temp = float(DEFAULTS["temperature"] if temp is None else temp)
+        top_p = float(DEFAULTS["top_p"] if top_p is None else top_p)
+        top_k = DEFAULTS["top_k"] if top_k is None else top_k
+        if isinstance(top_k, bool) or not isinstance(top_k, (int, float)) or top_k != int(top_k):
+            raise ValueError
+        top_k = int(top_k)
+    except (TypeError, ValueError, OverflowError):
+        raise ApiError(400, f"temperature and top_p: numbers are required; {top_k_key}: an integer") from None
+    if not math.isfinite(temp) or temp < 0:
+        raise ApiError(400, f"temperature: must be a finite number >= 0, got {temp:g}")
+    if not 0 <= top_p <= 1:  # (also NaN)
+        raise ApiError(400, f"top_p: must be in [0, 1], got {top_p:g}")
     extra = {}
     for key, lo, hi in (("min_p", 0.0, 1.0), ("presence_penalty", -2.0, 2.0), ("frequency_penalty", -2.0, 2.0)):
         v = body.get(key)
@@ -863,9 +880,29 @@ def sampling_of(body, top_k_key="top_k"):
         if not lo <= v <= hi:
             raise ApiError(400, f"{key}: must be in [{lo:g}, {hi:g}], got {v:g}")
         extra[key] = v
-    return {"temperature": float(DEFAULTS["temperature"] if temp is None else temp),
-            "top_k": int(DEFAULTS["top_k"] if top_k is None else top_k) if (top_k is None or top_k >= 0) else 0,
-            "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": body.get("seed"), **extra}
+    # (top_k < 0, or one that does not fit the engine's int: no top-k limit, as 0; the engine caps it at 64)
+    return {"temperature": temp, "top_k": top_k if 0 <= top_k < 1 << 30 else 0, "top_p": top_p,
+            "seed": seed_of(body), **extra}
+
+
+def seed_of(body):
+    """The request's seed: an integer or null (random.Random takes other types, or raises on them)."""
+    seed = body.get("seed")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ApiError(400, f"seed: an integer or null is required, got {seed!r:.40}")
+    return seed
+
+
+def token_ids_of(ids, vocab, what):
+    """Client token ids (a prompt, /detokenize): a list of integers in 0..vocab-1."""
+    if not isinstance(ids, list):
+        raise ApiError(400, f"{what}: a list of token ids is required")
+    for t in ids:
+        if isinstance(t, bool) or not isinstance(t, int):
+            raise ApiError(400, f"{what}: {t!r:.40} is not a token id")
+        if not 0 <= t < vocab:
+            raise ApiError(400, f"{what}: token id {t} is out of the vocabulary (0..{vocab - 1})")
+    return ids
 
 
 MAX_BIAS = 300  # (OpenAI's limit, kMaxBias)
@@ -967,6 +1004,28 @@ def stops_of(value):
     return [value] if isinstance(value, str) else [s for s in value if isinstance(s, str)]
 
 
+def origin_allowed(headers):
+    """Whether a POST may run: browsers send Origin with every cross-origin POST, and a form or text/plain POST of
+    another site's page is sent without a CORS preflight, so it would run (stop the engine, change settings, start
+    generations) although the page cannot read the answer. API clients (SDKs, curl, agents) send no Origin. Allowed:
+    no Origin, the server's own (the built-in UI; Host, or X-Forwarded-Host behind a reverse proxy) and those in
+    TRUSTED_ORIGINS (comma-separated, e.g. https://chat.example.internal; *: any)."""
+    origin = headers.get("Origin")
+    if origin is None:
+        return True
+    trusted = {o.strip().rstrip("/").lower() for o in os.environ.get("TRUSTED_ORIGINS", "").split(",") if o.strip()}
+    origin = origin.strip().rstrip("/").lower()
+    if "*" in trusted or origin in trusted:
+        return True
+    scheme, sep, hostport = origin.partition("://")
+    if not sep or scheme not in ("http", "https") or not hostport:
+        return False  # ("null": a sandboxed frame or a file)
+    default = ":443" if scheme == "https" else ":80"
+    own = {h.split(",")[0].strip().lower() for h in (headers.get("Host"), headers.get("X-Forwarded-Host")) if h}
+    norm = lambda h: h if ":" in h.rsplit("]", 1)[-1] else h + default  # noqa: E731 (an IPv6 host is in [])
+    return norm(hostport) in {norm(h) for h in own}
+
+
 class HTTPServer(ThreadingHTTPServer):
     # The default listen backlog of 5 refuses a burst of 6+ connections at once on Windows (llama-swap 502, issue #7).
     request_queue_size = 128
@@ -1054,8 +1113,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, self.engine_settings())
         elif path == "/version":
             self._json(200, {"version": "q27-phase6"})
-        elif path == "/ui":
-            body = UI_PAGE.read_bytes()
+        elif path in ("/ui", "/chat"):
+            body = (UI_PAGE if path == "/ui" else CHAT_PAGE).read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1096,6 +1155,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if not origin_allowed(self.headers):
+            self.close_connection = True  # (the body is not read)
+            return self._error(403, "cross-origin request: a web page of another site cannot use this server "
+                                    "(TRUSTED_ORIGINS lists origins to allow)", "permission_error")
         try:
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or b"{}")
@@ -1253,7 +1316,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(prompt) != 1:
                 raise ApiError(400, "only one prompt per request is supported")
             prompt = prompt[0]
-        ids = prompt if isinstance(prompt, list) else self.srv.encode(prompt)
+        ids = token_ids_of(prompt, self.srv.vocab, "prompt") if isinstance(prompt, list) else self.srv.encode(prompt)
         if not ids:
             raise ApiError(400, "empty prompt")
         left = self.srv.limit(len(ids))
@@ -1580,7 +1643,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def detokenize(self, body):
         with self.srv.tok_lock:
-            text = self.srv.tok.decode(body.get("tokens") or [])
+            text = self.srv.tok.decode(token_ids_of(body.get("tokens") or [], self.srv.vocab, "tokens"))
         self._json(200, {"prompt": text})
 
 

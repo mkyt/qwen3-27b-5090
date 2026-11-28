@@ -1,6 +1,6 @@
 # Builds the Windows package (scripts/windows/package.ps1): qwen3-27b-5090-<version>-windows-x64.zip (v0.3.0 on a tag,
 # v0.3.0-3-g6767c0c on main after it), a workflow artifact from main when the code in it changes, and an asset of the
-# GitHub Release of a v* tag (with its SHA-256). The runner has no GPU: the engine compiles, the GPU tests are run
+# GitHub Release of a v* tag (with its SHA-256; a tagged commit's main push skips the build). The runner has no GPU: the engine compiles, the GPU tests are run
 # before tagging.
 name: windows
 
@@ -28,9 +28,29 @@ permissions:
 env:
   CUDA_VERSION: 13.3.1
   CUDA_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3
+  # MSVC toolset for nvcc: CUDA 13.3's cudafe++ crashes (0xC0000005) on MSVC 14.52 (the runner image of 2026-11-16,
+  # which keeps 14.29, 14.44 and 14.52), even on CMake's compiler-id test. 14.44 is Visual Studio 2022's last toolset.
+  # Used when the runner has it; otherwise the default toolset.
+  MSVC_TOOLSET: "14.44"
 
 jobs:
+  # A release pushes main and its v* tag together: the tag's run builds that commit (and also tags it latest), so
+  # the run of the main push skips it instead of building the same thing twice.
+  tagged:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      found: ${{ steps.check.outputs.found }}
+    steps:
+      - id: check
+        run: |
+          if git ls-remote --tags "https://github.com/${{ github.repository }}" "refs/tags/v*" | grep -q "^${GITHUB_SHA}"; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${GITHUB_SHA} has a v* tag: its tag run builds it"
+          fi
   package:
+    needs: tagged
+    if: ${{ !cancelled() && needs.tagged.outputs.found != 'true' }}
     runs-on: windows-2025
     steps:
       # (all the history and tags: git describe names the version)
@@ -64,12 +84,16 @@ jobs:
           $p = Start-Process $exe -Wait -PassThru -ArgumentList "-s", "nvcc_$v", "nvvm_$v", "cudart_$v", "crt_$v", "thrust_$v"
           if ($p.ExitCode) { throw "CUDA installer exit code $($p.ExitCode)" }
           & "$env:CUDA_DIR\bin\nvcc.exe" --version
-      # MSVC from the runner's Visual Studio (vcvars64.bat), CMake and Ninja from its PATH.
+      # MSVC from the runner's Visual Studio (vcvars64.bat, toolset MSVC_TOOLSET), CMake and Ninja from its PATH.
       - name: Build the package
         shell: cmd
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
-          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          echo MSVC toolsets: & dir /b "%VS%\VC\Tools\MSVC"
+          set "VCVER="
+          if exist "%VS%\VC\Tools\MSVC\%MSVC_TOOLSET%.*" set "VCVER=-vcvars_ver=%MSVC_TOOLSET%"
+          if not defined VCVER echo MSVC %MSVC_TOOLSET% not installed, using the default toolset
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" %VCVER% || exit /b 1
           set "CUDA_PATH=%CUDA_DIR%"
           set "CUDACXX=%CUDA_DIR%\bin\nvcc.exe"
           set "PATH=%CUDA_DIR%\bin;%PATH%"

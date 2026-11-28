@@ -37,6 +37,19 @@ int guard(F&& f) {
 
 float g_last_us = 0.f;
 
+// Whether the process's CUDA context is lost: after a fault, or a reset of a GPU engine by the driver (a job that
+// hung), every call returns the sticky error, the creation of a stream too. (No device or driver: nothing to lose.)
+bool cuda_lost() {
+  cudaStream_t s;
+  cudaError_t e = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+  if (e == cudaSuccess) {
+    e = cudaStreamSynchronize(s);
+    cudaStreamDestroy(s);
+  }
+  return e != cudaSuccess && e != cudaErrorNoDevice && e != cudaErrorInsufficientDriver &&
+         e != cudaErrorInitializationError && e != cudaErrorStartupFailure && e != cudaErrorMemoryAllocation;
+}
+
 VisionPixels rgb_pixels(const uint8_t* rgb, const float* norm) {
   VisionPixels px;
   px.rgb = rgb;
@@ -338,8 +351,13 @@ int q27_spec_block(void* m) { return static_cast<Model*>(m)->spec_block(); }
 int q27_last_step_block(void* m) { return static_cast<Model*>(m)->last_step_block(); }
 // Rows of lane z's block in the last q27_spec_step_lanes (0: no such lane).
 int q27_last_lane_block(void* m, int z) { return static_cast<Model*>(m)->last_lane_block(z); }
+int q27_last_lane_draft(void* m, int z) { return static_cast<Model*>(m)->last_lane_draft(z); }
+// Tests of cut steps (Model::spec_set_draft_rows): the running sequence's single steps draft `rows` (0: as verified).
+int q27_spec_set_draft_rows(void* m, int rows) {
+  return guard([&] { static_cast<Model*>(m)->spec_set_draft_rows(rows); });
+}
 
-// Speculative counters since the last call: steps, lookup steps, tokens.
+// Speculative counters since the last call: steps, lookup steps, tokens, batched-step graphs captured (out[4]).
 int q27_spec_stats(void* m, int64_t* out) {
   return guard([&] { static_cast<Model*>(m)->spec_stats(out); });
 }
@@ -389,6 +407,11 @@ int q27_device_memory(void* m, int64_t* out) {
 int q27_has_vision(void* m) { return static_cast<Model*>(m)->has_vision() ? 1 : 0; }
 int q27_mm_set(void* m, const int32_t* spans, int n) {
   return guard([&] { static_cast<Model*>(m)->mm_set(spans, n); });
+}
+// Rows of mm_ for images i .. i + n - 1 from `row` on (in order): a request with more image tokens than
+// IMAGE_TOKENS places and encodes the images of each prompt chunk before running it.
+int q27_mm_place(void* m, int i, int n, int row) {
+  return guard([&] { static_cast<Model*>(m)->mm_place(i, n, row); });
 }
 int q27_mm_encode(void* m, int i, const float* pixels) {
   return guard([&] {
@@ -448,14 +471,16 @@ int q27_video_memory(const uint8_t* data, int64_t n, int out_w, int out_h, int s
 // Frames want[n_want] (ascending) of a video, decoded on NVDEC and resized on the GPU to out_w x out_h (0: their
 // size; PIL's bicubic), as RGB [h][w][3] uint8 into out (host), one after another. sessions: parallel decoders
 // (0: one per NVDEC engine). stats [5] = frames presented, pictures decoded, sessions, setup ms, total ms.
+// -4: the decode failed and took the CUDA context with it; only a new process can use the GPU again.
 int q27_video_frames(const uint8_t* data, int64_t n, const int32_t* want, int n_want, int out_w, int out_h, int sessions,
                      uint8_t* out, double* stats) {
-  return guard([&] {
+  const int rc = guard([&] {
     const VideoDecodeStats st = video_frames(data, size_t(n), std::vector<int>(want, want + n_want), out_w, out_h, out,
                                              sessions);
     const double v[5] = {double(st.presented), double(st.decoded), double(st.sessions), st.setup_ms, st.total_ms};
     std::memcpy(stats, v, sizeof v);
   });
+  return rc == -1 && cuda_lost() ? -4 : rc;
 }
 
 int q27_debug_kv(void* m, int layer, int pos, int n, void* out) {
@@ -600,6 +625,14 @@ int q27t_skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, 
                     float alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
   return kernel([&] { skinny_fp4(M, N, K, a, a_sf, w, w_sf, AlphaSegments::one(alpha), c, beta, d, ws, ws_bytes, ts()); });
 }
+// W4A4x2 activations (Q27_ACT_A4X2): T tokens, the second term of token t at row a2row + t of a (a_sf swizzled for
+// all rows); d = c + alpha * first + alpha * second (c may be null).
+int q27t_skinny_fp4_x2(int T, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
+                       float alpha, const float* c, float* d, void* ws, size_t ws_bytes, int a2row) {
+  return kernel([&] {
+    skinny_fp4(2 * T, N, K, a, a_sf, w, w_sf, AlphaSegments::one(alpha), c, c ? 1.f : 0.f, d, ws, ws_bytes, ts(), T, a2row);
+  });
+}
 int q27t_skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, float alpha, const float* c, float beta,
                     float* d, void* ws, size_t ws_bytes) {
   return kernel([&] { skinny_fp8(M, N, K, a, w, AlphaSegments::one(alpha), c, beta, d, ws, ws_bytes, ts()); });
@@ -685,6 +718,14 @@ int q27t_attention_decode(const float* q, const float* qg, int T, int pos0, void
 }
 int q27t_skinny_bf16(int M, int N, int K, const bf16* a, const bf16* w, float* d, void* ws, size_t ws_bytes) {
   return kernel([&] { skinny_bf16(M, N, K, a, w, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts()); });
+}
+int q27t_skinny_fp4_a4x2(int M, int N, int K, const uint8_t* q, const uint8_t* q_sf, const uint8_t* w,
+                         const uint8_t* w_sf, float alpha, float* d) {
+  return kernel([&] { skinny_fp4_a4x2(M, N, K, q, q_sf, w, w_sf, alpha, d, ts()); });
+}
+int q27t_quant_fp4x2(const float* x, const bf16* w, int M, int K, float eps, float input_scale, uint8_t* q,
+                     uint8_t* sf) {
+  return kernel([&] { quant_fp4x2(x, w, M, K, eps, input_scale, q, sf, ts()); });
 }
 int q27t_gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float* d) {
   return kernel([&] { gemm_bf16(M, N, K, a, w, 1.f, nullptr, 0.f, d, ts()); });

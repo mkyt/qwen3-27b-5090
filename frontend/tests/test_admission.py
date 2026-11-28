@@ -202,3 +202,14 @@ def test_suspended_request_waits_for_room_without_admit_kv():
     assert sch.admit(new)
     new.preempted = 1
     assert not sch.admit(new) and sch.blocked == "kv"
+
+
+def test_malformed_request_fails_alone():
+    # (the server rejects these first; the worker must not die if one gets through)
+    sch = scheduler(FakeEngine(free=10_000))
+    base = {"max_new": 8, "temperature": 1.0, "top_k": 20, "top_p": 0.95}
+    for rid, req in enumerate([dict(base, ids=[1, 2], seed=[1]), dict(base, ids=[1, -5]),
+                               dict(base, ids=[1, worker.VOCAB]), dict(base, ids=[1, 2.5]), dict(base, ids=[2**40])]):
+        sch.submit(rid, req)
+        assert sch.conn.sent[-1][:2] == ("error", rid) and sch.conn.sent[-1][-1] == 400
+    assert not sch.waiting

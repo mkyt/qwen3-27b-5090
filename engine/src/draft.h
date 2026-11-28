@@ -144,6 +144,7 @@ class Draft {
                         void* ws, size_t ws_bytes, cudaStream_t s);
   // The candidate ids of a batched step ([rows][16]: lane z's draft positions are the rows after its first).
   const int32_t* lane_cand() const { return cand_i_; }
+  const float* lane_lattice() const { return lattice_; }  // (DSpine: the lanes' tables, see dspine_conf_tokens)
   int32_t* lane_src() const { return src_lanes_; }
   int lanes() const { return lanes_; }
   void reset(cudaStream_t s);
@@ -326,6 +327,17 @@ void dspine_table(const LaneRows& lr, bool lanes, const float* raw, const float*
 void dspine_select(int nd, const SelectLanes* sl, const SpecSampling& smp, const int32_t* cand_i,
                    const int32_t* anchor, const uint64_t* rng, int32_t* ids_out, DraftChoice choice, float* lattice,
                    cudaStream_t s);
+// Verify-width confidence (P3-39): a logistic model of whether the draft at position e is accepted, given the walk
+// reached its predecessor a: g = sigmoid(w . [1, logit(c), H, log(1 + e), logit(c) log(1 + e)]) with c the largest and
+// H the entropy of softmax(lattice[e][a]); w[0] greedy lanes, w[1] sampled (fitted on recorded DSpine steps).
+struct ConfCalib {
+  float w[2][5];
+};
+// The expected tokens of each lane of lr at 1..16 verify rows, marginalized over the walk's draws (a function of the
+// lattice only, so a width chosen from it keeps the verify lossless): out[z][w - 1] (w past the lane's rows: its
+// rows'). greedy: bit z = lane z is greedy (its walk takes the argmax).
+void dspine_conf_tokens(const float* lattice, const LaneRows& lr, uint32_t greedy, const ConfCalib& cal, float* out,
+                        cudaStream_t s);
 // fp32 -> BF16 (load time).
 void draft_round_bf16(const float* x, int64_t n, bf16* out, cudaStream_t s);
 // Weight quantization at load: rows [n][K] of BF16 w into rows row0.. of l (format fmt).

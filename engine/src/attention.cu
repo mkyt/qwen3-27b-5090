@@ -112,8 +112,9 @@ __global__ void attn_prep_kernel(const float* qg, int ldq, const float* k, const
   int t = blockIdx.x, slot = blockIdx.y, d = threadIdx.x;
   int tl = t;  // the row's index in its block of new tokens
   if constexpr (kBatch) {
-    const int z = lanes.lr.lane(t);
-    tl = t - lanes.lr.first(z);
+    const LaneRows lr = lanes.lr.live();
+    const int z = lr.lane(t);
+    tl = t - lr.first(z);
     pos_dev = lanes.pos + z, page_table = lane_sel(lanes.page_table, z), rope.delta = lanes.rope_delta + z;
   }
   bool is_q = slot < kHeads;
@@ -545,10 +546,11 @@ __global__ void __launch_bounds__(kTcMaxT * 32 + kTcProd, 1) attention_tc_kernel
   }
   if constexpr (kBatch) {
     const int z = blockIdx.z;
-    const int64_t rows = int64_t(lanes.lr.first(z)) * kHeads;
+    const LaneRows lr = lanes.lr.live();
+    const int64_t rows = int64_t(lr.first(z)) * kHeads;
     q += rows * kHeadDim, pos_dev = lanes.pos + z, page_table = lane_sel(lanes.page_table, z);
     part.acc += rows * splits * kHeadDim, part.ml += rows * splits * 2;
-    T = lanes.lr.rows(z);
+    T = lr.rows(z);
   }
   constexpr bool kFp8 = kKvFp8<KV>, kFp4 = kKvFp4<KV>, kRaw = kFp8 || kFp4;
   constexpr bool kHalf = kFp4;  // NVFP4 KV: f16 operands (its values are exact in f16)
@@ -1530,10 +1532,11 @@ __global__ void __launch_bounds__((kWide ? kT8WideWarps : kT8Grp) * 32 + kT8Prod
   pdl_trigger();
   if constexpr (kBatch) {
     const int z = blockIdx.z;
-    const int64_t rows = int64_t(lanes.lr.first(z)) * kHeads;
+    const LaneRows lr = lanes.lr.live();
+    const int64_t rows = int64_t(lr.first(z)) * kHeads;
     q += rows * kHeadDim, pos_dev = lanes.pos + z, page_table = lane_sel(lanes.page_table, z);
     part.acc += rows * splits * kHeadDim, part.ml += rows * splits * 2;
-    T = lanes.lr.rows(z);
+    T = lr.rows(z);
   }
   constexpr bool kFp4 = kKvFp4<KV>;
   constexpr int kRowBytes = kKvRowBytes<KV>;
@@ -1830,8 +1833,9 @@ __global__ void attention_combine_kernel(const float* qg, int ldq, const int32_t
   const int d = threadIdx.x, t = blockIdx.x / kHeads, h = blockIdx.x % kHeads;
   int tl = t;
   if constexpr (kBatch) {
-    const int z = lanes.lr.lane(t);
-    pos_dev = lanes.pos + z, tl = t - lanes.lr.first(z);
+    const LaneRows lr = lanes.lr.live();
+    const int z = lr.lane(t);
+    pos_dev = lanes.pos + z, tl = t - lr.first(z);
   }
   const int pos0 = *pos_dev;
   pdl_wait();

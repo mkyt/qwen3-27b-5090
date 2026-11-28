@@ -15,7 +15,7 @@ What later releases keep, for the installed copies of this script:
 - The latest release of the repository (not a draft or pre-release) is the one to install; try-out versions are
   pre-releases. Its tag equals the new package's app\VERSION (only equality is compared; no VERSION: always updated).
 - An asset named *-windows-x64.zip (else the first *windows*.zip), and its SHA-256 in <zip name>.sha256 or in a
-  SHA256SUMS-style asset ("<hash>  <name>" lines). Without either, the zip is installed unchecked.
+  SHA256SUMS-style asset ("<hash>  <name>" lines). Without a matching checksum, the update stops.
 - The zip holds the package, at its top or in a folder: the folder that has python\python.exe.
 - The new package's update.ps1 accepts -InstallFrom, -Root, -StartTray and -Started (and -Check, which it ignores
   then), and creates the file -Started names before it changes anything. Anything else (where things are, the tray
@@ -151,10 +151,11 @@ function Expected-Hash($release, $zipName) {
     foreach ($l in $lines) {
       $parts = $l.Trim() -split "\s+", 2
       $file = if ($parts.Count -gt 1) { $parts[1].TrimStart("*").Trim() } else { "" }
-      if ($parts[0] -match "^[0-9a-fA-F]{64}$" -and ($lines.Count -eq 1 -or $file -eq $zipName)) { return $parts[0].ToLower() }
+      if ($parts[0] -match "^[0-9a-fA-F]{64}$" -and ($file -eq $zipName -or
+          (-not $file -and $lines.Count -eq 1 -and $a.name -eq "$zipName.sha256"))) { return $parts[0].ToLower() }
     }
   }
-  return $null
+  throw "cannot verify the update: no matching SHA-256 could be downloaded; try again later"
 }
 
 # The release and its zip
@@ -173,15 +174,14 @@ if (-not $Zip) {
   New-Item -ItemType Directory -Force $work | Out-Null
   $Zip = Join-Path $work $asset.name
   $want = Expected-Hash $release $asset.name
-  $have = if ($want -and (Test-Path $Zip)) { (Get-FileHash -Algorithm SHA256 $Zip).Hash.ToLower() } else { "" }
-  if (-not $want -or $have -ne $want) {
+  $have = if (Test-Path $Zip) { (Get-FileHash -Algorithm SHA256 $Zip).Hash.ToLower() } else { "" }
+  if ($have -ne $want) {
     Download $asset.url $Zip -Resume
-    if ($want -and (Get-FileHash -Algorithm SHA256 $Zip).Hash.ToLower() -ne $want) {
+    if ((Get-FileHash -Algorithm SHA256 $Zip).Hash.ToLower() -ne $want) {
       Remove-Item $Zip
       throw "the download's SHA-256 does not match the release's; run update.cmd again"
     }
   }
-  if (-not $want) { Write-Host "(the release has no SHA-256 for it: not checked)" }
 } else {
   $Zip = (Resolve-Path $Zip).Path
   Write-Host "installed: $shown, zip: $Zip"

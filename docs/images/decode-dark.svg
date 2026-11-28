@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="400" viewBox="0 0 760 400" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="760" height="400" fill="#1a1a19"/>
+<text x="56" y="22" font-size="15" font-weight="600" fill="#f0efec">Decode speed (RTX 5090, 400 W)</text>
+<text x="56" y="40" font-size="12" fill="#a8a79d">SGLang: DFlash2 mode (one request at a time) for one request and C=1, MTP modes for C=4 and C=8.</text>
+<rect x="56" y="54" width="12" height="12" rx="3" fill="#3987e5"/>
+<text x="74" y="64" font-size="12" fill="#f0efec">This engine v0.7.0</text>
+<rect x="225.6" y="54" width="12" height="12" rx="3" fill="#d95926"/>
+<text x="243.6" y="64" font-size="12" fill="#f0efec">NInfer ebdc67e</text>
+<rect x="366.4" y="54" width="12" height="12" rx="3" fill="#199e70"/>
+<text x="384.4" y="64" font-size="12" fill="#f0efec">vLLM v0.34.0</text>
+<rect x="492.79999999999995" y="54" width="12" height="12" rx="3" fill="#c98500"/>
+<text x="510.79999999999995" y="64" font-size="12" fill="#f0efec">SGLang v0.5.23</text>
+<text x="56" y="94" font-size="13" font-weight="600" fill="#f0efec">One request (decode tok/s)</text>
+<line x1="56" x2="360" y1="350.0" y2="350.0" stroke="#3a3936"/>
+<text x="48" y="354.0" font-size="11" text-anchor="end" fill="#a8a79d">0</text>
+<line x1="56" x2="360" y1="289.5" y2="289.5" stroke="#3a3936"/>
+<text x="48" y="293.5" font-size="11" text-anchor="end" fill="#a8a79d">200</text>
+<line x1="56" x2="360" y1="229.0" y2="229.0" stroke="#3a3936"/>
+<text x="48" y="233.0" font-size="11" text-anchor="end" fill="#a8a79d">400</text>
+<line x1="56" x2="360" y1="168.5" y2="168.5" stroke="#3a3936"/>
+<text x="48" y="172.5" font-size="11" text-anchor="end" fill="#a8a79d">600</text>
+<line x1="56" x2="360" y1="108.0" y2="108.0" stroke="#3a3936"/>
+<text x="48" y="112.0" font-size="11" text-anchor="end" fill="#a8a79d">800</text>
+<path d="M69.0,350.0 V230.8 Q69.0,226.8 73.0,226.8 H82.3 Q86.3,226.8 86.3,230.8 V350.0 Z" fill="#3987e5"/>
+<path d="M88.3,350.0 V264.7 Q88.3,260.7 92.3,260.7 H101.7 Q105.7,260.7 105.7,264.7 V350.0 Z" fill="#d95926"/>
+<path d="M107.7,350.0 V304.3 Q107.7,300.3 111.7,300.3 H121.0 Q125.0,300.3 125.0,304.3 V350.0 Z" fill="#199e70"/>
+<path d="M127.0,350.0 V280.8 Q127.0,276.8 131.0,276.8 H140.3 Q144.3,276.8 144.3,280.8 V350.0 Z" fill="#c98500"/>
+<text x="106.7" y="368" font-size="12" text-anchor="middle" fill="#a8a79d">code</text>
+<path d="M170.3,350.0 V129.7 Q170.3,125.7 174.3,125.7 H183.7 Q187.7,125.7 187.7,129.7 V350.0 Z" fill="#3987e5"/>
+<path d="M189.7,350.0 V237.5 Q189.7,233.5 193.7,233.5 H203.0 Q207.0,233.5 207.0,237.5 V350.0 Z" fill="#d95926"/>
+<path d="M209.0,350.0 V298.1 Q209.0,294.1 213.0,294.1 H222.3 Q226.3,294.1 226.3,298.1 V350.0 Z" fill="#199e70"/>
+<path d="M228.3,350.0 V260.6 Q228.3,256.6 232.3,256.6 H241.7 Q245.7,256.6 245.7,260.6 V350.0 Z" fill="#c98500"/>
+<text x="208.0" y="368" font-size="12" text-anchor="middle" fill="#a8a79d">JSON</text>
+<path d="M271.7,350.0 V278.2 Q271.7,274.2 275.7,274.2 H285.0 Q289.0,274.2 289.0,278.2 V350.0 Z" fill="#3987e5"/>
+<path d="M291.0,350.0 V292.8 Q291.0,288.8 295.0,288.8 H304.3 Q308.3,288.8 308.3,292.8 V350.0 Z" fill="#d95926"/>
+<path d="M310.3,350.0 V314.5 Q310.3,310.5 314.3,310.5 H323.7 Q327.7,310.5 327.7,314.5 V350.0 Z" fill="#199e70"/>
+<path d="M329.7,350.0 V300.9 Q329.7,296.9 333.7,296.9 H343.0 Q347.0,296.9 347.0,300.9 V350.0 Z" fill="#c98500"/>
+<text x="309.3" y="368" font-size="12" text-anchor="middle" fill="#a8a79d">prose</text>
+<line x1="56" x2="360" y1="350" y2="350" stroke="#5a5954"/>
+<text x="440" y="94" font-size="13" font-weight="600" fill="#f0efec">Concurrent requests (total tok/s)</text>
+<line x1="440" x2="744" y1="350.0" y2="350.0" stroke="#3a3936"/>
+<text x="432" y="354.0" font-size="11" text-anchor="end" fill="#a8a79d">0</text>
+<line x1="440" x2="744" y1="289.5" y2="289.5" stroke="#3a3936"/>
+<text x="432" y="293.5" font-size="11" text-anchor="end" fill="#a8a79d">400</text>
+<line x1="440" x2="744" y1="229.0" y2="229.0" stroke="#3a3936"/>
+<text x="432" y="233.0" font-size="11" text-anchor="end" fill="#a8a79d">800</text>
+<line x1="440" x2="744" y1="168.5" y2="168.5" stroke="#3a3936"/>
+<text x="432" y="172.5" font-size="11" text-anchor="end" fill="#a8a79d">1,200</text>
+<line x1="440" x2="744" y1="108.0" y2="108.0" stroke="#3a3936"/>
+<text x="432" y="112.0" font-size="11" text-anchor="end" fill="#a8a79d">1,600</text>
+<path d="M453.0,350.0 V305.9 Q453.0,301.9 457.0,301.9 H466.3 Q470.3,301.9 470.3,305.9 V350.0 Z" fill="#3987e5"/>
+<path d="M472.3,350.0 V317.2 Q472.3,313.2 476.3,313.2 H485.7 Q489.7,313.2 489.7,317.2 V350.0 Z" fill="#d95926"/>
+<path d="M491.7,350.0 V334.2 Q491.7,330.2 495.7,330.2 H505.0 Q509.0,330.2 509.0,334.2 V350.0 Z" fill="#199e70"/>
+<path d="M511.0,350.0 V325.2 Q511.0,321.2 515.0,321.2 H524.3 Q528.3,321.2 528.3,325.2 V350.0 Z" fill="#c98500"/>
+<text x="490.7" y="368" font-size="12" text-anchor="middle" fill="#a8a79d">C=1</text>
+<path d="M554.3,350.0 V220.1 Q554.3,216.1 558.3,216.1 H567.7 Q571.7,216.1 571.7,220.1 V350.0 Z" fill="#3987e5"/>
+<path d="M573.7,350.0 V233.7 Q573.7,229.7 577.7,229.7 H587.0 Q591.0,229.7 591.0,233.7 V350.0 Z" fill="#d95926"/>
+<path d="M593.0,350.0 V269.6 Q593.0,265.6 597.0,265.6 H606.3 Q610.3,265.6 610.3,269.6 V350.0 Z" fill="#199e70"/>
+<path d="M612.3,350.0 V286.8 Q612.3,282.8 616.3,282.8 H625.7 Q629.7,282.8 629.7,286.8 V350.0 Z" fill="#c98500"/>
+<text x="592.0" y="368" font-size="12" text-anchor="middle" fill="#a8a79d">C=4</text>
+<path d="M655.7,350.0 V146.9 Q655.7,142.9 659.7,142.9 H669.0 Q673.0,142.9 673.0,146.9 V350.0 Z" fill="#3987e5"/>
+<path d="M675.0,350.0 V159.8 Q675.0,155.8 679.0,155.8 H688.3 Q692.3,155.8 692.3,159.8 V350.0 Z" fill="#d95926"/>
+<path d="M694.3,350.0 V217.3 Q694.3,213.3 698.3,213.3 H707.7 Q711.7,213.3 711.7,217.3 V350.0 Z" fill="#199e70"/>
+<path d="M713.7,350.0 V223.1 Q713.7,219.1 717.7,219.1 H727.0 Q731.0,219.1 731.0,223.1 V350.0 Z" fill="#c98500"/>
+<text x="693.3" y="368" font-size="12" text-anchor="middle" fill="#a8a79d">C=8</text>
+<line x1="440" x2="744" y1="350" y2="350" stroke="#5a5954"/>
+<text x="380.0" y="388" font-size="11" text-anchor="middle" fill="#a8a79d">1,024 output tokens per prompt (median of 3) | reasoning prompt, 4,096 tokens each (mean of 2)</text>
+</svg>

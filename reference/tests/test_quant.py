@@ -1,6 +1,7 @@
 import torch
 
-from qwen27b.quant import E2M1_VALUES, quant_act_nvfp4, round_e2m1, to_e4m3, unpack_e2m1
+from qwen27b.quant import (E2M1_VALUES, QLinear, quant_act_nvfp4, quant_act_nvfp4_terms, round_e2m1, to_e4m3,
+                           unpack_e2m1)
 
 
 def test_unpack_low_nibble_first():
@@ -34,3 +35,16 @@ def test_quant_act_nvfp4_properties():
 
 def test_e4m3_saturates():
     assert to_e4m3(torch.tensor([1000.0, -1000.0])).tolist() == [448.0, -448.0]
+
+
+def test_two_term_activations():
+    torch.manual_seed(0)
+    x, scale = torch.randn(8, 512), torch.tensor(0.021)
+    one, two = quant_act_nvfp4_terms(x, scale, 1), quant_act_nvfp4_terms(x, scale, 2)
+    assert torch.equal(one, quant_act_nvfp4(x, scale))
+    assert torch.equal(two, one + quant_act_nvfp4(x - one, scale))
+    err = lambda v: float((v - x).norm() / x.norm())
+    assert err(two) < 0.02 < 0.05 < err(one)
+    w = torch.randn(64, 512)
+    assert torch.equal(QLinear("nvfp4", w, scale)(x), one @ w.T)
+    assert torch.equal(QLinear("nvfp4", w, scale, act_terms=2)(x), two @ w.T)

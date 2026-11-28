@@ -18,6 +18,7 @@ from llguidance.gbnf_to_lark import gbnf_to_lark
 # JSON: any whitespace between the tokens (the model's own layout, as vLLM's guidance backend), at most this much in a
 # row (a model that only writes newlines would fill max_tokens with them).
 JSON_OPTIONS = {"whitespace_flexible": True, "whitespace_pattern": r"[ \t\n\r]{0,32}"}
+LEAD_WS_MAX = 32  # whitespace before the format (after the reasoning): bounded for the same reason
 
 
 def _json_spec(schema, what):
@@ -135,7 +136,8 @@ def grammar(spec, lead_ws=False, calls=None):
         if n != 1:
             raise ValueError("structured_outputs.grammar: one start rule is required")
         out = "user_start"
-    lark = ("start: " + ("/[ \\t\\r\\n]*/ " if lead_ws else "") + "body\n"
+    lead = f"/[ \\t\\r\\n]{{0,{LEAD_WS_MAX}}}/ " if lead_ws else ""
+    lark = ("start: " + lead + "body\n"
             + "body: out" + (" | calls" if calls else "") + "\n"
             + "out: " + out + "\n")
     if calls:

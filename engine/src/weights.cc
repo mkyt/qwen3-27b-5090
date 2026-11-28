@@ -90,7 +90,9 @@ void Weights::scalar(const SafeTensors& ckpt, const std::string& name, float* ds
 bool Weights::fp8(const SafeTensors& ckpt, const std::vector<std::pair<std::string, LinearFp8*>>& group, Pool& dev) {
   for (auto& [p, l] : group) {
     const auto& info = ckpt.info(p + ".weight");
-    Q27_CHECK(info.dtype == "F8_E4M3", p + ": expected an FP8 weight");
+    Q27_CHECK(info.dtype == "F8_E4M3" && info.shape.size() == 2 && info.shape[0] > 0 &&
+                  info.shape[0] <= INT32_MAX && info.shape[1] > 0 && info.shape[1] <= INT32_MAX,
+              p + ": expected an FP8 matrix");
     l->out = int(info.shape[0]);
     l->in = int(info.shape[1]);
     tensor(ckpt, p + ".weight", dev, reinterpret_cast<const void**>(&l->w));
@@ -125,7 +127,9 @@ void Weights::fp4(const SafeTensors& ckpt, const std::vector<std::pair<std::stri
     const bool ct = ckpt.has(p + ".weight_packed");  // compressed-tensors: global scales are inverses
     const std::string wn = p + (ct ? ".weight_packed" : ".weight");
     const auto& info = ckpt.info(wn);
-    Q27_CHECK(info.dtype == "U8", p + ": expected an NVFP4 weight");
+    Q27_CHECK(info.dtype == "U8" && info.shape.size() == 2 && info.shape[0] > 0 &&
+                  info.shape[0] <= INT32_MAX && info.shape[1] > 0 && info.shape[1] <= INT32_MAX / 2,
+              p + ": expected an NVFP4 matrix");
     l->out = int(info.shape[0]);
     l->in = int(info.shape[1]) * 2;
     tensor(ckpt, wn, dev, reinterpret_cast<const void**>(&l->w));
@@ -138,7 +142,9 @@ void Weights::fp4(const SafeTensors& ckpt, const std::vector<std::pair<std::stri
 
 void Weights::fp4_from_bf16(const SafeTensors& ckpt, const std::string& p, Pool& dev, LinearFp4& l) {
   const auto& info = ckpt.info(p + ".weight");
-  Q27_CHECK(info.dtype == "BF16" && info.shape.size() == 2, p + ": expected a BF16 matrix");
+  Q27_CHECK(info.dtype == "BF16" && info.shape.size() == 2 && info.shape[0] > 0 &&
+                info.shape[0] <= INT32_MAX && info.shape[1] > 0 && info.shape[1] <= INT32_MAX,
+            p + ": expected a BF16 matrix");
   l.out = int(info.shape[0]);
   l.in = int(info.shape[1]);
   Q27_CHECK(l.out % 128 == 0 && l.in % 64 == 0, p + ": unexpected shape for NVFP4");
@@ -395,7 +401,8 @@ void Weights::plan_vision(const SafeTensors& ckpt, Pool& dev, Pool& host, Vision
   };
   auto mat = [&](const std::string& name, VisionMat& m) {
     const auto& info = ckpt.info(p + name);
-    Q27_CHECK(info.dtype == "BF16", p + name + ": expected BF16");
+    Q27_CHECK(info.dtype == "BF16" && !info.shape.empty() && info.shape[0] > 0 && info.shape[0] <= INT32_MAX &&
+                  info.nbytes / 2 / info.shape[0] <= INT32_MAX, p + name + ": invalid BF16 matrix");
     m.out = int(info.shape[0]);
     m.in = int(info.nbytes / 2 / info.shape[0]);  // (the patch embedding is [1152][3][2][16][16])
     if (mode == VisionMode::kFp8) {

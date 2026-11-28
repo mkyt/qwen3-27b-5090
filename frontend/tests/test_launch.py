@@ -17,7 +17,7 @@ from test_stats import hub  # noqa: E402
 
 GiB = 1 << 30
 DEFAULTS = {"weights": "gdnfp4", "kv_dtype": "nvfp4", "spec": "dspine", "vision": "host", "max_seqs": 8,
-            "max_tokens": 262144, "vram_budget_gib": None}
+            "max_tokens": 262144, "vram_budget_gib": None, "act_a4x2": "off"}
 DEVICE = (int(30.20 * GiB), int(31.82 * GiB))  # (free at the start, total) of an engine on the RTX 5090 under WSL2
 
 
@@ -49,6 +49,25 @@ def test_env_changes_name_what_changed_since_the_start():
     assert lc.env_changes() == {}
     lc.settings = dict(lc.at_start, kv_dtype="fp8", max_seqs=4, vram_budget_gib=None)
     assert lc.env_changes() == {"KV_DTYPE": "fp8", "MAX_SEQS": "4", "VRAM_BUDGET_GIB": ""}
+    lc.settings = dict(lc.at_start, act_a4x2="decode")
+    assert lc.env_changes() == {"Q27_ACT_A4X2": "decode"}
+
+
+def test_act_a4x2_setting():
+    """The quality mode (Q27_ACT_A4X2) as the engine reads the variable (a number or the setting's name, which the
+    engine is given and keep_env lists)."""
+    for v, s in (("", "off"), (None, "off"), ("0", "off"), ("2", "decode"), ("1", "all"), (" 3 ", "all"), ("decode", "decode"),
+                 ("off", "off"), ("all", "all")):
+        assert launch.act_a4x2_setting(v) == s
+    with pytest.raises(ValueError):
+        launch.act_a4x2_setting("on")
+    lc = settings()
+    for bad in ({"act_a4x2": "2"}, {"act_a4x2": True}, {"act_a4x2": None}):
+        with pytest.raises(ValueError):
+            lc.validate(bad)
+    # Settings without it (a client from before): off.
+    old = {k: v for k, v in DEFAULTS.items() if k != "act_a4x2"}
+    assert lc.validate({}, base=old)["act_a4x2"] == "off"
 
 
 def test_plan_device():
@@ -201,16 +220,18 @@ def test_default_spec_falls_back_to_a_downloaded_dflash2(monkeypatch):
     assert launch.env_settings()["spec"] == "dspine"
 
 
-def test_image_tokens_follow_video_max_tokens(monkeypatch, tmp_path):
-    """IMAGE_TOKENS unset or empty: 16,384, or VIDEO_MAX_TOKENS when more; set, it stays."""
+def test_image_tokens_default(monkeypatch, tmp_path):
+    """IMAGE_TOKENS unset or empty: 16,384, or what two prefill chunks and the largest image at each end take; set,
+    it stays. (VIDEO_MAX_TOKENS no longer counts: a video's pairs go through the table a chunk at a time.)"""
     env = {}
     monkeypatch.setattr(os, "environ", env)  # (set_engine_env also sets the engine's defaults)
-    for video, image, want in ((None, None, "16384"), ("8192", "", "16384"), ("131072", "", "131072"),
-                               ("131072", "20000", "20000")):
+    for extra, want in (({}, "16384"), ({"VIDEO_MAX_TOKENS": "131072", "IMAGE_TOKENS": ""}, "16384"),
+                        ({"IMAGE_TOKENS": "20000"}, "20000"), ({"IMAGE_MAX_PIXELS": "16777216"}, str(4096 + 32768)),
+                        ({"PREFILL_CHUNK": "8192"}, str(16384 + 8192)), ({"IMAGE_MAX_PIXELS": "x"}, "16384")):
         env.clear()
-        env.update({k: v for k, v in (("VIDEO_MAX_TOKENS", video), ("IMAGE_TOKENS", image)) if v is not None})
+        env.update(extra)
         launch.set_engine_env(tmp_path)
-        assert env["IMAGE_TOKENS"] == want
+        assert env["IMAGE_TOKENS"] == want, extra
     for bad in ("0", "-1", "1e5", "x"):
         env["VIDEO_MAX_FRAMES"] = bad
         with pytest.raises(ValueError):

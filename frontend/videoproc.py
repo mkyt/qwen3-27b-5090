@@ -69,13 +69,22 @@ def linspace_round(stop, n):
     return [round(i * step) for i in range(n - 1)] + [round(float(stop))]
 
 
+class DeviceLost(RuntimeError):
+    """The decode took the process's CUDA context with it (the driver reset the GPU's engine): nothing on the GPU
+    works in this process any more."""
+
+    device_lost = True
+
+
 def _check(r, what):
-    """Raises ValueError (the client's video: HTTP 400) or RuntimeError for a failed engine call."""
+    """Raises ValueError (the client's video: HTTP 400), DeviceLost, or RuntimeError for a failed engine call."""
     if r == 0:
         return
     from q27lib import lib
 
     msg = lib().q27_last_error().decode(errors="replace")
+    if r == -4:
+        raise DeviceLost(f"{what}: {msg}")
     raise (ValueError if r == -3 else RuntimeError)(f"{msg}" if r == -3 else f"{what}: {msg}")
 
 

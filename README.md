@@ -7,36 +7,52 @@ Anthropic-compatible APIs with images, so coding agents such as Claude Code and 
 It is not a general engine: the kernels, the memory plan and the scheduler are written for this one model on this one
 GPU. That buys two things:
 
-- **Speed.** Faster than [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [NInfer](https://github.com/Neroued/ninfer) on the same card in every scenario measured: 1.3–3.7x the
-  single-request decode, 1.02–1.6x the throughput of eight concurrent requests, and a 152K-token prompt answered in
-  22 s instead of 31–56 s.
-- **The full 262K context with room to spare.** A 602K-token KV cache on a 32 GB card, 2.8–6.3x what the other
-  engines fit, with up to eight requests, images and speculative decoding all enabled at once. Of the others, only
-  NInfer reached the model's whole 262,144-token context here, serving one request without speculative decoding.
+- **Speed.** Faster than the latest [vLLM](https://github.com/vllm-project/vllm) (v0.34.0), [SGLang](https://github.com/sgl-project/sglang) (v0.5.23) and [NInfer](https://github.com/Neroued/ninfer) (`ebdc67e`, 2026-11-16) on the same card in every scenario measured: 1.2–4.0x the
+  single-request decode, 1.07–1.6x the throughput of eight concurrent requests, and a 152K-token prompt answered in
+  22 s instead of 31–51 s.
+- **The full 262K context with room to spare.** A 602K-token KV cache on a 32 GB card, 2.7–6.1x what the other
+  engines fit in the settings measured, with up to eight requests, images and speculative decoding all enabled at
+  once.
 
-All numbers are measured at a **400 W power limit** (the card's default is 575 W) with the same scripts: the other
-engines on 2026-10-11, this engine with its current default draft (DSpine) on 2026-11-13; the same-day numbers with
-the previous default are in the benchmarks too. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, each engine's settings and the
-commands that reproduce them. At 575 W the engine is only 1–2% faster for one request and 9–26% faster for prefill
+All numbers are measured on the same day (2026-11-23) at a **400 W power limit** (the card's default is 575 W) with
+the same scripts, this engine at v0.7.0 with its default draft (DSpine); the numbers with `SPEC=dflash2` are in the
+benchmarks too. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, each engine's settings and the
+commands that reproduce them. At 575 W (measured 2026-10-27) the engine is only 1–2% faster for one request and 9–26% faster for prefill
 and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 ([Power limit and energy](docs/benchmarks.md#power-limit-and-energy)).
 
 ## Fast
 
-| On one RTX 5090 at 400 W | This engine | NInfer | SGLang | vLLM |
+| On one RTX 5090 at 400 W | This engine (v0.7.0) | NInfer (`ebdc67e`) | SGLang (v0.5.23) | vLLM (v0.34.0) |
 | --- | ---: | ---: | ---: | ---: |
-| Decode, one request: code / JSON / prose (tok/s) | **410 / 674 / 263** | 285 / 362 / 197 | 246 / 320 / 167 | 154 / 180 / 128 |
-| Eight concurrent requests, total (tok/s) | **1,305** (1,392 with `SPEC=dflash2`) | 1,260–1,277 | 837–851 | 912–930 |
-| Time to first token, 152K-token document | **22 s** | 31 s | 50 s | 56 s |
-| Time to first token, agent turn after a 20K-token history | **0.22 s** | 0.39 s | 0.31 s | 0.57 s |
-| Follow-up question on a 73K-token document | **0.12 s** | 10.9 s | 0.49 s | 1.01 s |
+| Decode, one request: code / JSON / prose (tok/s) | **407 / 742 / 250** | 295 / 385 / 202 | 242 / 309 / 176 | 164 / 185 / 131 |
+| Eight concurrent requests, total (tok/s) | **1,339–1,399** (1,364–1,368 with `SPEC=dflash2`) | 1,272–1,296 | 861–869 | 901–906 |
+| Prefill of a 152K-token document: tok/s (time to first token) | **6,852** (22.2 s) | 4,853 (31.3 s) | 3,004 (50.6 s) | 3,154 (48.2 s) |
+| Time to first token, agent turn after a 20K-token history | **0.21 s** | 0.27 s | 0.39 s | 0.41 s |
+| Follow-up question on a 73K-token document | **0.17 s** | 1.55 s | 0.51 s | 0.43 s |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/decode-dark.svg">
+  <img alt="Decode speed of one request (code, JSON, prose) and the total of 1, 4 and 8 concurrent requests for this engine, NInfer, vLLM and SGLang" src="docs/images/decode-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/prefill-depth-dark.svg">
+  <img alt="Prefill speed against the position in the prompt for this engine, NInfer, vLLM and SGLang" src="docs/images/prefill-depth-light.svg">
+</picture>
+
+In prefill, the deeper into the prompt, the wider the gap: every engine's time per prompt token grows in a straight line with
+the position, and attention, the growing part, costs this engine 0.91 µs per 1K tokens of position against 1.42
+(NInfer), 3.0 (vLLM) and 3.1 (SGLang). Between 73K and 152K tokens of a prompt this engine prefills 5,579 tok/s,
+1.4–2.5x the others' 3,907 (NInfer `ebdc67e`), 2,346 (vLLM v0.34.0) and 2,239 (SGLang v0.5.23).
 
 - **Speculative decoding** with the [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) block drafter (blocks of up to
   16 tokens, the verify width adapting to the acceptance; [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) with
   `SPEC=dflash2`), batched across concurrent requests; each request's tokens are bit-identical to running it alone.
-  DSpine is faster for one request (JSON 1.37x, code 1.08x). In a batch each DSpine request verifies 4 to 16 rows of
-  its own, chosen from its recent acceptance; on long reasoning DFlash2 is still 3–6% faster with four or eight
-  requests at once, so a server that mostly runs many such requests may prefer `SPEC=dflash2`.
+  DSpine is faster for one request on structured text (JSON 1.53x, code 1.12x; prose 0.92x). In a batch each DSpine
+  request verifies 4 to 16 rows of its own, chosen from its recent acceptance; on long reasoning DFlash2 is still 3–6%
+  faster with four requests at once and level with eight, so a server that mostly runs many such requests may prefer
+  `SPEC=dflash2`.
 - **NVFP4 weights including the Gated DeltaNet projections**
   ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), GPTQ from the BF16 original;
   the attention projections stay FP8 because quantizing them cost parallel tool calls): decode reads 14 GiB of
@@ -46,16 +62,15 @@ and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
 
 ## Long context on a 32 GB card
 
-| | This engine | NInfer | SGLang | vLLM |
+| | This engine (v0.7.0) | NInfer (`ebdc67e`) | SGLang (v0.5.23) | vLLM (v0.34.0) |
 | --- | ---: | ---: | ---: | ---: |
-| KV cache (tokens) | **601,856** | 96,128 | 214,219 | 173,913 |
-| Longest context of one request | **262,144** (the model's limit) | 94,208 | 196,608 | 160,000 |
-| ... at the same time as | 8 concurrent requests, images, DSpine | 4 requests | 4 requests, MTP | 8 requests, MTP |
+| KV cache (tokens) | **601,856** | about 220,000 | 214,219 | 169,491 |
+| Longest context of one request | **262,144** (the model's limit) | 131,072 | 196,608 | 160,000 |
+| ... at the same time as | 8 concurrent requests, images, DSpine | 8 requests, DFlash2 | 4 requests, MTP | 8 requests, MTP |
 
-The other engines' columns are the largest settings with concurrency and speculative decoding that ran on this
-machine; NInfer and SGLang need other configurations for other scenarios (NInfer: 262K for one request without
-speculative decoding; SGLang: one request at 90K for its DFlash2 mode). Here one configuration serves everything:
-the defaults.
+The other engines' columns are the settings measured here with concurrency and speculative decoding, not the
+largest each could start; SGLang needs other configurations for other scenarios (one request at 90K for its DFlash2
+mode, 160K for eight requests). Here one configuration serves everything: the defaults.
 
 Where the memory comes from: the weights and the draft take about 15 GiB, and the engine plans the rest once at
 startup against an explicit budget (no allocator slack, no profiling run). One GiB holds about 58K tokens of NVFP4
@@ -74,11 +89,10 @@ Long prompts stay fast and accurate:
 
 | Context | Prefill | Decode, no speculation |
 | ---: | ---: | ---: |
-| 73K tokens | 8,773 tok/s (8.3 s) | 87 tok/s |
-| 194K tokens | 5,875 tok/s (33 s) | 77 tok/s |
+| 73K tokens | 9,272 tok/s (7.9 s) | 87 tok/s |
+| 194K tokens | 6,149 tok/s (32 s) | 77 tok/s |
 
-Between 73K and 152K tokens of a prompt this engine prefills 5,652 tok/s, against 3,868 (NInfer), 2,234 (SGLang)
-and 1,953 (vLLM). Needle retrieval finds 16 of 16 facts at 190K tokens and 56 of 64 at 256K.
+Needle retrieval finds 16 of 16 facts at 190K tokens and 58 of 64 at 256K.
 
 The full measurements, each engine's settings and the caveats (NInfer's memory sizing under WSL2, for one) are in
 [docs/benchmarks.md](docs/benchmarks.md#other-engines); [docs/architecture.md](docs/architecture.md) explains the
@@ -369,7 +383,7 @@ is the fine-tune's own: it is not compared with a reference here.
 
 [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) is a quantization of the model itself
 with its own chat template. On the golden prompts its KL to the BF16 model is
-0.0258 (top-1 agreement 90.95%), against 0.0381 for NVIDIA's checkpoint and 0.0454 for gdnfp4, at 21.65 GB of
+0.0259 (top-1 agreement 90.86%), against 0.0343 for NVIDIA's checkpoint and 0.0426 for gdnfp4, at 21.65 GB of
 weights (KV pool 393,920 tokens) and 289–291 / 1,299–1,310 tok/s (one / eight requests; gdnfp4 322 / 1,383–1,396 on
 the same build).
 
@@ -377,22 +391,25 @@ the same build).
 
 The engine is checked against a PyTorch reference implementation of the model (`reference/`): the next-token
 distributions over 35,328 positions of Japanese and English prose and code (the "golden" set, `bench/golden/`) agree
-with the reference as closely as the reference agrees with itself under a different KV cache type (KL 0.036).
-Against the BF16 original the default configuration is at KL 0.047; GSM8K, BFCL v3, long-context needle retrieval and
+with the reference at least as closely as the reference agrees with itself under a different KV cache type (KL 0.036).
+Against the BF16 original the default configuration is at KL 0.043; GSM8K, BFCL v3, long-context needle retrieval and
 a Japanese set are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ```bash
 scripts/download-weights.sh --dev           # also NVIDIA's checkpoint, used by the reference model and the tests
 scripts/download-golden.sh                  # the reference recordings (GitHub Releases)
-docker compose --profile dev run --rm dev bash -c 'cd reference && python -m golden engine --prompts ../bench/golden/prompts.jsonl --out ../cache/engine.jsonl.gz'
+docker compose --profile dev run --rm dev bash -c 'cd reference && Q27_LM_HEAD_A4X2=0 python -m golden engine --prompts ../bench/golden/prompts.jsonl --out ../cache/engine.jsonl.gz'
 docker compose --profile dev run --rm dev-cpu bash -c 'cd reference && python -m golden compare ../cache/engine.jsonl.gz ../bench/golden/ref-gpu.jsonl.gz'
 ```
 
-`golden engine` loads the weights on the GPU (about 20 GB): stop the `serve` service first.
+`golden engine` loads the weights on the GPU (about 20 GB): stop the `serve` service first. It runs with
+`Q27_LM_HEAD_A4X2=0` here because the published recordings of NVIDIA's checkpoint have one-term lm_head activations
+(expect a KL of about 0.037); the engine's default is two terms, to be compared with a reference recorded the same
+way (`python -m golden ref --device cuda --prompts ../bench/golden/prompts.jsonl --out ...`, KL about 0.028).
 
 The recordings are about 8 MB each: the reference model with a BF16 KV cache (`ref-gpu`, what the engine is compared
 with), with an FP8 KV cache (`ref-gpu-kvfp8`, the noise floor), the BF16 original (`ref-gpu-bf16model`) and images
-(`vision-ref`). `reference/golden.py ref` records them again from the checkpoints in minutes (`ref-gpu-bf16model` needs the 55.6 GB BF16 original).
+(`vision-ref`, one term as well). `reference/golden.py ref --lm-head-terms 1` records the first three again from the checkpoints in minutes (`ref-gpu-bf16model` needs the 55.6 GB BF16 original).
 
 ## Tests
 
@@ -402,6 +419,7 @@ dependency beyond the CUDA toolkit. Unit tests:
 
 ```bash
 docker compose --profile dev run --rm dev-cpu python -m pytest -q frontend/tests                # server: parsing, admission (seconds)
+docker compose --profile dev run --rm dev-cpu python -m pytest -q engine/tests_cpu              # malformed checkpoint readers, no GPU
 docker compose --profile dev run --rm dev-cpu bash -c 'cd reference && pytest -q'               # reference model on the CPU (seconds; -m slow: every layer, about 11 min and 10 GB of RAM)
 docker compose --profile dev run --rm dev bash -c 'cmake -S engine -B /build/engine -G Ninja && cmake --build /build/engine && cd engine/tests && python -m pytest -q'   # kernels against PyTorch (GPU, about 3 min)
 ```

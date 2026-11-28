@@ -1003,7 +1003,7 @@ struct Row {
 enum SettingControl { IDC_ROW = 100, IDC_APPLY = 200, IDC_CLOSE, IDC_OPEN_INI, IDC_USE_KEEP, IDC_FIX_LINKS, IDC_BROWSE };
 enum { TIMER_TICK = 1, TIMER_PLAN = 2, TIMER_SCAN = 3 };
 
-constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 9, ROW_LOAD_LAST = 12;
+constexpr int ROW_SERVER_LAST = 2, ROW_ENGINE_LAST = 10, ROW_LOAD_LAST = 13;
 
 struct SettingsWindow {
     HWND window = nullptr, state = nullptr, summary = nullptr, load_warning = nullptr, host_warning = nullptr, folder_note = nullptr;
@@ -1021,6 +1021,7 @@ struct SettingsWindow {
     bool scanning = false, scanned = false, scan_draft = true, download_needed = false, folder_warning = false;
     std::wstring scan_folder;
     std::vector<std::wstring> scan_weights, scan_links;
+    std::map<std::wstring, bool> scan_drafts;  // whether the folder has each SPEC's draft
     std::map<std::wstring, std::wstring> keep;  // the stats page's changes that the controls do not have
 } settings;
 
@@ -1045,6 +1046,7 @@ std::vector<Row> make_rows() {
         {L"Requests at once", L"MAX_SEQS", "max_seqs", K::choice, T::engine, nullptr},
         {L"Context limit (tokens)", L"MAX_TOKENS", "max_tokens", K::choice, T::engine, nullptr},
         {L"VRAM budget (GiB)", L"VRAM_BUDGET_GIB", "vram_budget_gib", K::choice, T::engine, nullptr},
+        {L"Quality mode", L"Q27_ACT_A4X2", "act_a4x2", K::choice, T::engine, nullptr},
         {L"Load the engine", L"ENGINE_AUTOSTART", nullptr, K::choice, T::server, nullptr},
         {L"Unload when idle (seconds)", L"ENGINE_IDLE_UNLOAD_S", nullptr, K::edit, T::live, L"0: never"},
         {L"Smallest KV pool (tokens)", L"MIN_KV_TOKENS", nullptr, K::edit, T::server, L"Below this it does not load. 0: any size"},
@@ -1094,6 +1096,16 @@ std::wstring plan_text(const Json& plan) {
 
 std::wstring value_name(const Row& row, const std::wstring& value) {
     if (value.empty() && !wcscmp(row.var, L"VRAM_BUDGET_GIB")) return L"automatic";
+    if (!wcscmp(row.var, L"SPEC")) {
+        if (value == L"dspine") return L"DSpine";
+        if (value == L"dflash2") return L"DFlash2";
+        if (value == L"none") return L"off";
+    }
+    if (!wcscmp(row.var, L"Q27_ACT_A4X2")) {
+        if (value == L"off") return L"off (fastest)";
+        if (value == L"decode") return L"decode (closer to BF16)";
+        if (value == L"all") return L"all (closest; prefill slower)";
+    }
     return value;
 }
 
@@ -1241,7 +1253,9 @@ void show_scan() {
         return;
     }
     std::wstring current = value_of(weights);
-    bool draft_needed = value_of(*row_of(L"SPEC")) != L"none" && !settings.scan_draft;
+    std::wstring spec = value_of(*row_of(L"SPEC"));
+    auto draft = settings.scan_drafts.find(spec);
+    bool draft_needed = spec != L"none" && !(draft != settings.scan_drafts.end() ? draft->second : settings.scan_draft);
     bool found = std::find(settings.scan_weights.begin(), settings.scan_weights.end(), current) != settings.scan_weights.end();
     settings.download_needed = !found || draft_needed;
     std::wstring note;
@@ -1310,6 +1324,12 @@ void load_rows() {
             wchar_t number[32];
             swprintf(number, 32, L"%g", wcstod(row.initial.c_str(), nullptr));  // (24.0 and 24 are the same choice)
             row.initial = number;
+        }
+        if (var == L"Q27_ACT_A4X2" && row.known) {  // (a number, as the engine reads it: the setting's name)
+            const std::wstring& v = row.initial;
+            if (v.empty() || v == L"0") row.initial = L"off";
+            else if (v == L"2") row.initial = L"decode";
+            else if (v != L"off" && v != L"decode" && v != L"all" && wcstol(v.c_str(), nullptr, 10) != 0) row.initial = L"all";
         }
     }
 }
@@ -1408,6 +1428,8 @@ void on_scan_answer(const SettingsResult& result) {
     settings.scanned = true;
     settings.scan_folder = result.text;
     settings.scan_draft = parsed["draft"].flag;
+    settings.scan_drafts.clear();
+    for (const auto& field : parsed["drafts"].fields) settings.scan_drafts[widen(field.first)] = field.second.flag;
     settings.scan_weights.clear();
     for (const auto& field : parsed["weights"].fields)
         if (field.second.type != Json::string) settings.scan_weights.push_back(widen(field.first));

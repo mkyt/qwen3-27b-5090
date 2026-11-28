@@ -2,6 +2,7 @@
 // memory where noted); all launches go to `stream` and are asynchronous.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include <cuda_bf16.h>
@@ -19,7 +20,8 @@ constexpr size_t kv_row_bytes(KvType t) {
 
 // Batched speculative steps (P6-10): up to kMaxLanes sequences ("lanes") run one step together. Each lane verifies
 // its own block of 2..16 rows (DFlash2: 8): the compute row buffers hold the lanes' rows packed, lane z in
-// rows lr.row0[z] .. lr.row0[z + 1] - 1 (LaneRows, passed by value: a captured step has a fixed layout). The batched
+// rows lr.row0[z] .. lr.row0[z + 1] - 1 (LaneRows, passed by value; with dev set, the kernels read the layout from
+// that device copy instead, so a captured step runs any split of the same shape, see LaneRows::live). The batched
 // kernels take the lane from a grid dimension (or the row) and its scalars at strided offsets (pos + z, ...); what
 // differs per lane otherwise (states, page tables) comes as pointer arrays. What outlives a step (the anchor, the
 // commit path, the grammar masks) sits in per-lane slots of kLaneSlot rows, independent of the layout.
@@ -38,9 +40,25 @@ constexpr int batch_row_budget(int lanes) {
 #endif
 // (Device code reads row0 at constant indices only, by selects: a dynamic index into a kernel parameter goes through
 // the stack, which cost the batched attention kernel 9 us per call.)
-struct LaneRows {
+struct alignas(16) LaneRows {
   int n = 0;                          // lanes
   uint8_t row0[kMaxLanes + 1] = {};   // lane z: rows row0[z] .. row0[z + 1] - 1; row0[n] = the total
+  // (P3-39) The layout the kernels use, when set: a device copy (written before the step, e.g. by a memcpy node of
+  // the step's graph) of a LaneRows with the same lanes, total and longest lane as this one (the host's values
+  // still size the launches). Kernels read it once, by live(), into a local.
+  const LaneRows* dev = nullptr;
+#if defined(__CUDACC__)
+  __device__ LaneRows live() const {
+    if (!dev) return *this;
+    const int4 v = *reinterpret_cast<const int4*>(dev);  // (n, then row0 from byte 4)
+    LaneRows r;
+    r.n = v.x;
+    const uint32_t w[3] = {uint32_t(v.y), uint32_t(v.z), uint32_t(v.w)};
+    Q27_UNROLL
+    for (int j = 0; j <= kMaxLanes; j++) r.row0[j] = uint8_t(w[j / 4] >> (8 * (j % 4)));
+    return r;
+  }
+#endif
   static LaneRows one(int T) {  // (a single sequence: one lane of T rows)
     LaneRows r;
     r.n = 1;
@@ -86,13 +104,14 @@ struct LaneRows {
     for (int j = 1; j < kMaxLanes; j++) z += j < n && p >= row0[j] - j;
     return z;
   }
-  bool operator==(const LaneRows& o) const {
+  bool operator==(const LaneRows& o) const {  // (the layouts; dev is not compared)
     if (n != o.n) return false;
     for (int z = 0; z <= n; z++)
       if (row0[z] != o.row0[z]) return false;
     return true;
   }
 };
+static_assert(offsetof(LaneRows, row0) == 4 && kMaxLanes + 1 <= 12, "LaneRows::live reads n and row0 as one int4");
 struct SeqLanes {
   int n = 0;                                   // lanes (0: an unbatched call)
   const int32_t* pos = nullptr;                // [n] committed lengths
@@ -111,6 +130,8 @@ struct QuantOut {
   uint8_t* q = nullptr;   // fp8 [T][D] / packed e2m1 [T][D/2]
   uint8_t* sf = nullptr;  // NVFP4 only: swizzled scale factors
   float* scale = nullptr; // kFp8Row only: [T]
+  int row2 = 0;           // kFp4: > 0 also writes the second term (W4A4x2: the quantization of what the first left,
+                          // the same global scale) as row t + row2 of q / sf
 };
 
 // ---------------------------------------------------------------- elementwise (kernels.cu)
@@ -123,7 +144,8 @@ void embed_gather(const bf16* table, const int32_t* ids, int T, int D, float* ou
 void rmsnorm(const float* x, const bf16* w, int T, int D, float eps, bool zero_centered, float* out, cudaStream_t s);
 // Dynamic NVFP4 quantization (modelopt / FlashInfer numerics, see reference/qwen27b/quant.py):
 // q [M][K/2] packed e2m1 (low nibble = even column), sf in the CUTLASS SM1xx swizzled layout.
-void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s);
+void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s,
+               int row2 = 0);  // row2 > 0: two terms, as QuantOut::row2
 // A BF16 weight matrix [M][K] to NVFP4 (Weights::fp4_from_bf16), global = its weight_scale_2 (amax / 2688), the
 // block scales searched for the smallest error. The scale factors of rows m0.. of a larger matrix start at
 // sf + sf_bytes(m0, K / 16) when m0 is a multiple of 128.
@@ -142,9 +164,9 @@ void silu_mul_quant_fp4(const bf16* gate, const bf16* up, int64_t ld, int T, int
 // The same from the [T][2 I] output of the interleaved gate | up weights (glu_row: gate and up in alternate blocks
 // of 64 rows), with the gate's and the up's alphas applied here (the GEMM ran with alpha 1).
 void silu_mul_quant_fp4_glu(const float* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
-                            uint8_t* q, uint8_t* sf, cudaStream_t s);
+                            uint8_t* q, uint8_t* sf, cudaStream_t s, int row2 = 0);
 void silu_mul_quant_fp4_glu(const bf16* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
-                            uint8_t* q, uint8_t* sf, cudaStream_t s);
+                            uint8_t* q, uint8_t* sf, cudaStream_t s, int row2 = 0);
 // x' = e4m3(x / input_scale), [n] elements.
 void quant_fp8(const float* x, int64_t n, float input_scale, uint8_t* q, cudaStream_t s);
 // Dynamic per-row FP8 (QuantOut::kFp8Row): scale[t] = amax(row t) / 448 (1 for an all-zero row),
@@ -240,9 +262,13 @@ struct AlphaSegments {
 // Same contract as gemm_fp4 / gemm_fp8 for M = 1..64 (N a multiple of 128). The workspace holds the
 // split-K partials and per-tile counters; it must be zeroed once before the first call (the kernels
 // leave the counters at zero).
+// x2 > 0 (W4A4x2): a has M = 2 x2 rows, row t + x2 the second NVFP4 term of token t; d [x2][N] gets the sum of the
+// two terms' products (+ c, beta 1), each product rounded, then (c + first) + second.
+// a2row >= 0 (with x2 <= 64): the second term of token t is row a2row + t instead (a multiple of 128, its scales in
+// the same swizzled array), still one pass over the weights; M = 2 x2.
 void skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                 const AlphaSegments& alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes,
-                cudaStream_t s);
+                cudaStream_t s, int x2 = 0, int a2row = -1);
 void skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, const AlphaSegments& alpha, const float* c,
                 float beta, float* d, void* ws, size_t ws_bytes, cudaStream_t s);
 // Draft model weights quantized at load: d[t][n] = acc * wscale[n] * ascale[t] (per-output-channel weight
@@ -257,6 +283,16 @@ void skinny_fp4_scaled(int M, int N, int K, const uint8_t* a, const uint8_t* a_s
 // BF16 activations [M][K] x BF16 weights [N][K] (the draft model).
 void skinny_bf16(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,
                  void* ws, size_t ws_bytes, cudaStream_t s);
+
+// W4A4x2 for the lm_head (skinny_a4x2.cu): d = alpha * (x0 + x1) . W^T with the two NVFP4 terms of quant_fp4x2
+// (q [2 M][K / 2], q_sf [2 M][K / 16] row-major; row 2 tok + term) x NVFP4 weights [N][K] (skinny_fp4's layout);
+// alpha = input_scale * the weight's global scale; M = 1..64, N a multiple of 128, K of 256.
+void skinny_fp4_a4x2(int M, int N, int K, const uint8_t* q, const uint8_t* q_sf, const uint8_t* w,
+                     const uint8_t* w_sf, float alpha, float* d, cudaStream_t s);
+// Those two terms: x0 = the NVFP4 quantization of x, x1 = that of x - x0, with one global scale. With w, RMSNorm
+// first (rmsnorm_quant's arithmetic, so x0 is bit for bit its activation).
+void quant_fp4x2(const float* x, const bf16* w, int M, int K, float eps, float input_scale, uint8_t* q, uint8_t* sf,
+                 cudaStream_t s);
 
 // ---------------------------------------------------------------- GDN (gdn.cu)
 

@@ -148,6 +148,7 @@ label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--in
     <button class="cfgbtn" id="cfg" type="button" aria-expanded="false" aria-controls="launch" title="Start settings"></button>
     <span class="muted" id="engine-note" style="font-size:12px"></span>
     <span class="muted" id="conn" style="margin-left:auto"></span>
+    <a href="chat" style="color:var(--ink2)">Chat</a>
   </header>
 
   <section class="card" id="launch" hidden>
@@ -598,8 +599,9 @@ function drawHeader() {
   b.replaceChildren();
   if (st) {
     const ctx = eng === "ready" && i.max_tokens ? i.max_tokens : st.max_tokens;
-    b.append([st.weights, `KV ${st.kv_dtype}`, st.spec === "dflash2" ? "DFlash2" : "no spec", `vision ${st.vision}`,
-      `${st.max_seqs} req`, `ctx ${ctx % 1024 ? fmtTok(ctx) : ctx / 1024 + "K"}`, `VRAM ${fmtVal("vram_budget_gib", st.vram_budget_gib)}`].join(" · "));
+    b.append([st.weights, `KV ${st.kv_dtype}`, st.spec === "none" ? "no spec" : (SPEC_NAMES[st.spec] || st.spec), `vision ${st.vision}`,
+      `${st.max_seqs} req`, `ctx ${ctx % 1024 ? fmtTok(ctx) : ctx / 1024 + "K"}`, `VRAM ${fmtVal("vram_budget_gib", st.vram_budget_gib)}`,
+      st.act_a4x2 && st.act_a4x2 !== "off" ? `quality ${st.act_a4x2}` : null].filter(Boolean).join(" · "));
     if (launchChanges().length) b.append(" · ", el("span", { class: "edited" }, "edited"));
   }
   b.append(" ", $("launch").hidden ? "▾" : "▴");
@@ -623,14 +625,18 @@ document.querySelectorAll("#ctl button").forEach((b) => b.addEventListener("clic
 
 // ---------------------------------------------------------------- start settings (launch.py)
 const L = { saved: null, running: null, form: null, weights: {}, plan: null, err: null, seq: 0, timer: null, eng: null };
+const SPEC_NAMES = { dspine: "DSpine", dflash2: "DFlash2" };
 const OPTS = [
   { key: "weights", label: "Weights", note: "model kind", names: { gdnfp4: ["gdnfp4", "GDN NVFP4, attn FP8"], nvidia: ["nvidia", "GDN / attn FP8"], quasar: ["quasar", "all NVFP4 (QAT)"] } },
   { key: "kv_dtype", label: "KV cache", note: "quantization", names: { nvfp4: ["NVFP4"], fp8: ["FP8"], bf16: ["BF16"] } },
-  { key: "spec", label: "Speculative decoding", names: { dflash2: ["DFlash2"], none: ["off"] } },
+  { key: "spec", label: "Speculative decoding", note: "draft model", names: { dspine: ["DSpine", "default"], dflash2: ["DFlash2"], none: ["off"] } },
   { key: "vision", label: "Vision tower", note: "image input", names: { host: ["host", "pinned RAM, streamed"], fp8: ["GPU FP8"], bf16: ["GPU BF16"], off: ["off", "no images"] } },
   { key: "max_seqs", label: "Requests at once", note: "MAX_SEQS" },
   { key: "max_tokens", label: "Context limit", note: "per request, MAX_TOKENS" },
   { key: "vram_budget_gib", label: "VRAM budget", note: "allocated by the engine", custom: true },
+  { key: "act_a4x2", label: "Quality mode", note: "speed for accuracy, Q27_ACT_A4X2",
+    names: { off: ["off", "fastest"], decode: ["decode", "2-term activations in decode; 8 req about -13%"], all: ["all", "every layer; prefill about -40%"] },
+    title: "Two-term NVFP4 activations (W4A4x2): closer to the BF16 model (KL to it 0.057 -> 0.032 with all), slower" },
 ];
 const fmtVal = (k, v) => k === "vram_budget_gib" ? (v == null ? "auto" : `${v} GiB`) :
   k === "max_tokens" ? (v % 1024 ? v.toLocaleString() : `${v / 1024}K`) + (v === 262144 ? " (262,144)" : "") : String(v);
@@ -729,7 +735,7 @@ function drawLaunch() {
       inp.addEventListener("change", () => { const v = parseFloat(inp.value); setForm("vram_budget_gib", isFinite(v) ? v : null); });
       row.append(el("label", { class: "opt", style: "cursor:default" }, el("b", {}, "custom "), inp, el("span", { class: "n" }, "GiB")));
     }
-    box.append(el("div", { class: "k" }, o.label, o.note ? el("small", {}, o.note) : null), row);
+    box.append(el("div", o.title ? { class: "k", title: o.title } : { class: "k" }, o.label, o.note ? el("small", {}, o.note) : null), row);
   }
   box.append(el("div", { class: "k" }, "Unload when idle", el("small", {}, "applies at once")), idleRow());
   // The plan of the settings as chosen.

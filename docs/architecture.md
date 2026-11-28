@@ -103,7 +103,7 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 | MLP (gate, up, down) | NVFP4, W4A4 (16-element blocks, FP8 block scales) | 8.96 | yes |
 | GDN projections (qkv, z, out; a and b) | NVFP4, W4A4 (a and b: BF16) | 2.94 | yes |
 | Attention projections (q, k, v, o) | FP8, W8A8 (per-tensor scales) | 1.56 | yes |
-| lm_head | NVFP4 | 0.67 | yes |
+| lm_head | NVFP4, W4A4x2 (the activations in two NVFP4 terms) | 0.67 | yes |
 | Embedding | BF16, in pinned host memory | 0 | one row per token |
 | Vision tower | BF16, in pinned host memory (`VISION=host`) | 0 | only for images |
 | Draft (DSpine; DFlash2) | NVFP4, quantized at load time (DSpine's code bridge BF16, its codebook in pinned host memory) | about 1.2 | yes |
@@ -113,6 +113,11 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
   the GPU into the kernels' layouts; there is no converted copy on disk. The attention projections stay FP8
   because quantizing them costs parallel tool calls; [decisions.md](decisions.md#weights) has the measurements.
   `scripts/build-gdnfp4.sh` rebuilds it (it needs the BF16 original and a few hours).
+- **The lm_head's activations take two terms** (`engine/src/skinny_a4x2.cu`): q0 is the usual NVFP4 quantization of
+  the normalized activations x, q1 that of x - q0 with the same global scale. The kernel reads the weights once and
+  runs an FP4 MMA on each term: the input's error drops from 9.3% to 0.9% and the logits are as good as with BF16
+  activations, at the one-term kernel's speed, since reading the weights bounds the step. An FP8 lm_head is not
+  affected. `Q27_LM_HEAD_A4X2=0` gives one term.
 - **Fused projections.** GDN's `qkv | z`, attention's `q (+gate) | k | v` and the MLP's `gate | up` each run as one
   GEMM. Their activation scales are equal in every layer of the checkpoint, so fusing does not change the
   activation quantization.
@@ -176,7 +181,9 @@ request decodes at 96.6 tok/s at a short context.
   a cp.async ring of 3 stages per warp with `ldmatrix`, and split-K so that 170 SMs stay busy. At 1 to 8 rows the
   loads of the activations are 4-byte, at 16 to 32 rows 16-byte with a transpose in registers (P6-11), and at
   64 rows the activations are staged once per CTA in shared memory (P7-4). When the outputs are split along K,
-  a separate kernel sums the partials (P7-4) from two rows up. CUTLASS's 128 x 128 tiles reached 0.08 to
+  a separate kernel sums the partials (P7-4) from two rows up. The split does not depend on the number of rows,
+  so a token's row is bit-identical whether it is computed alone (decode) or among verify or batched rows
+  (before v0.6.2 one-row calls split more finely, and plain decode differed from verify). CUTLASS's 128 x 128 tiles reached 0.08 to
   0.9 TB/s on these shapes; the skinny GEMMs reach 1.3 to 1.67 TB/s.
 - **One CUDA graph per step, chained with PDL.** Every kernel triggers its dependents first and then waits for its
   predecessor (`griddepcontrol`), so the next GEMM is resident and prefetches its weights into L2 while the
@@ -212,7 +219,14 @@ below walks that table. A sequence verifies 16 rows while its tokens per step st
 the rows are packed, the kernels take each lane's first row and count, and every few steps (8) the engine moves one
 lane's rows at a time while that raises the step's expected tokens per ms, from each lane's tokens per step at
 the widths it ran (moving averages; untried widths extrapolated) and a model of the step time (about 11 + 0.18 per lane + 1.1 per 16 rows begun + 0.11 per row ms; the GEMMs step up
-every 16 rows). A new split of the rows updates the step's CUDA graph in place. `SPEC=dflash2` selects DFlash2, described next.
+every 16 rows). The kernels read the split from device memory (`Q27_BATCH_DEV_ROWS`): the step's graph copies it
+from a host buffer the engine fills before each launch, and is cached per shape (requests, total rows, longest
+request's rows), so a new split runs in the same graph. After the draft, each lane may verify
+fewer rows than it drafted (`Q27_SPEC_CUT`): a small kernel turns each lane's table into its expected tokens at every
+width (a logistic accept model per position, on the largest probability and the entropy of the row, carried through
+the walk's distribution), the host picks the prefixes that maximize the expected tokens minus the recent tokens per ms
+times the verify's time (a DP over the total rows), and the verify runs on those rows. The draft and the verify are two
+CUDA graphs. `SPEC=dflash2` selects DFlash2, described next.
 
 The DFlash2 draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"
 layers that read the target's hidden states from five layers, attend to the last 2,048 tokens and propose 7 tokens
@@ -236,7 +250,8 @@ from an anchor and verifies all 8 rows in one forward of the target.
 - **Lossless sampling.** Acceptance is rejection sampling against the target's distribution with the request's
   own temperature, top-k, min-p and top-p, so the output has the target's distribution exactly (checked with
   chi-square tests in `scripts/spec_sampling_test.py`). With greedy decoding, speculative and plain decoding give
-  identical tokens (`scripts/bench_spec.py --check-greedy`).
+  identical tokens (`scripts/bench_spec.py --check-greedy`), with the default settings since v0.6.2 (the skinny
+  GEMMs' split above).
 - **Penalties on the device.** Presence and frequency penalties count each sequence's output tokens in a
   vocabulary-sized array on the device (1 MiB per sequence), updated by the accept step itself, so pipelined
   steps need no host round trip. A verify row also counts the draft tokens on its own path, so every row sees the
@@ -374,7 +389,11 @@ images.
   fp32 patches, and the 0.3 s that numpy took for those on the CPU is gone.
 - Image tokens enter the prompt as out-of-vocabulary ids derived from the image's content. The prefix cache, which
   compares token ids, therefore distinguishes images without any change and skips encoding images that are already
-  in a cached prefix. The embeddings are written to a pinned host table that the embedding gather reads.
+  in a cached prefix. The embeddings are written to a pinned host table (`IMAGE_TOKENS` rows of 10 KiB) that the
+  embedding gather reads. The table holds only the images near the prefill call about to run: before each call the
+  engine process encodes the images and video pairs it may reach (under two prefill chunks) into rows of images the
+  prompt has already passed, so a request may hold any number of images, as an agent's history of screenshots
+  grows. An image the prompt runs again (its cached prefix was evicted) is encoded again.
 - M-RoPE: rows of an image get (t, h, w) positions; after the last image, positions continue as position + delta
   (one device integer), so decode and the speculative graphs are unchanged, and text-only requests are
   bit-identical to the text path.
@@ -389,9 +408,10 @@ takes it unchanged. In the vision tower a pair differs from an image only in tha
 over the temporal patch instead of one image twice; attention, position embeddings and RoPE stay within the pair.
 
 - The vision tower encodes many pairs of one grid in one pass (attention over each pair's patches: the third
-  grid dimension of the attention kernel), as many as `IMAGE_MAX_PIXELS` holds, so a 5-minute video's 300 pairs
-  take 0.25 s instead of 300 weight streams (about 20 ms each with `VISION=host`). The result is bit-identical to
-  one pair per call.
+  grid dimension of the attention kernel): the pairs one prefill call reaches, as many as `IMAGE_MAX_PIXELS`
+  holds, so a 5-minute video's 300 pairs take a few weight streams (about 20 ms each with `VISION=host`) instead of
+  300. The result is bit-identical to one pair per call. The frames are decoded once and kept until the prompt
+  has passed the video.
 - The engine library reads the container itself (`engine/src/video_mp4.cc`: MP4 / MOV, fragmented files and edit
   lists included; every offset and count checked against the file; `engine/src/video_mkv.cc`: Matroska / WebM on
   libwebm's `mkvparser`, the frame rate from `DefaultDuration` as libavformat rounds it, else from the frames'
@@ -411,6 +431,12 @@ over the temporal patch instead of one image twice; attention, position embeddin
   resized on the GPU in one pass per axis, PIL's bicubic bit for bit (fixed-point weights computed as
   `libImaging/Resample.c` does). Only the resized frames (at most 75 MB for a video) go to host memory, for the
   vision tower's input path.
+- Under WSL2 a decode first wakes the GPU (`wake_gpu`): a CUDA context created and destroyed at once raises it to
+  P1 for about 6 s, without a clock or power setting. It costs about 0.1 s and, for that long, 0.5 GiB of device
+  memory, at most once in 2 s (`Q27_NVDEC_WAKE`; not part of the decode times below). Without it a decode starting
+  in P8 could hang until Windows reset the engine (TDR), and the process lost its CUDA context. A decode that loses
+  the context all the same returns -4 (`videoproc.DeviceLost`): the engine process exits, the request gets HTTP 503
+  (not the 400 of a broken video) and the server starts a new engine.
 - One decoding session keeps one NVDEC engine busy (the RTX 5090 has two): a video of 256 frames or more is cut at
   closed key frames (IDR / BLA, not CRA) into one part per engine, decoded at once; a part that shows another number
   of frames than its samples (an open GOP after all) makes the video decode again in one part. 60 s at 30 fps,
@@ -457,7 +483,7 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
 - The server marks message boundaries for the prefix cache and reports, per request, how many tokens came from it.
 - OpenAI chat completions and completions also return llama.cpp's `timings` object (`cache_n`, `prompt_n`, `prompt_ms`,
   `predicted_n`, `predicted_ms` and the rates), on the response or the last streamed chunk, which front-ends such as
-  llama-swap read. With a draft, `draft_n` is 7 per verify step and `draft_n_accepted` the step's tokens minus the
+  llama-swap read (`prompt_ms` includes the vision tower for the images it encodes). With a draft, `draft_n` is 7 per verify step and `draft_n_accepted` the step's tokens minus the
   bonus token, as llama.cpp counts them; they are left out without a draft and with `Q27_SPEC_PATHS` above 1.
 - `/metrics` exposes Prometheus metrics; `/admin/concurrency` reads and sets the admission settings. There is no
   authentication: the server is meant to listen on 127.0.0.1 for one user.
@@ -466,6 +492,8 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
   (`q27_memory_report`); the server adds NVML samples and a log of requests and engine events, and streams them to
   the page as server-sent events. The page (and `POST /admin/engine`) also stops, starts and restarts the engine
   process: it holds all the VRAM, the server none.
+- `/chat` is a chat page (`frontend/ui/chat.html`, one file with no external resources) that calls
+  `/v1/chat/completions` from the same origin and keeps conversations in the browser's `localStorage`.
 - Start settings (`frontend/launch.py`): an engine can start with other weights, KV type, draft, vision tower,
   `MAX_SEQS`, `MAX_TOKENS` or VRAM budget. What each leaves for the context comes from the engine's own memory
   planner: `q27_plan` runs the constructor's planning (the pools, `MAX_TOKENS_FIT`, the KV pool) for a given free
@@ -490,6 +518,9 @@ and computes plainly.
   instead of a BF16 KV cache, differs from itself by a mean KL of 0.036 and 89% top-1 agreement over the golden
   positions. The engine is accepted when its distance to the reference is of the same size: mean KL <= 0.05, top-1
   >= 88%, positions with KL > 0.5 <= 1% (`reference/golden.py`, [benchmarks.md](benchmarks.md)).
+  Engine and reference must run the same number of lm_head terms: both take two by default (KL 0.028 between them),
+  while the published recordings of NVIDIA's checkpoint have one, as do the floor and the limits above
+  (`Q27_LM_HEAD_A4X2=0`, `golden ref --lm-head-terms 1`).
 - **Invariants that are tested bit for bit** (they keep the tests simple and catch logic errors that the noise
   above would hide):
   - a verify row equals the decode of the same token (speculative and plain greedy decoding agree),

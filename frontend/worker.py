@@ -57,6 +57,9 @@ class ImageError(Exception):
     """An image or video of the request cannot be decoded (the client's error: 400)."""
 
 
+VOCAB = 248320  # rows of the engine's embedding table (kVocab)
+
+
 def log(msg):
     print(f"[sched] {msg}", file=sys.stderr, flush=True)
 
@@ -81,6 +84,10 @@ class Seq:
         self.images = req.get("images")
         self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), ("video", k) -> of the
         #                          video's frames (videoproc.frames), started on arrival
+        # The images in the engine's image table while the prompt runs (Scheduler.mm_ready): span index -> row, and
+        # video k -> (first pair, its frames from there) until the prompt has passed the video.
+        self.mm_rows, self.mm_frames = {}, {}
+        self.mm_waited = 0.0     # seconds decoding images or waiting for their decode (log)
         self.arrival = now
         self.out = []            # generated tokens (EOS excluded)
         self.eng_ids = self.prompt  # what the engine runs (prompt + earlier output after a preemption)
@@ -156,6 +163,7 @@ class Scheduler:
         self.held_until = (None, 0.0)  # (request, time): skip checking it again until then
         self.batch = self.spec and cfg.get("batch_decode", True) and self.engine.max_lanes > 1
         self.chunk = cfg["prefill_chunk"]
+        self.image_tokens = int(os.environ.get("IMAGE_TOKENS") or 16384)  # (the engine's image table: rows)
         self.share = cfg["decode_share"]
         self.quantum = cfg["quantum_ms"] / 1000.0
         self.eos = set(cfg["eos"])
@@ -205,7 +213,16 @@ class Scheduler:
                 raise SystemExit(0)
 
     def submit(self, rid, req):
-        s = Seq(rid, req, time.time())
+        # (the server checks the request; a malformed one that gets past it fails alone, not the engine)
+        try:
+            s = Seq(rid, req, time.time())
+            array.array("i", s.prompt)  # (integers that fit int32)
+            # (an image's positions hold ids above the vocabulary: image_tokens.image_token_ids)
+            if s.prompt and (min(s.prompt) < 0 or (max(s.prompt) >= VOCAB and not s.images)):
+                raise ValueError(f"a prompt token id is out of the vocabulary (0..{VOCAB - 1})")
+        except (TypeError, ValueError, KeyError, OverflowError) as e:
+            self.send("error", rid, f"bad request: {e}", 400)
+            return
         if s.grammar is not None:
             try:
                 s.matcher = self.matcher(s.grammar)
@@ -602,59 +619,115 @@ class Scheduler:
         else:  # (after a preemption or a forced output)
             log(f"{s.rid}: resumed at {len(s.eng_ids)} tokens, {cached} restored from the prefix cache")
         if s.images:
-            spans, srcs, _ = s.images
+            spans = s.images[0]
             self.engine.mm_set(spans)
-            t0, encoded, waited = time.time(), 0, 0.0
+            s.mm_rows, s.mm_frames = {}, {}  # (the engine has no embeddings yet: mm_ready encodes them)
+            past = [gh * gw for start, gh, gw in spans if start + gh * gw > cached]
+            log(f"{s.rid}: images {len(spans)} ({sum(gh * gw for _, gh, gw in spans)} tokens), "
+                f"{len(past)} ({sum(past)} tokens) past the restored prefix")
 
-            def pixels(key, g=0):
-                """The image's pixels, or the video's frames from its pair g on."""
-                nonlocal waited
-                t1, f = time.time(), s.decoding.pop(key, None)
-                loan = -1
-                try:
-                    if f is not None and f.first_pair <= g:  # (prefetched from its first pair past the prefix)
-                        out = f.result()
-                        return out[2 * (g - f.first_pair):] if isinstance(key, tuple) else out
-                    if f is not None:  # (the cache restored less than the prefetch expected: earlier pairs too)
-                        f.cancel()
-                    sessions, loan = self.lend(s, key, g)
-                    return self.decode(s, key, sessions, g)
-                except Exception as e:  # noqa: BLE001 - any decoder error is the client's
-                    raise ImageError(f"cannot decode {'video' if isinstance(key, tuple) else 'image'}: {e}") from e
-                finally:
-                    if loan >= 0:
-                        self.engine.kv_unlend(loan)
-                    self.unlend()
-                    waited += time.time() - t1
+    def pixels(self, s, key, g=0):
+        """The pixels of image `key`, or the frames of video ("video", k) from its pair g on: prefetched, or decoded
+        now."""
+        t1, f = time.time(), s.decoding.pop(key, None)
+        loan, lost = -1, False
+        try:
+            if f is not None and f.first_pair <= g:  # (prefetched from its first pair past the prefix)
+                out = f.result()
+                return out[2 * (g - f.first_pair):] if isinstance(key, tuple) else out
+            if f is not None:  # (the cache restored less than the prefetch expected: earlier pairs too)
+                f.cancel()
+            sessions, loan = self.lend(s, key, g)
+            return self.decode(s, key, sessions, g)
+        except Exception as e:  # noqa: BLE001 - any decoder error is the client's, but a lost CUDA context
+            if getattr(e, "device_lost", False):  # (videoproc.DeviceLost: the process ends, the server's 503)
+                lost = True
+                raise
+            raise ImageError(f"cannot decode {'video' if isinstance(key, tuple) else 'image'}: {e}") from e
+        finally:
+            if not lost:  # (on a dead context the return would fail and hide the decode's error)
+                if loan >= 0:
+                    self.engine.kv_unlend(loan)
+                self.unlend()
+            s.mm_waited += time.time() - t1
 
-            i, frames = 0, {}
-            while i < len(spans):
-                start, gh, gw = spans[i]
-                src = srcs[i]
-                if start + gh * gw <= cached:  # (images inside the restored prefix need no embeddings)
-                    i += 1
-                    continue
-                if src[0] == "image":
-                    self.engine.mm_encode_rgb(i, pixels(i), src[3])
-                    i, encoded = i + 1, encoded + 1
-                    continue
-                k = src[1]  # (a video: its pairs from here to its end, encoded together)
-                j = i
-                while j < len(spans) and srcs[j][0] == "video" and srcs[j][1] == k:
-                    j += 1
-                # (the pairs from the first one past the restored prefix to the video's end: decoded from there)
-                frames[k] = pixels(("video", k), src[2])
-                self.engine.mm_encode_frames(i, frames[k][:2 * (j - i)], src[3])
-                i, encoded = j, encoded + j - i
-            frames.clear()
-            self.drop_decoding(s)  # (the pixels are not kept: a suspended request that needs them decodes again)
-            log(f"{s.rid}: images {len(spans)} ({sum(gh * gw for _, gh, gw in spans)} tokens), encoded {encoded} "
-                f"in {time.time() - t0:.3f} s ({waited:.3f} s decoding or waiting for it)")
+    def mm_ready(self, s, lo, hi):
+        """Makes the embeddings of the images and video pairs at positions lo .. hi - 1 (what the next prefill call
+        may run) ready in the engine's image table: places and encodes those not in it, reusing the rows of images
+        before lo, which the prompt has passed. The table (IMAGE_TOKENS rows) then only needs to hold the images
+        near one prefill call, so a request may hold any number of images; an image the prompt passes again (a
+        cache miss: a new prefix_begin) is encoded again."""
+        spans, srcs, _ = s.images
+        size = [gh * gw for _, gh, gw in spans]
+        need = [i for i, (start, _, _) in enumerate(spans) if start < hi and start + size[i] > lo]
+        for k in list(s.mm_frames):  # (the frames of a video the prompt has passed)
+            if all(spans[i][0] + size[i] <= lo for i in range(len(spans)) if srcs[i][0] == "video" and srcs[i][1] == k):
+                del s.mm_frames[k]
+        new = [i for i in need if i not in s.mm_rows]
+        if not new:
+            return
+        if sum(size[i] for i in need) > self.image_tokens:
+            raise ImageError(f"the images near positions {lo}..{hi} take {sum(size[i] for i in need)} tokens, "
+                             f"more than IMAGE_TOKENS ({self.image_tokens}; the server's setting)")
+
+        def units(idx):
+            """Images to encode together: an image alone, a video's consecutive pairs."""
+            out = []
+            for i in idx:
+                if out and srcs[i][0] == "video" and out[-1][-1] == i - 1 and srcs[i - 1][0] == "video" \
+                        and srcs[i - 1][1] == srcs[i][1]:
+                    out[-1].append(i)
+                else:
+                    out.append([i])
+            return out
+
+        def place(groups, used):
+            """First fit of each group's rows between the `used` (start, end) rows; None when one does not fit."""
+            used, out = sorted(used), []
+            for u in groups:
+                n, row = sum(size[i] for i in u), 0
+                for a, b in used:
+                    if row + n <= a:
+                        break
+                    row = max(row, b)
+                if row + n > self.image_tokens:
+                    return None
+                used = sorted(used + [(row, row + n)])
+                out.append((u, row))
+            return out
+
+        keep = {i: r for i, r in s.mm_rows.items() if i in need}
+        plan = place(units(new), [(r, r + size[i]) for i, r in keep.items()])
+        if plan is None:  # (no gap large enough between the kept images: all of them again from row 0)
+            keep, plan = {}, place(units(need), [])
+        s.mm_rows = dict(keep)
+        t0, waited0, rows = time.time(), s.mm_waited, 0
+        for u, row in plan:
+            self.engine.mm_place(u[0], len(u), row)
+            src = srcs[u[0]]
+            if src[0] == "image":
+                self.engine.mm_encode_rgb(u[0], self.pixels(s, u[0]), src[3])
+            else:  # (a video's pairs: the frames are decoded once, from the first pair the prompt runs)
+                k, g = src[1], src[2]
+                first, frames = s.mm_frames.get(k, (None, None))
+                if frames is None or g < first or 2 * (g - first + len(u)) > len(frames):
+                    first, frames = g, self.pixels(s, ("video", k), g)
+                    s.mm_frames[k] = (first, frames)
+                self.engine.mm_encode_frames(u[0], frames[2 * (g - first):2 * (g - first + len(u))], src[3])
+            for i in u:
+                s.mm_rows[i], row = row, row + size[i]
+                rows += size[i]
+        log(f"{s.rid}: images at {lo}..{hi}: encoded {sum(len(u) for u, _ in plan)} ({rows} tokens) in "
+            f"{time.time() - t0:.3f} s ({s.mm_waited - waited0:.3f} s decoding or waiting for it)")
 
     def prefill_turn(self, s):
         self.load(s)
         t0, fed0 = time.time(), s.fed
         rest = s.eng_ids[s.fed:]
+        # (the turn's time includes the vision tower: the engine runs the chunks asynchronously, and the encode waits
+        # for the previous chunk, so the two cannot be told apart without another synchronization)
+        if s.images:  # (Engine.prefill runs whole chunks up to the budget: under two chunks)
+            self.mm_ready(s, s.fed, s.fed + (len(rest) if len(rest) <= self.chunk else min(len(rest), 2 * self.chunk)))
         if len(rest) > self.chunk:
             s.fed += self.engine.prefill(rest, self.chunk, spec=self.spec)
         else:
@@ -680,6 +753,9 @@ class Scheduler:
                 tok = self.engine.forward_sample(rest, s.temperature, s.top_k, s.top_p, s.rng.random(), **extra)
             s.fed = len(s.eng_ids)
             s.phase = DECODE
+            if s.images:  # (the pixels are not kept: a suspended request that needs them decodes again)
+                self.drop_decoding(s)
+                s.mm_rows, s.mm_frames = {}, {}
             if s.first_token is None:
                 s.first_token = time.time()
         fed = s.fed  # (a forced output in the emit starts the request again: s.fed is 0 after it)
@@ -875,6 +951,7 @@ class Scheduler:
             return
         s.dead = True
         self.drop_decoding(s)
+        s.mm_rows, s.mm_frames = {}, {}
         if s in self.alive:
             self.alive.remove(s)
         self.by_id.pop(s.rid, None)

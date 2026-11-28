@@ -8,10 +8,10 @@
 #include <string>
 
 #include <cuda_runtime.h>
+#include "check.h"
 
 namespace q27 {
 
-[[noreturn]] void fail(const std::string& msg);
 // The KV page pool cannot hold the running sequence's next positions (every cached checkpoint already
 // evicted). Thrown before anything is launched, so the sequence is unchanged and the call can be
 // retried once other sequences gave pages back (the C API returns -2).
@@ -30,11 +30,6 @@ void log(const char* fmt, ...);
     if (err_ != cudaSuccess)                                                                  \
       ::q27::fail(std::string(#call " failed: ") + cudaGetErrorString(err_) + " at " __FILE__ \
                   ":" + std::to_string(__LINE__));                                            \
-  } while (0)
-
-#define Q27_CHECK(cond, msg)                                         \
-  do {                                                               \
-    if (!(cond)) ::q27::fail(std::string("check failed: ") + (msg)); \
   } while (0)
 
 // Dimensions of Qwen3.8-27B (text). The runtime is specialized for this model; the loader checks

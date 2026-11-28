@@ -27,7 +27,7 @@ What it takes for a setting to change depends on who reads it, and when:
 | At once | `ENGINE_IDLE_UNLOAD_S` | Stats page, `POST /admin/engine/idle` | The file |
 | At once | `MIN_SEQ_TPS`, `ADMIT_KV`, `KV_RESERVE_TOKENS` | `POST /admin/concurrency` | The file |
 | At once | `target_seqs` | `POST /admin/concurrency` | Cannot be kept: there is no variable (`MAX_SEQS` is the upper limit that can) |
-| When the engine restarts | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_BUDGET_GIB` | Stats page ([Start settings](#start-settings)), `POST /admin/engine` | The file. The page lists the lines to add, for these and for `ENGINE_IDLE_UNLOAD_S` |
+| When the engine restarts | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_BUDGET_GIB`, `Q27_ACT_A4X2` | Stats page ([Start settings](#start-settings)), `POST /admin/engine` | The file. The page lists the lines to add, for these and for `ENGINE_IDLE_UNLOAD_S` |
 | When the server restarts | Everything else, such as `HOST`, `PORT`, `HF_HOME`, `ENGINE_AUTOSTART`, `MIN_KV_TOKENS`, `MAX_TOKENS_FIT`, `STATE_HOST_CACHE`, `PREFILL_CHUNK` | Not possible | The file |
 
 - Restarting the engine reloads the weights, fails the requests in flight and empties the prefix cache. Restarting the
@@ -55,8 +55,14 @@ your network, set `HOST` to `0.0.0.0`:
 Use `0.0.0.0` rather than the PC's own address: the tray app and `scripts/serve.sh` check the server on `127.0.0.1`.
 
 **Security:** there is no authentication. Anyone who can reach the port can use the model, and can stop the engine and
-change its settings through the admin API and the stats page. Do this only on a network you trust, and do not forward the
-port to the internet.
+change its settings through the admin API and the stats page. It can also make the server fetch image and video URLs
+from the server's network (including addresses only that machine can reach). Do this only on a network you trust, and
+do not forward the port to the internet.
+
+POST requests that a browser sends from a page of another site (an `Origin` header other than the server's own) get
+403, so a web page you visit cannot use the server through your browser, even when it listens only on `127.0.0.1`.
+API clients send no `Origin` and are not affected, nor is the built-in UI. Behind a reverse proxy, the proxy must pass
+`Host` or set `X-Forwarded-Host`. `TRUSTED_ORIGINS` allows other origins.
 
 **Windows Firewall:** the first start of the Windows package with `0.0.0.0` asks whether to allow Python; allow it for
 private networks. If you closed that prompt, add a rule in an administrator PowerShell:
@@ -86,8 +92,8 @@ the port opens without a firewall rule and those tools' rules do not close it. T
   ```
 
 **On the other machine,** use the PC's address in place of `127.0.0.1`: the API at `http://<address>:8000/v1` (Anthropic
-clients: `http://<address>:8000`) and the stats page at `http://<address>:8000/ui`. With another `PORT`, change the port
-everywhere above.
+clients: `http://<address>:8000`), the stats page at `http://<address>:8000/ui` and the chat page at
+`http://<address>:8000/chat`. With another `PORT`, change the port everywhere above.
 
 ## Serving
 
@@ -95,6 +101,7 @@ everywhere above.
 | --- | --- | --- |
 | `HOST` | `frontend/server.py` run directly: 0.0.0.0. Docker and the Windows package: 127.0.0.1 | Address to listen on. `0.0.0.0`: the network ([Using it from other machines](#using-it-from-other-machines)). With Docker, the address published on the host: the server in the container always listens on all its addresses |
 | `PORT` | 8000 | Port of the API and the web UI. With Docker, the port published on the host; in the container it stays 8000 |
+| `TRUSTED_ORIGINS` | empty | Web origins (`scheme://host[:port]`, comma-separated; `*`: any) whose pages may send POST requests from a browser, besides the server's own. The server sends no CORS headers, so such a page can only send them, not read the answers ([Using it from other machines](#using-it-from-other-machines)) |
 | `SERVED_MODEL_NAME` | `qwen3.8-27b` | Name in `/v1/models` (requests may use any model name) |
 | `MAX_TOKENS` | 262144 | Context limit of one request. If the KV pool cannot hold it, `MAX_TOKENS_FIT` lowers it; the value in effect is in the startup log (`max_tokens ... lowered to`) and in `/v1/models` (`max_model_len`) |
 | `MAX_TOKENS_FIT` | 1 | 1: start with `MAX_TOKENS` lowered to what the KV pool holds (a multiple of 1,024). 0: fail to start instead (the service then restarts every 60 s). The engine library (`q27lib.Engine`) defaults to 0 |
@@ -106,14 +113,16 @@ everywhere above.
 | `SCHED_QUANTUM_MS` | 50 | Length of a decode turn (with `BATCH_DECODE=0`, the interval between requests' turns; a switch costs about 1 ms) |
 | `BATCH_DECODE` | 1 | 1: requests in decode advance together in one batched speculative step (P6-10; about 2.3x aggregate at 4 requests; each request's tokens are the same as alone). 0: requests take turns |
 | `PREFILL_CHUNK` | 2048 | Prefill chunk in tokens (8,192 is only 2.5% faster at 32K and needs 4x the activations, P5-4) |
-| `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16`. NVFP4 holds about 1.7x the tokens of FP8 (589,888 against 339,968 at 262K with gdnfp4), prefills as fast or faster (+1 / +6 / +9% at 19K / 73K / 194K, P7-8), and costs a little KL against the BF16 original (0.0470 against 0.0445 with FP8 KV); GSM8K, the Japanese set and needle retrieval are the same. BFCL `parallel` is about 3 points lower than FP8 on short prompts and the same after 32K / 96K of agent context (P4-11, P7-8, P7-9) |
+| `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16`. NVFP4 holds about 1.7x the tokens of FP8 (589,888 against 339,968 at 262K with gdnfp4), prefills as fast or faster (+1 / +6 / +9% at 19K / 73K / 194K, P7-8), and costs a little KL against the BF16 original (0.0470 against 0.0445 with FP8 KV, both measured with the one-term `lm_head`); GSM8K, the Japanese set and needle retrieval are the same. BFCL `parallel` is about 3 points lower than FP8 on short prompts and the same after 32K / 96K of agent context (P4-11, P7-8, P7-9) |
 | `WEIGHTS` | `gdnfp4` | `gdnfp4`: GDN projections in NVFP4, attention projections FP8 ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), pinned revision, `scripts/download-weights.sh`; PQ-14). `nvidia`: NVIDIA's checkpoint as is (GDN / attention projections FP8). `quasar`: the QUASAR-QAT checkpoint, every projection NVFP4, weaker at parallel tool calls (`scripts/download-weights.sh --quasar`; its BF16 `lm_head` is replaced by NVIDIA's NVFP4 one through `Q27_LM_HEAD_CKPT`). Or another NVFP4 checkpoint of Qwen3.8-27B on the Hugging Face Hub, e.g. a fine-tune: `ORG/NAME` (its main branch) or `ORG/NAME@REVISION`, downloaded with `scripts/download_weights.py --weights ORG/NAME` (which first checks that the engine takes it) or `scripts/download-weights.sh --repo ORG/NAME` (see [Other checkpoints](#other-checkpoints)). Or a model directory inside the container. From Python: `qwen27b.weights.engine_target(...)`; scripts take `--weights` |
 | `SPEC` | `dspine` | `dspine` (speculative decoding with the DSpine draft, `tencent/Qwen3.8-27B-DSpine-b16`: blocks of up to 16, adaptive width), `dflash2` (the DFlash2 draft, blocks of 8) or `none`. Unset with only DFlash2 downloaded (a checkout from before DSpine became the default), the server uses DFlash2 and logs a warning; `scripts/download-weights.sh` gets DSpine |
 | `Q27_DRAFT_BLOCK` | `16` | DSpine: rows of a single sequence's draft block (the last token and the drafted ones), 2..16 (DSpine was trained on 16; fewer rows verify faster). Batched steps (several sequences decoding) always draft 8 per sequence |
 | `Q27_DRAFT_WINDOW` | `2048` | DSpine: the draft's context window (its attention and context ring), 256..8192. DSpine was trained with 8,192, but at a 32K context that accepted no more tokens than 2,048 and made each step 0.2-0.3 ms longer; its ring takes 160 MiB per sequence at 8,192, 40 MiB at 2,048 (as DFlash2's) |
 | `Q27_SPEC_ADAPT` | `1` | Adaptive verify width when the draft's block is longer than 8 (DSpine): a sequence verifies `Q27_SPEC_ADAPT_LOW` (8) rows while the moving average of its tokens per step (`Q27_SPEC_ADAPT_ALPHA`, 0.125) is below `Q27_SPEC_ADAPT_DOWN` (4.0), and the full block again once it reaches `Q27_SPEC_ADAPT_UP` (4.5). Only past steps decide the width, so the output distribution is unchanged. `0`: always the full block |
 | `Q27_SPEC_ADAPT_BATCH` | `1` | DSpine, requests that step together: each verifies 4, 8, 12 or 16 rows, chosen from its own tokens per batched step at the rows it ran (a moving average per width; untried widths are extrapolated) and a model of the step's time (the GEMMs step up every 16 rows of the total), within the row budget (8 per request of `MAX_SEQS`). Masked (structured output) requests keep 8. Only past steps decide the rows, so the output distribution is unchanged. Needs `Q27_SPEC_ADAPT`. `0`: 8 rows each |
-| `Q27_SPEC_ADAPT_HYST` | `0.01` | `Q27_SPEC_ADAPT_BATCH`: a lane's rows change only when that raises the step's expected tokens per ms by more than this fraction (each new split of the rows re-captures the step's CUDA graph, about 1.2 ms) |
+| `Q27_SPEC_CUT` | `1` | DSpine, batched steps of 2 or more requests without a grammar mask: after the draft, each request verifies only the prefix of its drafted rows (4, 8, .. or all) that maximizes the step's expected tokens per ms. The expected tokens come from the draft's own 16 x 16 tables (a calibrated per-position accept model, marginalized over the selector's draws), before any draw is looked at, so the output distribution is unchanged. Costs a host round trip between the draft and the verify (about 0.1 ms). `0`: every request verifies all the rows it drafted |
+| `Q27_BATCH_DEV_ROWS` | `1` | Batched steps: the kernels read the requests' row layout from device memory (written by the step's CUDA graph from a host buffer), so one graph serves every split of the same shape (requests, total rows, longest request's rows) and a new split costs nothing. Outputs are the same as with `0`. In-process against `0` (the graph re-captured and updated for each new split, about 0.55 ms): four / eight requests greedy +2.0% / +0.5%, sampled +1.4% / +1.7%; four requests at a 16K context +1.3% / +1.0% (greedy / sampled). `0`: the layout is in the kernels' arguments |
+| `Q27_SPEC_ADAPT_HYST` | `0.01` | `Q27_SPEC_ADAPT_BATCH`: a lane's rows change only when that raises the step's expected tokens per ms by more than this fraction (with `Q27_BATCH_DEV_ROWS=0`, each new split of the rows re-captures the step's CUDA graph, about 1.2 ms) |
 | `Q27_SPEC_ADAPT_PERIOD` | `8` | `Q27_SPEC_ADAPT_BATCH`: batched steps between the decisions (between them the rows stay) |
 | `Q27_SPEC_ADAPT_BATCH_ALPHA` | `0.03125` | `Q27_SPEC_ADAPT_BATCH`: rate of the lanes' moving averages. Slower than a single request's (`Q27_SPEC_ADAPT_ALPHA`) because the rule compares lanes: with 1/8, requests of one kind looked different by chance and traded rows at a loss (four sampled reasoning requests 5% slower) |
 | `Q27_DRAFT_QUANT` | `fp4` | Draft linear layers: `fp4`, `fp8` or `bf16` (same acceptance, FP4 is fastest) |
@@ -123,7 +132,7 @@ everywhere above.
 | `CHECKPOINT_INTERVAL` | 8192 | Distance between checkpoints inside a long prompt (a multiple of 64) |
 | `VISION` | `host` | Image input. `host`: the vision tower's BF16 weights (0.86 GiB) stay in pinned host memory and are streamed to the GPU one layer ahead of the computation; the KV pool loses 192 tokens, small images take +13 ms (the copy is about 20 ms), 1024x1024 and larger +1–4 ms; output identical to `bf16`. `fp8`: E4M3 weights with per-row scales on the GPU, widened per layer (0.43 GiB; embedding error about 3x that of `bf16`, answers can change). `bf16`: BF16 weights on the GPU (fastest, 0.86 GiB). `off`: requests with images get HTTP 400 (the engine library's default). Activations and the weight staging (90 MiB) share the prefill's buffers |
 | `IMAGE_MAX_PIXELS` | 4194304 | Images are resized to at most this many pixels (2048x2048 = 4,096 tokens, 370 ms in the vision tower) |
-| `IMAGE_TOKENS` | 16384 | Image and video tokens per request (embeddings in pinned host memory, 10 KiB per token: 160 MiB). More: HTTP 400. Unset or empty: 16,384, or `VIDEO_MAX_TOKENS` when that is more |
+| `IMAGE_TOKENS` | 16384 | Rows of the image table (embeddings in pinned host memory, 10 KiB per token: 160 MiB). Not a limit on a request's images: the table holds the images near one prefill call (two prefill chunks and the largest image at each end), reusing the rows of those the prompt has passed. An image larger than the table: HTTP 400. Unset or empty: 16,384, or what `PREFILL_CHUNK` and `IMAGE_MAX_PIXELS` need when that is more |
 | `VIDEO_MAX_TOKENS` | the checkpoint's 12,288 | Tokens of a video at most (the pixels of all its sampled frames together, 2,048 per token; the checkpoint's `size.longest_edge`), besides the time stamps of its pairs. A pair of frames takes at most 768 tokens all the same, so a video of up to 16 pairs (16 s at 2 frames per second) keeps its size; longer ones get larger frames. A request's `mm_processor_kwargs.size.longest_edge` replaces it for that request ([Long videos](#long-videos)) |
 | `VIDEO_MAX_FRAMES` | the checkpoint's 768 | Frames sampled from a video at most (2 per second until then), and the most a request's `num_frames` / `min_frames` / `max_frames` may ask for |
 | `VRAM_BUDGET_GIB` / `WDDM_MARGIN_GIB` | free − 0.6 / 0.6 | VRAM budget and the margin kept free for the display driver. The budget is never above the automatic one (free − margin, at most 30.3 GiB for the process): beyond it the driver moves memory to system RAM without an error, about 7 times slower. A higher `VRAM_BUDGET_GIB` is lowered, with a line in the log |
@@ -155,7 +164,7 @@ a request:
 VIDEO_MAX_TOKENS=131072 VIDEO_MAX_FRAMES=2048 docker compose up -d serve
 ```
 
-Or per request, within `IMAGE_TOKENS` and `VIDEO_MAX_FRAMES`:
+Or per request, within `VIDEO_MAX_FRAMES`:
 `"mm_processor_kwargs": {"fps": 2, "max_frames": 2048, "size": {"longest_edge": 268435456}}`
 (`size.longest_edge` is T in pixels: 2,048 per token; `num_frames` takes a frame count instead of `fps`).
 
@@ -207,9 +216,8 @@ finer time.
 
 ### Limits and costs
 
-- `IMAGE_TOKENS` follows `VIDEO_MAX_TOKENS` unless it is set: the embeddings take 10 KiB of pinned host memory per
-  token (1.25 GiB for 131,072), allocated when the engine starts. A request with more tokens of images and videos
-  gets HTTP 400.
+- A long video needs no larger `IMAGE_TOKENS`: its pairs go through the image table a prefill call at a time (the
+  frames are decoded once and kept in host memory until the prompt has passed the video).
 - The tokens of the videos, their pairs' text included, must fit the context: 1,024 pairs add about 10K tokens of
   text.
 - A frame takes at least about 4,300 pixels (about 4 tokens), so with a very high F and a low T (more than about
@@ -327,6 +335,7 @@ variables:
 | `max_seqs` | `MAX_SEQS` | 1 to 8 |
 | `max_tokens` | `MAX_TOKENS` | 2,048 to 262,144 (lowered to what the budget holds, `MAX_TOKENS_FIT`) |
 | `vram_budget_gib` | `VRAM_BUDGET_GIB` | `null` (automatic) or 4 GiB up to the automatic budget |
+| `act_a4x2` | `Q27_ACT_A4X2` | `off` (empty / `0`, the default), `decode` (`2`), `all` (`1`): the quality mode, speed for accuracy ([`Q27_ACT_A4X2`](#development-switches)). The variable takes the names or the numbers |
 
 Under every choice the page shows the longest context of one request and the KV pool all requests share if only that
 setting changed, and for the settings as chosen the device pools against the budget. These come from the engine's own
@@ -353,6 +362,33 @@ The same from a script:
   load, and whether they fit is decided when it does. Example:
   `curl -s -X POST localhost:8000/admin/engine -H 'Content-Type: application/json' -d '{"action": "restart", "settings": {"kv_dtype": "fp8", "max_seqs": 4}}'`.
 
+## Chat page
+
+`http://localhost:8000/chat` is a simple chat page, to try the model in a browser without installing a client (like
+llama.cpp's `llama-server`). It is one file with no external resources, served by the server itself, and calls
+`/v1/chat/completions` from the same origin, so it needs no CORS or `TRUSTED_ORIGINS`.
+
+- Streaming, the reasoning folded away (open while the model thinks), Markdown with tables and code blocks (with a
+  copy button), and each reply's tokens, decode rate, prompt and cached tokens and accepted drafts (from `timings`).
+- Images and videos: the attach button, paste or drop. They are sent as data URLs.
+- Thinking: off (`chat_template_kwargs.enable_thinking: false`) or the reasoning effort, `low`, `medium` or `xhigh`
+  (the default; `chat_template_kwargs.reasoning_effort`). It is one setting for all chats and can change within a
+  conversation, from the next reply. The chat template puts the effort's instruction at the head of the prompt (none
+  for `medium` and off, which therefore share a head), so a change to another head reads the conversation again
+  unless the prefix cache still holds it from an earlier use of that setting.
+- A system prompt, temperature, top-p and max tokens (empty: the server's defaults).
+- The earlier replies' reasoning is sent back (`reasoning_content`), as the chat template expects, so it stays in the
+  model's context and counts toward it.
+- Stop (closing the stream cancels the request), regenerate the last reply, edit a message (the conversation is cut
+  there).
+- Conversations are kept in the browser's `localStorage`, on that browser only. Videos are not kept, and when the
+  storage is full the images of the oldest conversations are dropped first; the text stays.
+- The browser's tabs share the conversations: a save or a delete shows in the others. When two tabs change the same
+  conversation at the same time, the one that finishes later is kept as a copy ("(copy)" after the title).
+
+It is meant for trying the server and light use. For more (accounts, several models, documents, tools, conversations
+on the server), use a full client such as Open WebUI with `http://<address>:8000/v1` as an OpenAI connection.
+
 ## Prefix cache
 
 The server takes checkpoints at message boundaries and at the end of each generation; the next request resumes from
@@ -366,7 +402,8 @@ the chat template renders it.
 takes the layouts it already reads: the modelopt one of NVIDIA's checkpoint (projections in FP8 or NVFP4) and the
 compressed-tensors one of QUASAR, with NVFP4 activations (W4A4) and the model's dimensions. A BF16 `lm_head` (kept by
 QUASAR and its fine-tunes) is quantized to NVFP4 at load, with the block scales chosen for the smallest error (on
-QUASAR: KL to the BF16 model 0.0473, against 0.0471 with NVIDIA's NVFP4 `lm_head`). The compressed-tensors
+QUASAR: KL to the BF16 model 0.0469, against 0.0462 with NVIDIA's NVFP4 `lm_head`). An NVFP4 `lm_head`, either kind,
+takes its activations in two terms (`Q27_LM_HEAD_A4X2`). The compressed-tensors
 "mixed-precision" layout of unsloth's and Red Hat's checkpoints loads as well: FP8 weights with per-output-channel
 scales (the GDN and attention projections, the last eight MLPs, unsloth's `lm_head`) run as they are, with the
 activations quantized per token at run time as the checkpoint specifies (`gemm_fp8_scaled`, `skinny_fp8_scaled`);
@@ -449,7 +486,7 @@ path if the folder moved.
 | Group | Settings | Apply |
 | --- | --- | --- |
 | Server | `HOST`, `PORT`, `HF_HOME` | Restarts the server, which downloads the weights if the new `HF_HOME` does not have them |
-| Engine | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_BUDGET_GIB` | Reloads the engine if it is loaded (weights with another tokenizer: restarts the server); otherwise the next load uses them |
+| Engine | `WEIGHTS`, `KV_DTYPE`, `SPEC`, `VISION`, `MAX_SEQS`, `MAX_TOKENS`, `VRAM_BUDGET_GIB`, `Q27_ACT_A4X2` (Quality mode) | Reloads the engine if it is loaded (weights with another tokenizer: restarts the server); otherwise the next load uses them |
 | When it holds the VRAM | `ENGINE_IDLE_UNLOAD_S` | Applies at once |
 | When it holds the VRAM | `ENGINE_AUTOSTART`, `MIN_KV_TOKENS` | Restarts the server |
 
@@ -477,7 +514,8 @@ path if the folder moved.
 ### Updating
 
 From v0.3.1, run `update.cmd` in the package's folder. It downloads the latest release's zip (an interrupted download
-resumes when run again), checks its SHA-256, quits the tray app of this folder, replaces `python\`, `app\` and the
+resumes when run again), checks its SHA-256 (the `update.cmd` of v0.6.2 and later stops when it cannot get the
+SHA-256, instead of installing an unchecked zip), quits the tray app of this folder, replaces `python\`, `app\` and the
 files next to them, and starts the tray app again if it was running. `settings.ini`, the weights and the log stay. If a
 step fails, the old version is put back. A server started with `start.cmd` has to be closed by hand.
 
@@ -503,7 +541,8 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_PROFILE=1` | GPU time per operation, also inside CUDA graphs (`Engine.profile_dump()`) |
 | `Q27_NO_GRAPH=1` / `Q27_NO_PDL=1` / `Q27_NO_SKINNY=1` | Disable CUDA graphs / programmatic dependent launch / the skinny GEMMs |
 | `Q27_SKINNY_CHECK=1` | Compare the skinny GEMMs with the prefill GEMMs and log the difference |
-| `Q27_SKINNY_EXACT=1` | Make a row's skinny-GEMM result independent of M (tests of tree verification and preemption) |
+| `Q27_SKINNY_EXACT=1` | Split K for every row count as decode did before v0.6.2 (2 waves rounded up; a row's result stays independent of M) |
+| `Q27_SKINNY_M1_UP=1` | The pre-v0.6.2 default: one-row calls (plain decode) split K into 2 waves rounded up, wider calls rounded down. Plain decode about 1% faster, but a token's result then depends on M, and greedy speculative decoding no longer reproduces `SPEC=none` exactly |
 | `Q27_SKINNY_EXT_REDUCE_M` | Rows from which the skinny GEMM's split-K reduction runs as a separate kernel (default 1: M >= 2; at M = 1 the last CTA reduces; same result; P7-4) |
 | `Q27_DRAFT_ATTN_TC=0` | The draft's attention on CUDA cores (default: tensor cores; P7-4) |
 | `Q27_SKIP=norm,silu,gdn,attn,gemm,gemm4,gemm8,draft,dctx` | Skip a kind of kernel to measure its share of the time (`gemm4` / `gemm8`: FP4 / FP8 GEMMs only; `draft` / `dctx`: the draft model / its context update in a speculative step; the output is garbage) |
@@ -514,10 +553,13 @@ All default to the faster setting. Except those marked static, they can be switc
 | `Q27_KV_BLOCK=N` | Pages per block of the KV pool (P7-13; default the smallest count whose slice is >= 2 MiB: 57 for NVFP4, 32 for FP8, 16 for BF16). 1 lays pages out one by one (long-context decode 1.5% slower). Read at startup |
 | `Q27_PAGES_HIGH=1` | Hand out KV pages from the top (tests, P7-13): the KV cache then occupies the parking areas, so every park moves pages. Read at startup |
 | `Q27_KV_VMM=0` | Allocate the KV pool in one `cudaMalloc` instead of through CUDA's virtual memory management: then no KV pool memory is lent to video decoding, and NVDEC's surfaces are taken beyond the VRAM budget. Read at startup |
+| `Q27_NVDEC_WAKE=0` / `1` | Before a video decode, wake the idle GPU by creating and destroying a CUDA context (about 0.1 s and, for that long, 0.5 GiB of device memory; no clock or power setting is changed; at most once in 2 s). Default: on under WSL2 only, where an NVDEC decode starting on a GPU idled down to P8 could hang until Windows reset it, which ends the engine process. 0: never. 1: also elsewhere. Read at the first decode |
 | `Q27_ATTN_PREFILL_TC=0` | Prefill attention on CUDA cores (static) |
 | `Q27_GDN_CHUNK=0` / `1` | GDN in prefill: 0 = sequential (static); 1 = the chunk prep writes W and U (P5-2, read per call). Default 2: the prep writes only (I + L)^-1 and the chunk kernel forms delta itself (P5-14, prefill +1.9% at 19K) |
 | `Q27_AB_TC=1` | Prefill in_proj_a / b (T > 8): one block per 32 tokens over all of K (before P5-16, read per call). Default: K split in 4 over a cluster, partial sums added in order (prompts of 128 / 512 tokens +7.4 / +6.4%) |
 | `Q27_AB_NORM=0` | Prefill: the input RMSNorm writes its fp32 rows for in_proj_a / b (before P5-17, read per call). Default: it writes only 1 / rms per token and in_proj_a / b normalizes the residual itself (bit-identical; 19K +0.5%) |
+| `Q27_LM_HEAD_A4X2=0` | The NVFP4 `lm_head` with one-term NVFP4 activations (W4A4), as the published reference recordings of NVIDIA's checkpoint. Default 1: two terms (W4A4x2, `skinny_a4x2.cu`: the quantization of the activations plus that of what it left): same weights and memory, the same speed within measurement noise, as good as BF16 activations on that head (PQ-21). No effect on a checkpoint with an FP8 `lm_head` |
+| `Q27_ACT_A4X2=1` / `2` (or `all` / `decode`; empty, `0` or `off`: one term) | Quality mode: two-term NVFP4 activations (W4A4x2: the quantization of the activation plus that of what it left, one global scale) into every NVFP4 layer GEMM, not only the `lm_head`. The weights stay as they are; the activations are where most of the distance to the BF16 original comes from. `1`: every GEMM. Prefill runs each GEMM twice (and the MLP without the fused gate \| up kernel): about -45% at 19K and -39% at 73K tokens. Decode and verify-sized GEMMs (up to 64 rows: one sequence's verify and batched steps) run the two terms as one GEMM of twice the rows, reading the weights once, that sums each token's two terms: -1.3% without a draft, -3 to -4% with DSpine (steps +5 to 11%, partly won back by a longer acceptance); 1 / 4 / 8 concurrent requests (DSpine, `bench_concurrent.py` reason) -1% / -5 to -8% / -13%. `2`: only the decode / verify-sized GEMMs (64 rows or fewer); prefill as by default. On the golden prompts against the BF16 original (`golden compare` with the original first, `gdnfp4`, NVFP4 KV), KL 0.0570 -> 0.0321 with `1` (top-1 87.9 -> 90.9%); on 128 decoded positions per prompt 0.0558 -> 0.0326 (`1`) / 0.0360 (`2`). Same KV capacity (about 30 MB more activations). Speculative and plain greedy decoding stay identical. Read at startup of the engine: the stats page's [Start settings](#start-settings) (`act_a4x2`) change it with a restart of the engine |
 | `Q27_MLP_FUSED=0` | Prefill MLP: gate \| up as a BF16-output GEMM, then SiLU and NVFP4 quantization in a separate kernel. Default 1: one GEMM (`gemm_mma.cu`) whose epilogue writes silu(gate) * up as the down GEMM's NVFP4 activations (prefill +2% at 19K / 73K, P5-12) |
 | `Q27_MLP_BF16=0` | With `Q27_MLP_FUSED=0`: fp32 outputs for the prefill MLP's gate \| up |
 | `Q27_SPEC_PATHS=K` | Paths of tree verification (default 1 = a chain; 2 / 4 accept more but take longer and break even) |

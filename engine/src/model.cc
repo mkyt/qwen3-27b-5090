@@ -130,8 +130,20 @@ Model::Model(const Options& opt) : opt_(opt) {
   size_t o_a = f32("a", Tc * kVHeads), o_bb = f32("b", Tc * kVHeads), o_g = f32("g", Tc * kVHeads),
          o_beta = f32("beta", Tc * kVHeads);
   // (an FP8 MLP's down GEMM takes [T][I] bytes)
-  size_t o_aq = act_.add("act quant", size_t(Tp) * (w_.mlp8 ? kInter : std::max(kInter / 2, kHeads * kHeadDim)));
-  size_t o_asf = act_.add("act sf", size_t(sf_bytes(Tp, kInter / 16)));
+  // (Q27_ACT_A4X2: room for the second term, from row Tp on)
+  // (by number, or by the name of the start setting: off = 0, decode = 2, all = 1)
+  const int a4x2 = [] {
+    const char* e = getenv("Q27_ACT_A4X2");
+    if (!e || !*e || !strcmp(e, "off")) return 0;
+    if (!strcmp(e, "decode")) return 2;
+    if (!strcmp(e, "all")) return 1;
+    return atoi(e);
+  }();
+  act_a4x2_ = a4x2 != 0;
+  act_a4x2_small_ = a4x2 == 2;  // (2: decode / verify-sized GEMMs only)
+  const int64_t Ta = !act_a4x2_ ? Tp : act_a4x2_small_ ? Tp + 2 * 128 : 2 * Tp;  // (2: second terms of <= 64 rows)
+  size_t o_aq = act_.add("act quant", size_t(Ta) * (w_.mlp8 ? kInter : std::max(kInter / 2, kHeads * kHeadDim)));
+  size_t o_asf = act_.add("act sf", size_t(sf_bytes(Ta, kInter / 16)));
   size_t o_asc = w_.dyn8 ? f32("act row scales", Tp) : 0;
   size_t o_ids = act_.add("ids", Tc * 4);
   size_t o_mpos = act_.add("mrope positions", Tc * 3 * 4);
@@ -286,7 +298,7 @@ Model::Model(const Options& opt) : opt_(opt) {
     vis_ws_ = o_vis ? act_.at<void>(o_vis) : act_.at<void>(o_x);
     mm_ = host_mm_.at<bf16>(0);
     static const char* kWhere[] = {"", "BF16 on the device", "BF16 in pinned host memory", "FP8 on the device"};
-    log("vision: %s, workspace %.0f MiB%s, images up to %d px, %d image tokens per request", kWhere[opt.vision],
+    log("vision: %s, workspace %.0f MiB%s, images up to %d px, an image table of %d tokens", kWhere[opt.vision],
         vis_ws_bytes_ / 1048576.0, o_vis ? "" : " (in the prefill activations)", opt.image_max_pixels,
         opt.image_tokens);
   }
@@ -338,11 +350,19 @@ Model::Model(const Options& opt) : opt_(opt) {
     Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&b_out_), size_t(kMaxLanes) * 2 * sizeof(SpecOut),
                            cudaHostAllocMapped));
     Q27_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void**>(&b_out_dev_), b_out_, 0));
+    Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&b_conf_), size_t(kMaxLanes) * kSpecBlock * 4, cudaHostAllocMapped));
+    Q27_CUDA(cudaHostGetDevicePointer(reinterpret_cast<void**>(&b_conf_dev_), b_conf_, 0));
+    Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&b_lrh_), 2 * sizeof(LaneRows), cudaHostAllocDefault));
+    Q27_CUDA(cudaMalloc(reinterpret_cast<void**>(&b_lrd_), 2 * sizeof(LaneRows)));
+    Q27_CUDA(cudaMemset(b_lrd_, 0, 2 * sizeof(LaneRows)));
     log("batched decode: up to %d sequences per step", lanes);
   }
 
   Q27_CUDA(cudaMemset(page_table_, 0, size_t(max_pages_) * 4));  // all unmapped (pages come from pool_)
-  Q27_CUDA(cudaMemset(asf_, 0, sf_bytes(Tp, kInter / 16)));
+  {
+    const int64_t tp = round_up(opt_.prefill_chunk, 128);
+    Q27_CUDA(cudaMemset(asf_, 0, sf_bytes(!act_a4x2_ ? tp : act_a4x2_small_ ? tp + 2 * 128 : 2 * tp, kInter / 16)));
+  }
   if (ascale_) Q27_CUDA(cudaMemset(ascale_, 0, size_t(Tp) * 4));
 
   w_.load(s_);
@@ -377,6 +397,7 @@ void Model::configure() {
   graph_warm_ = false;
   spec_warm_ = false;
   bwarm_ = false;
+  bstep_ = 0;  // (the batched rows' decision period starts again: runs after it compare as pairs)
   const char* e = getenv("Q27_SKIP");
   skip_ = e ? e : "";
   decode_memcpy_ = getenv("Q27_DECODE_MEMCPY") != nullptr;
@@ -407,11 +428,17 @@ void Model::configure() {
   adapt_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_ALPHA", 0.125f), 0.f, 1.f);
   batch_adapt_ = adapt_on_ && env_int("Q27_SPEC_ADAPT_BATCH", 1) != 0;
   batch_hyst_ = std::max(0.f, env_f("Q27_SPEC_ADAPT_HYST", 0.01f));
+  batch_cut_ = draft_ && draft_->dspine() && env_int("Q27_SPEC_CUT", 1) != 0;
+  dev_rows_ = env_int("Q27_BATCH_DEV_ROWS", 1) != 0;
+  // (fitted on recorded DSpine steps of 7 workloads, P3-39: [1, logit(c), entropy, log(1 + e), logit(c) log(1 + e)])
+  cut_cal_ = ConfCalib{{{0.300642f, 0.664243f, -0.350132f, -0.201407f, -0.015231f},
+                        {0.291596f, 0.479417f, -0.143337f, -0.351559f, 0.054301f}}};
   batch_period_ = std::max(1, env_int("Q27_SPEC_ADAPT_PERIOD", 8));
   batch_alpha_ = std::clamp(env_f("Q27_SPEC_ADAPT_BATCH_ALPHA", 0.03125f), 0.f, 1.f);
   spec_pipeline_ = env_int("Q27_SPEC_PIPELINE", 1) != 0;
   mlp_bf16_ = env_int("Q27_MLP_BF16", 1) != 0;
   mlp_fused_ = env_int("Q27_MLP_FUSED", 1) != 0;
+  head_a4x2_ = env_int("Q27_LM_HEAD_A4X2", 1) != 0;
   const char* prof = getenv("Q27_PROFILE");
   prof_.on = prof && *prof && *prof != '0';
   graphs_ = !getenv("Q27_NO_GRAPH") && !skinny_check_;
@@ -433,6 +460,9 @@ Model::~Model() {
   if (mask_dev_) cudaFree(mask_dev_);
   if (draft_host_) cudaFreeHost(draft_host_);
   if (b_out_) cudaFreeHost(b_out_);
+  if (b_conf_) cudaFreeHost(b_conf_);
+  if (b_lrh_) cudaFreeHost(b_lrh_);
+  if (b_lrd_) cudaFree(b_lrd_);
   if (host_io_) cudaFreeHost(host_io_);
   if (lp_) cudaFreeHost(lp_);
   if (cs_) cudaStreamSynchronize(cs_), cudaStreamDestroy(cs_);
@@ -813,7 +843,16 @@ bool Model::skip(const char* kind) const {
 }
 
 QuantOut Model::q8(float in_scale) const { return {QuantOut::kFp8, in_scale, aq_, nullptr}; }
-QuantOut Model::q4(float in_scale) const { return {QuantOut::kFp4, in_scale, aq_, asf_}; }
+QuantOut Model::q4(float in_scale, int T) const {
+  a2_row_ = x2_row(T);
+  return {QuantOut::kFp4, in_scale, aq_, asf_, nullptr, a2_row_};
+}
+
+int Model::x2_row(int T) const {
+  if (!act_a4x2_ || T <= 0) return 0;
+  if (act_a4x2_small_ && !(skinny_ && T <= kSkinnyMaxM)) return 0;
+  return skinny_ && 2 * T <= kSkinnyMaxM ? T : int(round_up(T, 128));
+}
 QuantOut Model::q8row() const { return {QuantOut::kFp8Row, 1.f, aq_, nullptr, ascale_}; }
 
 // The input of an NVFP4 or per-token FP8 projection from fp32 rows (an FP8 one with a calibrated input scale was
@@ -824,9 +863,13 @@ void Model::quant_in(const LinearQ& l, const float* x, int T, int K) {
     quant_fp8_rows(x, K, T, K, aq_, ascale_, s_);
     return;
   }
-  if (!l.fp4) return;
+  if (!l.fp4) {
+    a2_row_ = 0;
+    return;
+  }
   mark("quant fp4");
-  quant_fp4(x, T, K, l.in_scale(), aq_, asf_, s_);
+  a2_row_ = x2_row(T);
+  quant_fp4(x, T, K, l.in_scale(), aq_, asf_, s_, a2_row_);
 }
 
 // GEMMs on the activation already quantized into aq_ (and asf_). Fused projections (several alpha
@@ -871,6 +914,21 @@ void Model::gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool
   if (skip("gemm") || skip("gemm4")) return;
   const float* c = residual ? out : nullptr;
   const float beta = residual ? 1.f : 0.f;
+  if (const int r2 = a2_row_; r2 > 0) {  // W4A4x2 (Q27_ACT_A4X2): the two terms of aq_
+    const int N = l.out, K = l.in;
+    const uint8_t* q1 = aq_ + size_t(r2) * (K / 2);
+    const uint8_t* sf1 = asf_ + sf_bytes(r2, K / 16);
+    if (T <= kSkinnyMaxM && skinny_) {
+      // One GEMM of 2 T rows (the weights read once) that sums each token's two terms; the second terms follow the
+      // first (r2 = T, up to 32 tokens) or start at row 128 (33..64 tokens).
+      skinny_fp4(2 * T, N, K, aq_, asf_, l.w, l.sf, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_, T, r2);
+      return;
+    }
+    Q27_CHECK(l.alpha.count == 1, std::string(what) + ": fused projections need the skinny path");
+    gemm_fp4(T, N, K, aq_, asf_, l.w, l.sf, l.alpha.alpha[0], c, beta, out, s_);
+    gemm_fp4(T, N, K, q1, sf1, l.w, l.sf, l.alpha.alpha[0], out, 1.f, out, s_);
+    return;
+  }
   if (T <= kSkinnyMaxM && skinny_) {
     auto run = [&] {
       skinny_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_);
@@ -934,7 +992,7 @@ void Model::gdn(int i, int T) {
   // the rstd per token, in_proj_a / b normalizing x_ itself.
   const bool norm_ab = !verify_ && T > 1 && linear_bf16_pair_norm_ok(T);
   if (!skip("norm"))
-    rmsnorm_quant(x_, L.in_norm, T, kEps, norm_ab ? nullptr : h_, qin(G.qkv), s_, cap_for(i), ddims::kCtxFeatures * kHidden,
+    rmsnorm_quant(x_, L.in_norm, T, kEps, norm_ab ? nullptr : h_, qin(G.qkv, T), s_, cap_for(i), ddims::kCtxFeatures * kHidden,
                   norm_ab ? h_ : nullptr);
   float *qkv = big1_, *z = big2_;
   int ld = kConvDim, ldz = kVHeads * kVDim;
@@ -1001,7 +1059,7 @@ void Model::attn(int i, int T) {
   KvLayer kv = kv_layers_[i / kAttnEvery];
   mark("norm+quant");
   if (!skip("norm"))
-    rmsnorm_quant(x_, L.in_norm, T, kEps, nullptr, qin(A.q), s_, cap_for(i), ddims::kCtxFeatures * kHidden);
+    rmsnorm_quant(x_, L.in_norm, T, kEps, nullptr, qin(A.q, T), s_, cap_for(i), ddims::kCtxFeatures * kHidden);
   // qg [T][24][512]: query | gate per head; k, v [T][4][256].
   float *qg = big1_, *k = k_, *v = q_;  // (q_ is free in attention layers)
   int ldq = kHeads * 2 * kHeadDim, ldkv = kKvHeads * kHeadDim;
@@ -1058,11 +1116,12 @@ void Model::mlp(int i, int T) {
     return;
   }
   mark("norm+quant");
-  if (!skip("norm")) rmsnorm_quant(x_, L.post_norm, T, kEps, nullptr, q4(L.gate.in_scale), s_);
+  if (!skip("norm")) rmsnorm_quant(x_, L.post_norm, T, kEps, nullptr, q4(L.gate.in_scale, T), s_);
   // gate_up is the interleaved gate | up with alpha 1 (Weights::fp4_glu): the silu step reads it as such and
   // applies the gate's and the up's alphas.
   const float ag = L.gate.alpha.alpha[0], au = L.up.alpha.alpha[0];
-  if (mlp_fused_ && T > kSkinnyMaxM && !fused(T)) {
+  // (Q27_ACT_A4X2: the fp32 path below, whose silu step writes both terms)
+  if (mlp_fused_ && !(act_a4x2_ && !act_a4x2_small_) && T > kSkinnyMaxM && !fused(T)) {
     // Prefill: one GEMM for gate | up whose epilogue writes silu(gate) * up as the down GEMM's NVFP4
     // activations (big1_ / big2_: aq_ is this GEMM's input), instead of BF16 gate / up written and read
     // back.
@@ -1076,13 +1135,14 @@ void Model::mlp(int i, int T) {
       gemm_fp4(T, kHidden, kInter, q, qsf, L.down.w, L.down.sf, L.down.alpha.alpha[0], x_, 1.f, x_, s_);
     return;
   }
-  if (mlp_bf16_ && T > kSkinnyMaxM && !fused(T)) {
+  if (mlp_bf16_ && !(act_a4x2_ && !act_a4x2_small_) && T > kSkinnyMaxM && !fused(T)) {
     // Prefill: gate | up in BF16 (it only feeds silu * up and its FP4 quantization; [T][2 I] in big1_).
     bf16* gu = reinterpret_cast<bf16*>(big1_);
     mark("mlp gate_up");
     if (!skip("gemm") && !skip("gemm4"))
       gemm_fp4_bf16(T, L.gate_up.out, L.gate_up.in, aq_, asf_, L.gate_up.w, L.gate_up.sf, 1.f, gu, s_);
     mark("mlp silu+quant");
+    a2_row_ = 0;
     if (!skip("silu")) silu_mul_quant_fp4_glu(gu, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
   } else {
     // fp32 [T][2 I]: in big1_ ([Tc][I]) up to Tc / 2 rows, beyond that also in big2_ (adjacent).
@@ -1090,7 +1150,8 @@ void Model::mlp(int i, int T) {
               "MLP: big1_ / big2_ not adjacent");
     gemm_q("mlp gate_up", L.gate_up, T, big1_, false);
     mark("mlp silu+quant");
-    if (!skip("silu")) silu_mul_quant_fp4_glu(big1_, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
+    a2_row_ = x2_row(T);
+    if (!skip("silu")) silu_mul_quant_fp4_glu(big1_, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_, a2_row_);
   }
   gemm_q("mlp down", L.down, T, x_, true);
 }
@@ -1137,25 +1198,40 @@ void Model::mm_set(const int32_t* spans, int n) {
   Q27_CHECK(n == 0 || opt_.vision, "images need the vision tower (VISION)");
   batch_exit();
   mm_spans_.clear();
+  // Rows of mm_ in order while they fit; the spans past IMAGE_TOKENS rows have none until mm_place gives them some
+  // (a request with more image tokens than the table runs them a part at a time, reusing rows).
   int rows = 0, delta = 0, end = 0;
   for (int i = 0; i < n; i++) {
-    MmSpan sp{spans[3 * i], spans[3 * i + 1], spans[3 * i + 2], rows};
+    MmSpan sp{spans[3 * i], spans[3 * i + 1], spans[3 * i + 2], -1};
     Q27_CHECK(sp.gh > 0 && sp.gw > 0 && sp.start >= end, "images: bad or overlapping spans");
+    if (rows + sp.len() <= opt_.image_tokens) sp.row = rows;
     rows += sp.len();
     end = sp.start + sp.len();
     delta += std::max(sp.gh, sp.gw) - sp.len();  // the rotary position advances by max(gh, gw)
     mm_spans_.push_back(sp);
   }
-  Q27_CHECK(rows <= opt_.image_tokens, "images: more image tokens than IMAGE_TOKENS");
   Q27_CUDA(cudaMemcpyAsync(rope_delta_, &delta, 4, cudaMemcpyHostToDevice, s_));
   Q27_CUDA(cudaStreamSynchronize(s_));
+}
+
+void Model::mm_place(int i, int n, int row) {
+  Q27_CHECK(n > 0 && i >= 0 && i + n <= int(mm_spans_.size()) && row >= 0, "mm_place: no such image");
+  for (int k = 0; k < n; k++) {
+    MmSpan& sp = mm_spans_[i + k];
+    Q27_CHECK(row + sp.len() <= opt_.image_tokens, "images: more image tokens at once than IMAGE_TOKENS");
+    sp.row = row;
+    row += sp.len();
+  }
 }
 
 void Model::mm_encode(int i, const VisionPixels* pixels, int n) {
   Q27_CHECK(opt_.vision && n > 0 && i >= 0 && i + n <= int(mm_spans_.size()), "mm_encode: no such image");
   const MmSpan& sp = mm_spans_[i];
-  for (int k = 1; k < n; k++)  // (rows of consecutive spans are consecutive: mm_set)
+  Q27_CHECK(sp.row >= 0, "mm_encode: the image has no rows (mm_place)");
+  for (int k = 1; k < n; k++) {  // (written as one block of rows)
     Q27_CHECK(mm_spans_[i + k].gh == sp.gh && mm_spans_[i + k].gw == sp.gw, "mm_encode: images of different grids");
+    Q27_CHECK(mm_spans_[i + k].row == sp.row + k * sp.len(), "mm_encode: images in rows apart (mm_place)");
+  }
   const int gh = sp.gh * vdims::kMerge, gw = sp.gw * vdims::kMerge;
   const int64_t pixels_each = int64_t(gh) * gw * vdims::kPatchPixels * vdims::kPatchPixels;
   Q27_CHECK(pixels_each <= opt_.image_max_pixels, "image larger than IMAGE_MAX_PIXELS");
@@ -1175,18 +1251,23 @@ void Model::mm_encode(int i, const VisionPixels* pixels, int n) {
 void Model::mm_embeds(int i, bf16* out) {
   Q27_CHECK(opt_.vision && i >= 0 && i < int(mm_spans_.size()), "mm_embeds: no such image");
   const MmSpan& sp = mm_spans_[i];
+  Q27_CHECK(sp.row >= 0, "mm_embeds: the image has no rows (mm_place)");
   memcpy(out, mm_ + size_t(sp.row) * kHidden, size_t(sp.len()) * kHidden * sizeof(bf16));
 }
 
 void Model::mm_put(int i, const bf16* in) {
   Q27_CHECK(opt_.vision && i >= 0 && i < int(mm_spans_.size()), "mm_put: no such image");
   const MmSpan& sp = mm_spans_[i];
+  Q27_CHECK(sp.row >= 0, "mm_put: the image has no rows (mm_place)");
   memcpy(mm_ + size_t(sp.row) * kHidden, in, size_t(sp.len()) * kHidden * sizeof(bf16));
 }
 
 void Model::upload_ids(const int32_t* ids, int T) {
+  // The embedding lookup reads row id: outside an image's rows (which are set here), a caller's id must be a token of
+  // the vocabulary. (Image positions hold out-of-vocabulary ids derived from the image: the prefix cache's keys.)
   mpos_on_ = false;
   if (mm_spans_.empty()) {
+    for (int t = 0; t < T; t++) Q27_CHECK(ids[t] >= 0 && ids[t] < kVocab, "token id out of the vocabulary");
     Q27_CUDA(cudaMemcpyAsync(ids_, ids, size_t(T) * 4, cudaMemcpyHostToDevice, s_));
     return;
   }
@@ -1206,11 +1287,13 @@ void Model::upload_ids(const int32_t* ids, int T) {
     const bool img = k < mm_spans_.size() && p >= mm_spans_[k].start;
     if (img) {
       const MmSpan& sp = mm_spans_[k];
+      Q27_CHECK(sp.row >= 0, "images: an image in the chunk has no rows (mm_place)");
       const int r = p - sp.start, base = sp.start + delta;
       tr[t] = kVocab + sp.row + r;
       if (mpos_on_) mp[3 * t] = base, mp[3 * t + 1] = base + r / sp.gw, mp[3 * t + 2] = base + r % sp.gw;
-    } else if (mpos_on_) {
-      mp[3 * t] = mp[3 * t + 1] = mp[3 * t + 2] = p + delta;
+    } else {
+      Q27_CHECK(tr[t] >= 0 && tr[t] < kVocab, "token id out of the vocabulary");
+      if (mpos_on_) mp[3 * t] = mp[3 * t + 1] = mp[3 * t + 2] = p + delta;
     }
   }
   Q27_CUDA(cudaMemcpyAsync(ids_, tr.data(), size_t(T) * 4, cudaMemcpyHostToDevice, s_));
@@ -1229,6 +1312,21 @@ void Model::logits(const float* x_rows, int rows) {
   if (w_.lm_head8.w) {  // (an FP8 lm_head: lm_head is the draft model's NVFP4 copy)
     rmsnorm_quant(x_rows, w_.final_norm, rows, kEps, nullptr, q8row(), s_);
     gemm_q("lm_head", w_.lm_head8, rows, logits_, false);
+    return;
+  }
+  if (head_a4x2_) {
+    // W4A4x2: in slices of the skinny kernel's 64 rows (aq_ holds both terms and their scales of that many whatever
+    // the prefill chunk; a row does not depend on the slicing).
+    const auto& lm = w_.lm_head;
+    uint8_t* sf = aq_ + size_t(2 * kMaxBatchRows) * (kHidden / 2);
+    for (int r0 = 0; r0 < rows; r0 += kMaxBatchRows) {
+      const int M = std::min(kMaxBatchRows, rows - r0);
+      mark("norm+quant");
+      quant_fp4x2(x_rows + size_t(r0) * kHidden, w_.final_norm, M, kHidden, kEps, lm.in_scale, aq_, sf, s_);
+      mark("lm_head");
+      if (skip("gemm") || skip("gemm4")) continue;
+      skinny_fp4_a4x2(M, kVocab, kHidden, aq_, sf, lm.w, lm.sf, lm.alpha.alpha[0], logits_ + size_t(r0) * kVocab, s_);
+    }
     return;
   }
   rmsnorm_quant(x_rows, w_.final_norm, rows, kEps, nullptr, q4(w_.lm_head.in_scale), s_);
@@ -1565,9 +1663,12 @@ void Model::spec_body(const SpecSampling& sampling, int part) {
     mark("lookup");
     if (lk.on) spec_lookup(lk, ids_ver_, s_);
     mark("draft");
+    const int rows = std::max(spec_block_of(smp), spec_draft_rows_);
     if (!skip("draft"))  // (Q27_SKIP=draft: timing only, the step verifies the previous step's tokens)
       draft_->propose(block_ids_, pos_dev_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], smp, rng_, ids_ver_,
-                    aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_, spec_block_of(smp));
+                    aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, lk, s_, rows);
+    if (rows > spec_rows(smp))  // (a cut step's test: the verify's rows of the draft)
+      lane_cut(LaneRows::one(rows), LaneRows::one(spec_rows(smp)), ids_ver_, tree_, s_);
     if (part == 1) return;
   }
   const int W = spec_rows(smp);
@@ -1640,7 +1741,7 @@ int Model::spec_step(int32_t* out, bool allow_ahead) {
   } else if (spec_inflight_) {
     Q27_CHECK(same(smp, spec_key_), "spec_step: sampling changed with a step in flight");
     slot = inflight_slot_;
-  } else if (!graphs_ || !spec_warm_) {
+  } else if (!graphs_ || !spec_warm_ || spec_draft_rows_ > 0) {
     spec_body(smp);
     spec_warm_ = true;
     par_host_ ^= 1;
@@ -1745,6 +1846,7 @@ void Model::spec_adapt(SpecSampling& smp, int n) const {
 }
 
 cudaGraphExec_t Model::capture(const std::function<void()>& body, cudaGraphExec_t update) {
+  if (batch_on_) bcaptures_++;
   cudaGraph_t graph;
   cudaGraphExec_t exec;
   trace_clear_launches();
@@ -1833,8 +1935,9 @@ void Model::spec_set_block(int area, int block) {
 }
 
 void Model::spec_stats(int64_t* out) {
-  out[0] = stat_steps_, out[1] = stat_lookup_, out[2] = stat_tokens_;
+  out[0] = stat_steps_, out[1] = stat_lookup_, out[2] = stat_tokens_, out[3] = int64_t(bcaptures_);
   stat_steps_ = stat_lookup_ = stat_tokens_ = 0;
+  bcaptures_ = 0;
 }
 
 void Model::debug_kv(int layer, int pos, int n, void* out) {
@@ -2105,7 +2208,8 @@ void Model::seq_suspend(int a) {
 // ends. A verify's commit is replayed at the start of the lane's next verify, in place (the lane's state has
 // one buffer here); ending the batch replays the last one.
 // Each lane verifies a block of its own rows (DSpine; see batch_rows) within the step's row budget (batch_rows_);
-// the rows are packed (blr_), the graphs keyed by the lanes' total rows and updated in place for another split.
+// the rows are packed (blr_); the kernels read the split on the device (dev_rows_), the graphs keyed by its shape
+// (total rows, longest lane; Q27_BATCH_DEV_ROWS=0: total rows, updated in place for another split).
 // The batched steps keep the sequences' adaptive widths (spec_adapt) up to date as their single steps do.
 
 Model::LaneRef Model::lane_ref(int z) {
@@ -2124,7 +2228,7 @@ GdnSpec Model::gdn_spec_lanes(int gi) const {
   GdnSpec sp = gdn_spec(gi);  // (the replay buffers; lane z uses its rows, blr_)
   sp.par = b_par_, sp.ncommit = b_nc_, sp.cpath = b_cpath_, sp.tree = b_tree_, sp.paths = 1;
   sp.lanes = int(blanes_.size());
-  sp.lr = blr_, sp.prow0 = b_prow0_;
+  sp.lr = vrows(), sp.prow0 = b_prow0_;
   for (int z = 0; z < sp.lanes; z++) {
     sp.lconv[z] = bconv_[z] + size_t(gi) * kConvDim * (kConvK - 1);
     sp.lst[z] = bssm_[z] + size_t(gi) * kVHeads * kKDim * kVDim;
@@ -2150,6 +2254,7 @@ void Model::batch_enter(const int32_t* lanes, int n) {
     Q27_CHECK(a >= 0 ? parked_[a].spec_last >= 0 : spec_last_ >= 0, "spec_step_lanes: the sequence is not decoding");
   }
   blanes_.assign(lanes, lanes + n);
+  cut_lam_ = 0.f;
   bsl_ = SeqLanes{};
   bsl_.n = n, bsl_.pos = b_pos_, bsl_.rope_delta = b_delta_;
   const size_t rb = draft_->ring_layers_bytes();
@@ -2245,20 +2350,55 @@ bool Model::batch_masked() const {
   return std::any_of(bacc_.smp, bacc_.smp + int(blanes_.size()), [](const SpecSampling& m) { return m.masked; });
 }
 
+// The lanes' rows as the kernels take them: with dev_rows_, the layout from the device copies (b_lrd_), which the step
+// writes from b_lrh_ first (batch_body); stage_rows sets b_lrh_ before every run of a step or of a part.
+LaneRows Model::vrows() const {
+  LaneRows r = blr_;
+  r.dev = dev_rows_ ? b_lrd_ : nullptr;
+  return r;
+}
+
+LaneRows Model::drows() const {
+  LaneRows r = bdlr_;
+  r.dev = dev_rows_ ? b_lrd_ + 1 : nullptr;
+  return r;
+}
+
+void Model::stage_rows() {
+  if (!dev_rows_) return;
+  b_lrh_[0] = blr_, b_lrh_[1] = bdlr_;
+  b_lrh_[0].dev = b_lrh_[1].dev = nullptr;
+}
+
 void Model::batch_body(int n, int part) {
   const auto& lm = w_.lm_head;
+  if (dev_rows_) {  // (captured: a memcpy node reading b_lrh_ when the graph runs)
+    stage_rows();
+    Q27_CUDA(cudaMemcpyAsync(b_lrd_, b_lrh_, 2 * sizeof(LaneRows), cudaMemcpyHostToDevice, s_));
+  }
+  const LaneRows vr = vrows(), dr = drows();
+  bsl_.lr = bacc_.lr = vr;
+  bacc_.clr = dr;
   DraftLanes dl;
-  dl.n = n, dl.pos = b_pos_, dl.lr = blr_;
+  dl.n = n, dl.pos = b_pos_, dl.lr = dr;
   SelectLanes sel;
-  sel.lr = blr_;
+  sel.lr = dr;
   for (int z = 0; z < n; z++) dl.ring_k[z] = bring_k_[z], dl.ring_v[z] = bring_v_[z], sel.smp[z] = bacc_.smp[z];
   if (part != 2) {
     mark("draft");
-    lane_blocks(blr_, b_anchor_, ddims::kMaskId, b_blk_, b_ids_, s_);
+    lane_blocks(dr, b_anchor_, ddims::kMaskId, b_blk_, b_ids_, s_);
     draft_->propose_lanes(dl, b_blk_, w_.embed, lm.w, lm.sf, lm.in_scale, lm.alpha.alpha[0], sel, b_rng_, b_ids_,
                           b_tree_, aq_, asf_, logits_, skinny_ws_, kSkinnyWsBytes, s_);
+    if (cut_step_) {  // (the expected tokens at each width, for cut_rows)
+      uint32_t greedy = 0;
+      for (int z = 0; z < n; z++) greedy |= uint32_t(bacc_.smp[z].temperature <= 0.f) << z;
+      dspine_conf_tokens(draft_->lane_lattice(), dr, greedy, cut_cal_, b_conf_dev_, s_);
+    }
     if (part == 1) return;
   }
+  // (a cut step's graph runs any split of its shape: the cut is always in it)
+  if ((cut_step_ && dev_rows_) || !(bdlr_ == blr_)) lane_cut(dr, vr, b_ids_, b_tree_, s_);
+  dl.lr = vr;  // (the context: the verify's rows)
   const int W = blr_.total();
   verify_ = true;
   verify_paths_ = 1;
@@ -2273,7 +2413,7 @@ void Model::batch_body(int n, int part) {
   BiasLanes bl;
   for (int z = 0; z < n; z++) bl.list[z] = bacc_.smp[z].bias, bl.pos[z] = b_pos_ + z, bl.depth[z] = b_tree_[z].depth;
   if (std::any_of(bl.list, bl.list + n, [](const BiasList* b) { return b != nullptr; }))
-    bias_logits(logits_, kVocab, bl, blr_, s_);
+    bias_logits(logits_, kVocab, bl, vr, s_);
   uint32_t masked = 0;
   for (int z = 0; z < n; z++)
     if (bacc_.smp[z].masked) {  // (the host's rows of lane z: its slot; the logits': its rows)
@@ -2282,7 +2422,7 @@ void Model::batch_body(int n, int part) {
                                mask_host_ + size_t(z) * kLaneSlot * kMaskWords,
                                size_t(blr_.rows(z)) * kMaskWords * 4, cudaMemcpyHostToDevice, s_));
     }
-  if (masked) mask_logits(logits_, kVocab, mask_dev_, kMaskWords, blr_, masked, s_);
+  if (masked) mask_logits(logits_, kVocab, mask_dev_, kMaskWords, vr, masked, s_);
   int K = *std::max_element(bacc_.k, bacc_.k + n);
   PenaltyLanes pl;
   for (int z = 0; z < n; z++) pl.pen[z] = bacc_.smp[z].pen;
@@ -2292,21 +2432,25 @@ void Model::batch_body(int n, int part) {
   const bool lp = std::any_of(ln.n, ln.n + n, [](int v) { return v >= 0; });
   K = pen ? 64 : std::max(K, *std::max_element(ln.n, ln.n + n));  // (see spec_body)
   topk_rows(logits_, W, kVocab, K, tv_, ti_, s_);
-  if (pen) penalize_rows(tv_, ti_, K, blr_, pl, b_tree_, s_, lp ? lpv_ : nullptr, lpi_);
+  if (pen) penalize_rows(tv_, ti_, K, vr, pl, b_tree_, s_, lp ? lpv_ : nullptr, lpi_);
   spec_accept_lanes(b_ids_, b_anchor_, tv_, ti_, K, bacc_, draft_->lane_cand(), b_tree_, draft_->lane_src(), b_rng_,
                     b_nc_, b_cpath_, b_out_dev_, b_pos_, b_par_, b_budget_, s_);
   if (lp)
-    spec_logprobs(blr_, logits_, kVocab, pen ? lpv_ : tv_, pen ? lpi_ : ti_, pen ? kMaxTopLogprobs : K, ln, b_tree_,
+    spec_logprobs(vr, logits_, kVocab, pen ? lpv_ : tv_, pen ? lpi_ : ti_, pen ? kMaxTopLogprobs : K, ln, b_tree_,
                   b_cpath_, b_nc_, b_ids_, lp_dev_ + kLpLanes, b_par_, s_);
   mark("draft context");
   draft_->append_ctx_lanes(dl, cap_buf_, b_nc_, b_cpath_, skinny_ws_, kSkinnyWsBytes, s_);
-  spec_advance_lanes(blr_, b_pos_, b_nc_, b_par_, b_rng_, b_budget_, b_prow0_, s_);
+  spec_advance_lanes(vr, b_pos_, b_nc_, b_par_, b_rng_, b_budget_, b_prow0_, s_);
 }
 
 // The lanes' graph cache entry (the graph holds their state pointers: keyed by the lanes, the running one's state
-// buffer, their sampling and their total rows), created when missing (the least recently used one goes beyond
-// kBatchGraphCache). Another split of the same total re-captures the graph and updates it in place (spec_step_lanes).
-Model::BatchGraph& Model::batch_graph(int n) {
+// buffer, their sampling and their total rows; with dev_rows_ also the longest lane's rows, which shape the launches),
+// created when missing (the least recently used one goes beyond kBatchGraphCache). Another split of the same shape
+// runs in the same graph with dev_rows_ (its rows are read on the device); otherwise, and for masked lanes (whose
+// grammar masks are copied by the lanes' rows), it re-captures the graph and updates it in place (spec_step_lanes).
+Model::BatchGraph& Model::batch_graph(int n, int tag) {
+  const LaneRows& pr = tag == 1 ? bdlr_ : blr_;  // (the part's rows)
+  const int total = pr.total(), longest = dev_rows_ ? pr.max_rows() : 0;
   const int sb = std::count(blanes_.begin(), blanes_.end(), -1) ? sbuf_host_ : -1;
   auto same_acc = [&](const AcceptLanes& a) {
     for (int z = 0; z < n; z++) {
@@ -2317,7 +2461,8 @@ Model::BatchGraph& Model::batch_graph(int n) {
     return true;
   };
   for (auto& g : bgraphs_)
-    if (g.lanes == blanes_ && g.sbuf == sb && g.lr.total() == blr_.total() && same_acc(g.acc)) {
+    if (g.tag == tag && g.lanes == blanes_ && g.sbuf == sb && g.total == total && g.longest == longest &&
+        same_acc(g.acc)) {
       g.used = ++graph_clock_;
       return g;
     }
@@ -2330,6 +2475,8 @@ Model::BatchGraph& Model::batch_graph(int n) {
   bgraphs_.push_back({blanes_, sb, bacc_, nullptr, ++graph_clock_});
   BatchGraph& g = bgraphs_.back();
   g.lr = g.lr2 = blr_;
+  g.tag = tag, g.clr = bdlr_;
+  g.total = total, g.longest = longest;
   return g;
 }
 
@@ -2372,7 +2519,7 @@ void Model::lane_note(SpecSampling& m, int w, int k) const {
 // tokens at c rows, est(c), come from the moving average of its tokens per step at the rows it ran; the step's time is
 // about batch_step_ms(lanes, total rows) (the GEMMs step up at every 16 rows of the total; how the rows split does
 // not matter). From the lanes' current rows, the move of one lane's rows that raises sum(est) / time most is taken
-// while it gains more than Q27_SPEC_ADAPT_HYST (relative; each new split re-captures the step's graph, about 1.2 ms),
+// while it gains more than Q27_SPEC_ADAPT_HYST (relative; with Q27_BATCH_DEV_ROWS=0 each new split re-captures the step's graph, about 1.2 ms),
 // within the row budget (batch_rows_). Pinned (spec_set_block) lanes keep their width, masked ones 8 (the rule off:
 // Q27_SPEC_ADAPT_BATCH=0, every lane 8).
 void Model::batch_rows(int n, int* w) {
@@ -2434,6 +2581,7 @@ void Model::batch_prepare(const int32_t* lanes, int n) {
   batch_enter(lanes, n);
   // Lanes of different rows need DSpine (DFlash2's blocks are 8) and the FP8-MMA verify; else every lane has 8.
   const bool vary = draft_->dspine() && attention_lanes_vary(opt_.kv_type);
+  bvary_ = vary;
   int w[kMaxLanes];
   if (!vary) {
     std::fill(w, w + n, ddims::kBlock);
@@ -2441,7 +2589,9 @@ void Model::batch_prepare(const int32_t* lanes, int n) {
     batch_rows(n, w);
   }
   blr_.set(n, w);
-  bsl_.lr = bacc_.lr = blr_;
+  bdlr_ = blr_;
+  bsl_.lr = bacc_.lr = bacc_.clr = blr_;
+  cut_step_ = false;
   for (int z = 0; z < n; z++) {
     bacc_.smp[z].block = w[z];
     LaneRef r = lane_ref(z);
@@ -2463,7 +2613,66 @@ bool Model::batch_part(int n, int part) {
   if (x && !(lr == blr_)) x = capture([&] { batch_body(n, part); }, x);  // (other rows: updated in place)
   if (!x) x = capture([&] { batch_body(n, part); });
   lr = blr_;
+  stage_rows();
   Q27_CUDA(cudaGraphLaunch(x, s_));
+  return true;
+}
+
+namespace {
+// A batched verify's time (ms) by lanes and total rows, the draft excluded (P3-39: fitted on measured split steps,
+// RTX 5090 at 400 W, gdnfp4 weights, 4 and 8 lanes); the draft's rows past the verify's cost about 0.018 ms each.
+float verify_ms(int lanes, int rows) {
+  return 11.14f + 0.303f * float(lanes) + 0.694f * float((rows + 15) / 16) + 0.126f * float(rows);
+}
+}  // namespace
+
+// The verify rows of a cut step: each lane's prefix of its draft rows (4, 8, .. or all of them; pinned lanes: all)
+// that maximizes sum(E_z(w_z)) - lam * verify_ms(lanes, total), by a DP over the total (E: b_conf_, a function of the
+// draft's table only, so the verify stays lossless; lam: the tokens per ms of the earlier cut steps).
+bool Model::cut_rows(int n) {
+  constexpr int kR = kMaxBatchRows;
+  const float lam = cut_lam_ > 0.f ? cut_lam_ : 4.25f * float(n) / verify_ms(n, 8 * n);
+  float best[kR + 1];
+  uint8_t pick[kMaxLanes][kR + 1];
+  std::fill(best, best + kR + 1, -1e30f);
+  best[0] = 0.f;
+  for (int z = 0; z < n; z++) {
+    const int d = bdlr_.rows(z);
+    const bool fixed = lane_smp(z).pinned;
+    float nb[kR + 1];
+    std::fill(nb, nb + kR + 1, -1e30f);
+    for (int c = fixed ? d : std::min(4, d); c <= d; c = c + 4 > d && c < d ? d : c + 4) {
+      const float e = b_conf_[z * kSpecBlock + c - 1];
+      for (int r = 0; r + c <= kR; r++)
+        if (best[r] > -1e29f && best[r] + e > nb[r + c]) nb[r + c] = best[r] + e, pick[z][r + c] = uint8_t(c);
+    }
+    std::copy(nb, nb + kR + 1, best);
+  }
+  int R = -1;
+  float bo = -1e30f;
+  for (int r = 1; r <= kR; r++)
+    if (best[r] > -1e29f && best[r] - lam * verify_ms(n, r) > bo) bo = best[r] - lam * verify_ms(n, r), R = r;
+  int w[kMaxLanes];
+  for (int z = n - 1; z >= 0; z--) w[z] = pick[z][R], R -= w[z];
+  blr_.set(n, w);
+  bsl_.lr = bacc_.lr = blr_;
+  for (int z = 0; z < n; z++) bacc_.smp[z].block = w[z];
+  return !(blr_ == bdlr_);
+}
+
+// A cut step's part (batch_body's: 1 the draft with the expected tokens, 2 the cut and the rest), its graph keyed by
+// the part's total rows (part 2's re-captured when the split of its verify or draft rows differs).
+bool Model::cut_part(int n, int part) {
+  if (!graphs_ || !bwarm_) {
+    batch_body(n, part);
+    return false;
+  }
+  BatchGraph& g = batch_graph(n, part);
+  if (g.exec && !dev_rows_ && !(g.lr == blr_ && g.clr == bdlr_)) g.exec = capture([&] { batch_body(n, part); }, g.exec);
+  if (!g.exec) g.exec = capture([&] { batch_body(n, part); });
+  g.lr = blr_, g.clr = bdlr_;
+  stage_rows();
+  Q27_CUDA(cudaGraphLaunch(g.exec, s_));
   return true;
 }
 
@@ -2484,7 +2693,21 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
   static const char* trace = getenv("Q27_TRACE");  // debug timeline (build with -DQ27_TRACE)
   if (trace) trace_step_begin(s_);
   cudaGraphExec_t exec = nullptr;
-  if (batch_masked()) {
+  bool graphed = false;
+  // Cut steps: batched DSpine steps of 2 or more lanes without a grammar mask, with a lane that could verify fewer rows.
+  bool cut = batch_cut_ && bvary_ && n >= 2 && !batch_masked();
+  if (cut) {
+    cut = false;
+    for (int z = 0; z < n; z++) cut |= !lane_smp(z).pinned && bdlr_.rows(z) > 4;
+  }
+  if (cut) {
+    cut_step_ = true;
+    cut_part(n, 1);
+    Q27_CUDA(cudaStreamSynchronize(s_));  // (b_conf_ written)
+    cut_rows(n);
+    graphed = cut_part(n, 2);
+    bwarm_ = true;
+  } else if (batch_masked()) {
     Q27_CHECK(b_drafted_, "spec_step_lanes: a step with masked lanes is drafted first (spec_draft_lanes)");
     b_drafted_ = false;
     if (batch_part(n, 2)) exec = batch_graph(n).exec2;
@@ -2493,18 +2716,20 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     bwarm_ = true;
   } else {
     BatchGraph& g = batch_graph(n);
-    if (g.exec && !(g.lr == blr_)) g.exec = capture([&] { batch_body(n); }, g.exec);  // (other rows: updated in place)
+    if (g.exec && !dev_rows_ && !(g.lr == blr_)) g.exec = capture([&] { batch_body(n); }, g.exec);  // (other rows: updated in place)
     if (!g.exec) g.exec = capture([&] { batch_body(n); });
     g.lr = blr_;
+    stage_rows();
     exec = g.exec;
     Q27_CUDA(cudaGraphLaunch(exec, s_));
   }
   Q27_CUDA(cudaStreamSynchronize(s_));
-  profile_collect(exec != nullptr);
+  profile_collect(exec != nullptr || graphed);
   static int trace_steps = 0;
   static const int trace_at = getenv("Q27_TRACE_STEP") ? atoi(getenv("Q27_TRACE_STEP")) : 20;
   if (trace && ++trace_steps == trace_at) trace_step_end(trace);
   batch_pending_ = true;
+  int got = 0;
   for (int z = 0; z < n; z++) {
     const SpecOut& so = b_out_[2 * z + bpar_];
     const int k = so.n;
@@ -2525,7 +2750,14 @@ void Model::spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* 
     *r.spec_last = o[k - 1];
     stat_steps_++, stat_tokens_ += k;
     spec_adapt(lane_smp(z), k);  // (the width of the sequence's later steps, batched or not)
-    lane_note(lane_smp(z), blr_.rows(z), k);  // (its rows in later batched steps)
+    // (its rows in later batched steps; a cut step's: noted at its draft rows, as the cut was chosen in P3-39)
+    lane_note(lane_smp(z), bdlr_.rows(z), k);
+    got += k;
+  }
+  if (cut_step_) {  // (the verify, the draft's rows past it and the host's decision)
+    const float ms = verify_ms(n, blr_.total()) + 0.018f * float(bdlr_.total() - blr_.total()) + 0.12f;
+    const float lam0 = cut_lam_ > 0.f ? cut_lam_ : 4.25f * float(n) / verify_ms(n, 8 * n);
+    cut_lam_ = lam0 + (float(got) / ms - lam0) / 32.f;
   }
   bpar_ ^= 1;
   bstep_++;

@@ -103,6 +103,8 @@ def gpu(engine_lib):
     raw = encode(8, 10, 64, 64)
     try:
         videoproc.frames(raw, _plan([0, 1], (64, 64)))
+    except videoproc.DeviceLost:
+        raise  # (a lost CUDA context is a failure, not a missing decoder)
     except RuntimeError as e:
         pytest.skip(f"no NVDEC: {e}")
     return True
@@ -197,6 +199,8 @@ def test_rotated_video_comes_upright(engine_lib, k):
     size = (96, 160) if k % 2 else (160, 96)
     try:
         got = videoproc.frames(rot, _plan([0, 5, 6, 19], size))
+    except videoproc.DeviceLost:
+        raise  # (a lost CUDA context is a failure, not a missing decoder)
     except RuntimeError as e:
         pytest.skip(f"no NVDEC: {e}")
     base = videoproc.frames(raw, _plan([0, 5, 6, 19], (160, 96)))
@@ -266,6 +270,8 @@ def test_video_matches_transformers(engine_lib, model, video):
 
     try:
         rgb = videoproc.frames(raw, plan)
+    except videoproc.DeviceLost:
+        raise
     except RuntimeError as e:
         pytest.skip(f"no NVDEC for the pixels: {e}")
     except ValueError as e:  # (NVDEC's smallest picture is larger than some of these)

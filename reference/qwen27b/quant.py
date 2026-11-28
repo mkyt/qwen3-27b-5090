@@ -67,6 +67,15 @@ def quant_act_nvfp4(x: torch.Tensor, input_scale: torch.Tensor) -> torch.Tensor:
     return (q * sf / gs).reshape(shape)
 
 
+def quant_act_nvfp4_terms(x: torch.Tensor, input_scale: torch.Tensor, terms: int) -> torch.Tensor:
+    """NVFP4 in `terms` terms with one global scale, each the quantization of what the ones before left (the
+    engine's lm_head takes two: W4A4x2, quant_fp4x2); one term is quant_act_nvfp4."""
+    out = quant_act_nvfp4(x, input_scale)
+    for _ in range(terms - 1):
+        out = out + quant_act_nvfp4(x.to(torch.float32) - out, input_scale)
+    return out
+
+
 def dequant_fp8(weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
     return weight.to(torch.float32) * weight_scale.to(torch.float32)
 
@@ -82,8 +91,9 @@ class QLinear:
     kind: "nvfp4" | "fp8" | "bf16". Weights are dequantized once to `dtype` on `device`.
     """
 
-    def __init__(self, kind, weight, input_scale=None, act_quant=True):
+    def __init__(self, kind, weight, input_scale=None, act_quant=True, act_terms=1):
         self.kind = kind
+        self.act_terms = act_terms  # nvfp4: terms of the activation (quant_act_nvfp4_terms)
         self.weight = weight  # dequantized [out, in]
         self.input_scale = input_scale
         self.act_quant = act_quant and input_scale is not None
@@ -91,7 +101,7 @@ class QLinear:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if self.act_quant:
             if self.kind == "nvfp4":
-                x = quant_act_nvfp4(x, self.input_scale)
+                x = quant_act_nvfp4_terms(x, self.input_scale, self.act_terms)
             elif self.kind == "fp8":
                 x = quant_act_fp8(x, self.input_scale)
         return x.to(self.weight.dtype) @ self.weight.T

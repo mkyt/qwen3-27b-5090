@@ -1,14 +1,13 @@
 """Speculative decoding (DFlash2 or DSpine, --draft) of the engine, in-process: decode speed and acceptance length.
 
-Uses the decode prompts of bench_agentic.py (code / json / prose, chat template, thinking off) and the
+Uses the decode prompts of bench_agentic.py (code / json / prose, chat template, thinking off unless --thinking) and the
 checkpoint's default sampling (temperature 1.0, top-k 20, top-p 0.95) unless --temperature is given.
 Decode tok/s counts like bench_agentic.py: (tokens - 1) / (time of the last token - time of the first).
 The acceptance length is the generated tokens per verify step (the first token comes from the prompt).
 
 --check-greedy N: greedy, N tokens per prompt, speculative vs plain decoding; the token sequences must
-be identical (the verify rows are bit-identical to decode steps; the run sets Q27_SKINNY_EXACT=1, the
-split-K policy that does not depend on the number of rows, and with Q27_SPEC_PATHS > 1 Q27_ATTN_TC=0: the
-tree's attention runs on CUDA cores).
+be identical with the default settings (the verify rows are bit-identical to decode steps; with
+Q27_SPEC_PATHS > 1 the run sets Q27_ATTN_TC=0: the tree's attention runs on CUDA cores).
 
 --ab CFG [CFG ...]: A/B of runtime switches in one process (like ab_decode.py): each config ("-" or
 KEY=VALUE,...) runs greedy speculative decoding of the prompts in turn for --rounds rounds; greedy makes
@@ -51,9 +50,9 @@ PROMPTS = {  # scripts/bench_agentic.py scenario_decode
 EOS = {248046, 248044}
 
 
-def chat_ids(tok, text):
+def chat_ids(tok, text, thinking=False):
     ids = tok.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True,
-                                  enable_thinking=False)
+                                  enable_thinking=thinking)
     return list(ids["input_ids"]) if not isinstance(ids, list) else ids
 
 
@@ -97,6 +96,7 @@ def main():
     ap.add_argument("--logprobs", type=int, default=-1, help="top logprobs per token (0..20; -1: none)")
     ap.add_argument("--prompts", default="code,json,prose")
     ap.add_argument("--check-greedy", type=int, default=0, metavar="N")
+    ap.add_argument("--thinking", action="store_true", help="reasoning on in the chat template")
     ap.add_argument("--label", default="spec")
     ap.add_argument("--no-save", action="store_true")
     ap.add_argument("--profile", action="store_true", help="per-op GPU time of the steps (Q27_PROFILE=1)")
@@ -123,14 +123,17 @@ def main():
 
     if args.check_greedy:
         import os
-        os.environ["Q27_SKINNY_EXACT"] = "1"
         # Tree verification (Q27_SPEC_PATHS > 1) runs its attention on CUDA cores, decode and chains on tensor cores: a
         # different summation order, which W4A4 carries to visibly different distributions. Both on CUDA cores here.
         if int(os.environ.get("Q27_SPEC_PATHS", "1")) > 1:
             os.environ.setdefault("Q27_ATTN_TC", "0")
-    tok = AutoTokenizer.from_pretrained(snapshot(*TARGET))
+    # The tokenizer of the selected weights (a gdnfp4-only install has no NVIDIA snapshot); a directory without one
+    # (e.g. from scripts/quantize_proj.py) falls back to the NVIDIA checkpoint's.
+    model = engine_target(args.weights)
+    has_tok = (pathlib.Path(model) / "tokenizer.json").is_file()
+    tok = AutoTokenizer.from_pretrained(model if has_tok else snapshot(*TARGET))
     t0 = time.perf_counter()
-    eng = Engine(engine_target(args.weights), max_tokens=8192,
+    eng = Engine(model, max_tokens=8192,
                  kv_dtype=args.kv_dtype or ("fp8" if args.kv_fp8 else "bf16"), draft=draft_dir(args.draft))
     print(f"load {time.perf_counter() - t0:.1f} s", flush=True)
     names = args.prompts.split(",")
@@ -140,7 +143,7 @@ def main():
         envs = [parse(c) for c in args.ab]
         keys = sorted({k for e in envs for k in e})
         res = {c: [] for c in args.ab}
-        ids = {n: chat_ids(tok, PROMPTS[n]) for n in names}
+        ids = {n: chat_ids(tok, PROMPTS[n], args.thinking) for n in names}
         for r in range(args.rounds):
             for cfg, env in zip(args.ab, envs):
                 eng.configure(**{k: env.get(k) for k in keys})
@@ -163,13 +166,15 @@ def main():
     if args.check_greedy:
         ok = True
         for name in names:
-            ids = chat_ids(tok, PROMPTS[name])
+            ids = chat_ids(tok, PROMPTS[name], args.thinking)
             plain = run_plain(eng, ids, args.check_greedy)
             eng.reset()
             spec, steps, _, _ = run_spec(eng, ids, len(plain), 0.0, 1, 1.0, 0)
             spec = spec[:len(plain)]
             diff = next((i for i, (a, b) in enumerate(zip(plain, spec)) if a != b), None)
-            ok &= diff is None and len(spec) == len(plain)
+            if diff is None and len(spec) != len(plain):  # (a shorter output is a difference too)
+                diff = min(len(spec), len(plain))
+            ok &= diff is None
             acc = (len(spec) - 1) / max(steps, 1)
             st = eng.spec_stats()
             print(f"{name}: {len(plain)} tokens, {'identical' if diff is None else f'differs at {diff}'}, "
@@ -182,7 +187,7 @@ def main():
 
     rows = []
     for name in names:
-        ids = chat_ids(tok, PROMPTS[name])
+        ids = chat_ids(tok, PROMPTS[name], args.thinking)
         for rep in range(args.reps):
             eng.reset()
             if args.profile:

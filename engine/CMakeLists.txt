@@ -37,6 +37,7 @@ add_library(q27 SHARED
   src/kernels.cu
   src/gemm_mma.cu
   src/skinny.cu
+  src/skinny_a4x2.cu
   src/gdn.cu
   src/attention.cu
   src/sampling.cu

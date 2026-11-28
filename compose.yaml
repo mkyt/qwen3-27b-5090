@@ -64,6 +64,7 @@ services:
       Q27_LOAD_THREADS: ${Q27_LOAD_THREADS:-8}     # threads reading the weight files ahead of the uploads
       STATS_SAMPLE_S: ${STATS_SAMPLE_S:-1}         # seconds between the GPU samples of /ui (0: none)
       API_DUMP_DIR: ${API_DUMP_DIR:-}              # debugging: write every POST body to this directory in the container
+      TRUSTED_ORIGINS: ${TRUSTED_ORIGINS:-}        # web origins whose pages may POST from a browser (besides the server's own)
       ENGINE_IDLE_UNLOAD_S: ${ENGINE_IDLE_UNLOAD_S:-0}  # seconds without a request before the engine frees its VRAM (0: off)
       MAX_TOKENS: ${MAX_TOKENS:-262144}
       MAX_TOKENS_FIT: ${MAX_TOKENS_FIT:-1}         # 1: lower MAX_TOKENS to what the VRAM fits (since P7-13 MAX_SEQS=8 fits 262144)
@@ -85,6 +86,8 @@ services:
       Q27_SPEC_ADAPT_HYST: ${Q27_SPEC_ADAPT_HYST:-}    # Q27_SPEC_ADAPT_BATCH: relative gain a change of rows needs (default 0.01)
       Q27_SPEC_ADAPT_PERIOD: ${Q27_SPEC_ADAPT_PERIOD:-}  # Q27_SPEC_ADAPT_BATCH: batched steps between the decisions (default 8)
       Q27_SPEC_ADAPT_BATCH_ALPHA: ${Q27_SPEC_ADAPT_BATCH_ALPHA:-}  # Q27_SPEC_ADAPT_BATCH: rate of the lanes' moving averages (default 1/32)
+      Q27_SPEC_CUT: ${Q27_SPEC_CUT:-}              # DSpine, requests stepping together: 1 (default) = verify the prefix of each draft with the most expected tokens per ms, 0 = all drafted rows
+      Q27_BATCH_DEV_ROWS: ${Q27_BATCH_DEV_ROWS:-}  # batched steps: 1 (default) = kernels read the row split from device memory (no graph re-capture per split), 0 = in the kernel arguments
       Q27_DRAFT_QUANT: ${Q27_DRAFT_QUANT:-fp4}     # draft linear layers: fp4 | fp8 | bf16
       Q27_DRAFT_VOCAB: ${Q27_DRAFT_VOCAB:-/work/bench/draft-vocab/vocab-128k.txt}  # candidate vocabulary; none: full
       STATE_HOST_CACHE: ${STATE_HOST_CACHE:-4}     # prefix cache: GiB of pinned state checkpoints (0: off)
@@ -92,12 +95,15 @@ services:
       CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-8192}
       VISION: ${VISION:-host}                      # off | host | fp8 | bf16: image input (P4-12)
       IMAGE_MAX_PIXELS: ${IMAGE_MAX_PIXELS:-4194304}  # images are resized to at most this many pixels
-      IMAGE_TOKENS: ${IMAGE_TOKENS:-}              # image and video tokens per request (pinned host embeddings, 10 KiB each); empty: 16384 or VIDEO_MAX_TOKENS if more
+      IMAGE_TOKENS: ${IMAGE_TOKENS:-}              # rows of the image table (pinned host, 10 KiB each), reused within a request; empty: 16384 or what PREFILL_CHUNK and IMAGE_MAX_PIXELS need
       VIDEO_MAX_TOKENS: ${VIDEO_MAX_TOKENS:-}      # tokens of a video at most; empty: the checkpoint's 12288
       VIDEO_MAX_FRAMES: ${VIDEO_MAX_FRAMES:-}      # frames sampled from a video at most (and a request's bound); empty: the checkpoint's 768
       Q27_ATTN_FP8: ${Q27_ATTN_FP8:-}              # prefill attention MMAs: empty = 2 (FP8 KV) / 3 (NVFP4 KV: Q·K on FP4 MMAs, P7-8); 2 Q·K and P·V in FP8, 1 P·V only, 0 BF16
       Q27_ATTN_FP4_STAGE: ${Q27_ATTN_FP4_STAGE:-1} # NVFP4 KV prefill: V (mode 3) rounded to E4M3 once per call (P7-8; 1 KiB/token; 0 = per CTA, mode 2)
       Q27_ATTN_TC_F8: ${Q27_ATTN_TC_F8:-}          # decode / verify attention MMAs: empty / 1 = FP8 with FP8 and NVFP4 KV (P7-7), 0 = BF16 / f16
+      Q27_LM_HEAD_A4X2: ${Q27_LM_HEAD_A4X2:-}      # NVFP4 lm_head: empty / 1 = two-term NVFP4 activations (W4A4x2: as good as BF16 activations there, same speed and memory), 0 = one (W4A4)
+      Q27_ACT_A4X2: ${Q27_ACT_A4X2:-}              # quality mode: all / 1 = two-term NVFP4 activations into every NVFP4 layer (closer to BF16, prefill about -40%, decode -1 to -4%), decode / 2 = decode / verify only (prefill unchanged); empty / off / 0 = one term (also the stats page's Start settings)
+      Q27_NVDEC_WAKE: ${Q27_NVDEC_WAKE:-}          # video decoding: empty = on WSL2, wake the idle GPU before a decode (NVDEC can hang from P8 there); 0 never, 1 always
       Q27_MLP_FUSED: ${Q27_MLP_FUSED:-1}           # prefill MLP: 1 = gate | up, silu * up and its NVFP4 quantization in one GEMM (gemm_mma.cu); 0 = BF16 gate | up, then the silu step
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]

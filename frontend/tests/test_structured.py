@@ -83,6 +83,21 @@ class FakeTok:
         return {"</think>": 99, "<tool_call>": 500, "</tool_call>": 501}[t]
 
 
+@pytest.mark.parametrize("spec", [("json", None), ("regex", "[a-z]+"), ("choice", ["yes", "no"])])
+@pytest.mark.parametrize("ws", [" ", "\n", "\r", "\t"])
+def test_leading_whitespace_is_bounded(spec, ws):
+    """After the reasoning the template's blank line may come first, but not whitespace without end (a model that
+    prefers it to the format's first character filled max_tokens with it)."""
+    tok = llguidance.LLTokenizer("byte")
+    g = structured.grammar(spec, lead_ws=True)
+    ids = tok.tokenize_str(ws * structured.LEAD_WS_MAX)
+    m = llguidance.LLMatcher(tok, g)
+    assert m.validate_tokens(ids) == len(ids)
+    ids = tok.tokenize_str(ws * (structured.LEAD_WS_MAX + 1))
+    m = llguidance.LLMatcher(tok, g)
+    assert m.validate_tokens(ids) == structured.LEAD_WS_MAX
+
+
 def test_server_constrain():
     srv = object.__new__(Server)
     srv.tok = FakeTok()

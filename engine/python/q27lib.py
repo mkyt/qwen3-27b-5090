@@ -36,6 +36,8 @@ SIGNATURES = {
     "q27_spec_block": ([P], I),
     "q27_last_step_block": ([P], I),
     "q27_last_lane_block": ([P, I], I),
+    "q27_last_lane_draft": ([P, I], I),
+    "q27_spec_set_draft_rows": ([P, I], I),
     "q27_spec_set_block": ([P, I, I], I),
     "q27_max_lanes": ([P], I),
     "q27_max_tokens": ([P], I),
@@ -49,6 +51,7 @@ SIGNATURES = {
     "q27_device_memory": ([P, P], I),
     "q27_has_vision": ([P], I),
     "q27_mm_set": ([P, P, I], I),
+    "q27_mm_place": ([P, I, I, I], I),
     "q27_mm_encode": ([P, I, P], I),
     "q27_mm_encode_rgb": ([P, I, P, P], I),
     "q27_mm_encode_frames": ([P, I, I, P, P], I),
@@ -89,7 +92,10 @@ SIGNATURES = {
     "q27t_gemm_fp4": ([I, I, I, P, P, P, P, F, P, F, P], I),
     "q27t_gemm_fp8": ([I, I, I, P, P, F, P, F, P], I),
     "q27t_gemm_fp4_glu": ([I, I, I, P, P, P, P, F, F, F, P, P], I),
+    "q27t_skinny_fp4_a4x2": ([I, I, I, P, P, P, P, F, P], I),
+    "q27t_quant_fp4x2": ([P, P, I, I, F, F, P, P], I),
     "q27t_skinny_fp4": ([I, I, I, P, P, P, P, F, P, F, P, P, SZ], I),
+    "q27t_skinny_fp4_x2": ([I, I, I, P, P, P, P, F, P, P, P, SZ, I], I),
     "q27t_skinny_fp8": ([I, I, I, P, P, F, P, F, P, P, SZ], I),
     "q27t_gemm_fp8_scaled": ([I, I, I, P, P, P, P, P, F, P], I),
     "q27t_skinny_fp8_scaled": ([I, I, I, P, P, P, P, P, F, P, P, SZ], I),
@@ -360,6 +366,15 @@ class Engine:
         """Rows of lane z's block in the last spec_step_lanes (0 for builds without the entry)."""
         return lib().q27_last_lane_block(self.h, z) if hasattr(lib(), "q27_last_lane_block") else 0
 
+    def last_lane_draft(self, z):
+        """Draft rows of lane z in the last spec_step_lanes (more than last_lane_block in a cut step, Q27_SPEC_CUT)."""
+        return lib().q27_last_lane_draft(self.h, z)
+
+    def spec_set_draft_rows(self, rows):
+        """Tests of cut steps: the running sequence's single steps draft `rows` (0: as many as they verify) and verify
+        the first rows of them (spec_set_block)."""
+        self._check(lib().q27_spec_set_draft_rows(self.h, rows), "q27_spec_set_draft_rows")
+
     def spec_set_block(self, area, block):
         """Pins a decoding sequence's verify width (area None: the running one) for its single and batched steps."""
         self._check(lib().q27_spec_set_block(self.h, -1 if area is None else area, block), "q27_spec_set_block")
@@ -481,6 +496,12 @@ class Engine:
         flat = array.array("i", [v for sp in spans for v in sp] or [0])
         self._check(lib().q27_mm_set(self.h, flat.buffer_info()[0], len(spans)), "q27_mm_set")
 
+    def mm_place(self, i, n, row):
+        """Rows of the image table for images i .. i + n - 1 from `row` on, in order (mm_set places the images in
+        order while they fit; more image tokens than IMAGE_TOKENS: the caller places each prompt chunk's images,
+        reusing the rows of earlier ones, and encodes them before running the chunk)."""
+        self._check(lib().q27_mm_place(self.h, i, n, row), "q27_mm_place")
+
     def mm_encode(self, i, pixel_values):
         """Runs the vision tower on image i: pixel_values [4 * gh * gw, 1536] (float32, numpy or CPU torch)."""
         import numpy as np
@@ -517,8 +538,9 @@ class Engine:
         self._check(lib().q27_mm_put(self.h, i, e.ctypes.data), "q27_mm_put")
 
     def spec_stats(self):
-        """Counters since the last call: {"steps", "lookup_steps", "tokens"}."""
-        out = (ctypes.c_int64 * 3)()
+        """Counters since the last call: {"steps", "lookup_steps", "tokens", "batch_captures"} (the last: graphs of
+        batched steps captured, new or updated)."""
+        out = (ctypes.c_int64 * 4)()
         self._check(lib().q27_spec_stats(self.h, out), "q27_spec_stats")
-        return {"steps": out[0], "lookup_steps": out[1], "tokens": out[2]}
+        return {"steps": out[0], "lookup_steps": out[1], "tokens": out[2], "batch_captures": out[3]}
 
