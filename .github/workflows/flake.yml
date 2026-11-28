@@ -1,0 +1,54 @@
+name: flake
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Fast gate: every output evaluates (`nix flake check --no-build`), the
+  # formatting is nixfmt's, and the frontend tests pass (the server's packages
+  # only: no torch, GPU or CUDA). The CUDA engine builds in the `engine` job
+  # below; `reference-tests` (torch-bin) build with
+  # `nix build .#checks.x86_64-linux.reference-tests`.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: flake structure (eval only, no builds)
+        run: nix flake check --no-build --no-update-lock-file
+      - name: nixfmt
+        run: nix fmt -- --ci
+      - name: frontend tests
+        run: nix build --no-update-lock-file .#checks.x86_64-linux.frontend-tests
+
+  # Path filter: only run the expensive CUDA build when engine sources change.
+  paths:
+    runs-on: ubuntu-latest
+    outputs:
+      engine: ${{ steps.filter.outputs.engine }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            engine:
+              - 'engine/CMakeLists.txt'
+              - 'engine/src/**'
+              - 'flake.nix'
+              - 'flake.lock'
+              - 'nix/**'
+
+  # Engine build: compiles libq27.so for sm_120a (no GPU needed, nvcc cross-compiles).
+  # First run compiles ~20 .cu files (~10–20 min); subsequent runs are cached.
+  engine:
+    needs: [check, paths]
+    if: needs.paths.outputs.engine == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: nix build engine
+        run: nix build --no-update-lock-file .#engine
